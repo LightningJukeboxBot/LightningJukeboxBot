@@ -1,0 +1,155 @@
+@font-face {
+    font-family: boucherie-block;
+    src: url(boucherie-block.ttf);
+	font-size: min(max(2px, 3vw), 28px);
+	}
+
+
+body, html {
+  width: 100%;
+  height: 100%;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-image: linear-gradient(30deg, #457b6e, #a4e0c6);
+}
+
+.container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+}
+
+.image-container {
+  position: relative;
+  display: flex;
+  height: 100%;
+  justify-content: center;
+  align-items: center;
+}
+
+.image-content {
+  position: relative;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: hidden;
+  aspect-ratio: 762 / 977;
+}
+
+.qr-code-container {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -22%);
+  /* adjust the size of the QR code container to fit your QR code image */
+  width: 60%;
+  height: 47%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+
+.search-container {
+#  border: 4px solid black;
+  position: absolute;
+  top: 40%;
+  left: 22%;
+  width: 49%;
+  height: 7%;
+  display: flex;
+  justify-content: left;
+  align-items: left;
+  text-align: left;
+}
+
+.search-results-container {
+#  border: 4px solid white;
+  position: absolute;
+  top: 51%;
+  left: 22%;
+  width: 58%;
+  height: 37%;
+  display: flex;
+  justify-content: left;
+  align-items: left;
+  text-align: left;
+  flex-direction: column;
+  font-family: boucherie-block;
+}
+
+.search-result-container {
+#  border: 4px solid white;
+  font-family: boucherie-block;
+  font-size: min(max(2px, 3vw), 28px);
+  line-height: 90%;
+  height: 20%;
+  display: block;
+}
+
+
+
+
+.copy-data {
+  position: absolute;
+  bottom: 3.1%;
+  left: 50%;
+  width: 50%;
+  height: 8.8%;
+  transform: translate(-50%, 0);
+  opacity: 0;
+  background-color: #fff;
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.copy-data:hover {
+  opacity: 0.2;
+  transition-duration: 0.2s;
+}
+
+.copy-data:active {
+  opacity: 0.2;
+  background-color: #000;
+  transition-duration: 0.1s;
+}
+
+.image-container img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.search-button {
+//    border: 1px solid black;
+    opacity: 0;
+    position: absolute;
+    top: 39%;
+    left: 71%;
+    width: 10%;
+    height: 10%;
+    display: flex;
+    justify-content: left;
+    align-items: left;
+    text-align: left;
+    font-family: boucherie-block;    
+}
+
+input {
+    border: none;
+    outline: none;
+    background-color: hsla(120, 0%, 0%, 0);
+    width: 100%;
+    font-family: boucherie-block;
+    font-size: min(max(2px, 3vw), 28px);
+}
+
+</style>
