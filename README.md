@@ -20,6 +20,21 @@ If you want to test out the functionality, there are a few options. Tune in via 
 You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
 If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
 
+The Jukebox uses LNbits in the back, meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
+
+## TG commands for the bot
+- /faq to show short list of options (needs updating)
+- /add artist and track title (to add music to the /queue)
+- /history
+- /queue (see upcoming tracks (need to still differentiate between added tracks and those in the background playlist))
+- /stack (takes you to PM with the bot to view your stack
+- /fund (folks can pay per track as they /add, or preload their Jukebox stack with the /fund command)
+- /refund invoice (allows users to send sats from their /stack to any invoice)
+- /stats (for super-admins only, shows how many admins connected their instance to a TG group and have it connected to their media-player)
+- /link (to link your personal /stack to your mobile lightning solution)
+- /dj (used as a reply to someone to send sats. Example /dj 21 sends 21 sats)
+- /couple, /decouple, /setclientid and /setclientsecret are commands to connect your own music player to this bot and start your own Jukebox! For now, there is only Sptify Premiums upport. 
+
 ## Ideas for new features
  - Super admin stats: interface for dedicated superadmins that can see stuff like the groups that are using the bot, sats in the bot etc. 
  - Seperate queue: When folks type /queue, and the bot shows the queue, can we differentiate between what is added by plebs and what is the background playlist? Maybe by not showing the background playlist at all? We could create our own queue that is separate from the background playlist. If we manage our own queue we could also introduce features like upvoting items in the queue. 
