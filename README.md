@@ -3,7 +3,7 @@
 *Our trust in DJ's has been broken, and we will make them obsolete!* ;)
 
 ## What we achieved:
-- We want the crowd to be the DJ. Our Jukebox Lightning Bot* makes this possible.
+- We want the crowd to be the DJ. Our **Jukebox Bot** makes this possible.
 Not only for Radiostations, but also for live events, venues, bars and pubs, businesess, you name it!
 - You want a three channel silent disco for your #bitcoin meetup, conference of festival? We got you covered!
 - It works very well for parties, pubs, or wherever else you want folks to have acces to a Lightning enabled Jukebox Bot. **GREAT FOR ORANGE PILLING FRENS & FAM!**
@@ -15,12 +15,10 @@ So musicians get their fair share of sats that flow through the Jukebox
 - Getting the bot to nostr. This process is slowly underway, see: #npub1wqtq2k9cawq2hkwz474xdm6ef0drmdhn4fk59hpyuex5l0ewa9rsj9a4cz
 
 ## General info
- - Find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
- 
 If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/naddr1qqjrswfevvukxvrr95cx2vt9956xyepn94snxdfs95urwwryxe3x2wfjvscn2q3qeaz6dwsnvwkha5sn5puwwyxjgy26uusundrm684lg3vw4ma5c2jsxpqqqpmxwe2sz27) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
 
-You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface.
-For now, ask for help in the [Noderunners Radio Telegram](https://t.me/noderunnersradio) chat if you need it, or just come hangout and play us your favorite pieces of music. There is a bit more functionality available in Telegram right now than compared to the web-interface.
+You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
+If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
 
 ## Ideas for new features
  - Super admin stats: interface for dedicated superadmins that can see stuff like the groups that are using the bot, sats in the bot etc. 
