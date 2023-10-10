@@ -1,12 +1,18 @@
 # A Bitcoin enabled Jukebox
 ![ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg)
+*Our trust in DJ's has been broken, and we will make them obsolete!* ;)
 
-# Our trust in DJ's has been broken, and we will make them obsolete!* ;)
-
-# What we achieved:
+## What we achieved:
 - We want the crowd to be the DJ. Our Jukebox Lightning Bot* makes this possible.
 Not only for Radiostations, but also for live events, venues, bars and pubs, businesess, you name it!
 - You want a three channel silent disco for your #bitcoin meetup, conference of festival? We got you covered!
+- It works very well for parties, pubs, or wherever else you want folks to have acces to a Lightning enabled Jukebox Bot. **GREAT FOR ORANGE PILLING FRENS & FAM!**
+
+## Our goals
+- Integrating with Wavlake with the Jukebox Lightning Bot
+So musicians get their fair share of sats that flow through the Jukebox
+- Making the Lightning Jukebox Bot more modular as to easily allow for plugging in/out more media-players & -libraries and to further bot integration over more platforms
+- Getting the bot to nostr. This process is slowly underway, see: #npub1wqtq2k9cawq2hkwz474xdm6ef0drmdhn4fk59hpyuex5l0ewa9rsj9a4cz
 
 ## General info
  - Find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
