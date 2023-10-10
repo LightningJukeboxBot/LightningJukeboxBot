@@ -1,5 +1,5 @@
 # A Bitcoin enabled Jukebox
-![bot-avatar]([ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg))
+![ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg)
 
 # Our trust in DJ's has been broken, and we will make them obsolete!* ;)
 
