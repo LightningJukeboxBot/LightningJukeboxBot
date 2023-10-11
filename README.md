@@ -33,7 +33,45 @@ The Jukebox uses LNbits in the back, meaning each user that comes in via TG gets
 - /stats (for super-admins only, shows how many admins connected their instance to a TG group and have it connected to their media-player)
 - /link (to link your personal /stack to your mobile lightning solution)
 - /dj (used as a reply to someone to send sats. Example /dj 21 sends 21 sats)
-- /couple, /decouple, /setclientid and /setclientsecret are commands to connect your own music player to this bot and start your own Jukebox! For now, there is only Sptify Premiums upport. 
+- /couple, /decouple, /setclientid and /setclientsecret are commands to connect your own music player to this bot and start your own Jukebox! For now, there is only Sptify Premiums upport.
+
+## FAQ
+#### How do I couple the bot to my own Spotify Premium account?
+- For now, you are sadly still required to use Telegram to connect the bot to your own Premium Spotify account. **Please keep in mind, that if you later want to stream the audio to a Telegram group, you must be OWNER of that group!** *(There is a difference between being owner and admin. Only owners can retrieve RTMP + streaming Key from a TG group)* If you are certain you don't want to stream the music into that TG group at a later date, you can just be admin. The bot will act within that group, only as a remote to your Spotify. 
+1. Invite the [Jukebox Bot](https://t.me/Jukebox_Lightning_bot) to an existing or new Telegram Group
+2. Make the bot admin
+3. Send the bot a Private Message with this command: /couple
+4. The bot will now give you a short list of what to do next
+5. Locate the [link to your Spotify Developer account](https://developer.spotify.com/dashboard) and go there
+6. In your [Spotify Developer account](https://developer.spotify.com/dashboard), click on the 'Create an app' button and give the bot a random name and description. Then click 'Create"
+7. Click 'Edit Settings' and add **EXACTLY** this url https://jukebox.lighting/spotify under 'Redirect URIs'. Do not forget to click 'Add' and 'Save'
+8. Copy the Client ID and give the bot this command in a Private Message and paste the client ID after it: /setclientid PasteClientID
+9. Copy the Client Secret and give the bot this command in a Private Message and paste the secret after it: /setclientsecret PasteClientID
+10. Now, make sure your spotify is playing music. *(We recommend setting a playlist to reteat continuously)*
+11. Next, return to the group you made the bot admin of and type this command: /couple
+12. The bot should give you a message with a button to click to finalize coupling your account. Click it!
+13. The browser should open up, and you will see this message if all went well: *Authorisation Succesfull! You can close this window now.*
+- To test if all works well (again, make sure spotify is playing music), try using some of the [commands you can use in Telegram](https://github.com/LightningJukeboxBot/LightningJukeboxBot/tree/main#tg-commands-for-the-bot)
+*If you have trouble setting up, contact [@NoderunnersFM](https://t.me/noderunnersFM) or [@artdesigbysf](https://t.me/artdesigbysf) on Telegram*
+- You can now plug in your pc/phone or whatever device is playing your spotify to a soundsystem and use the /web interface to /add music to the /queue!
+Just give the /web command to print out QR codes with you unique web-interface link on it. 
+- Additionally, you may set a /price. Standard is: /price 21 7 (Meaning 14 will go to your personal Jukeobox /stack and 7 will go to furhter development. You may choose to set /price to whatever you like. Examples: */price 0 0 (no amounts set, adding is free) /price 2100 210 (Price per track added is 2100 of which 210 go to bot dev fund and the rest to you)*
+- **More functionality is in the works!**
+    
+#### How do I stream the music to some other location?
+1. Make sure spotify is playing music
+2. [Download and install OBS](https://obsproject.com/)
+3. Make sure to mute your desktop audio, unless you want every sound your device makes to be streamed!
+4. Make sure to set audio to 320KB for optimal quality
+5. Set video bitrate to whatever works best for you
+6. Add sources (select spotify exe), you may choose to add a microphone or imagery for your video feed
+7. **Important**: set all audio outputs under 'Audio Mixer' to  -3 dB
+8. If you are owner of a TG group, you can find the RTMP settings behind the symbol on the dopright (**TG-desktop op ONLY!**) that looks like a speech-balloon with three vertical lines in it.
+9. Enter the RTMP werver of your TG group into OBS settings
+10. Do the same for the key
+11. Click, start streaming to begin streaming into TG
+12. If you want to ouput to multiple locations, [use this plugin](https://obsproject.com/forum/resources/multiple-rtmp-outputs-plugin.964/)
+13. Good luck and have fun! 
 
 ## Ideas for new features
  - Super admin stats: interface for dedicated superadmins that can see stuff like the groups that are using the bot, sats in the bot etc. 
