@@ -1,5 +1,5 @@
 # A Bitcoin enabled Jukebox
-*Please consider donating some sats to ![our Geyser.fund](https://geyser.fund/project/jukeboxbot), thank you!*
+*Please consider donating some sats to [our Geyser.fund](https://geyser.fund/project/jukeboxbot), thank you!*
 ![ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg)
 
 **Our trust in DJ's has been broken, and we will make them obsolete!* ;)*
