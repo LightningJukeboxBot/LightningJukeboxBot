@@ -2,8 +2,8 @@
 *Please consider donating some sats to [our Geyser.fund](https://geyser.fund/project/jukeboxbot), thank you!*
 ![ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg)
 
-**Our trust in DJ's has been broken, and we will make them obsolete!* ;)*
-*(Except for [Rootzoll](https://twitter.com/rootzoll), He the man!)*
+Our trust in DJ's has been broken, and we will make them obsolete! ;)
+*Except for [Rootzoll](https://twitter.com/rootzoll), he the man!*
 
 ## What we achieved:
 - We want the crowd to be the DJ. Our **Jukebox Bot** makes this possible.
