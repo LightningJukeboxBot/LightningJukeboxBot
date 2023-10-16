@@ -77,13 +77,15 @@ Just give the /web command to print out QR codes with you unique web-interface l
 
 ## Ideas for new features
  - Super admin stats: interface for dedicated superadmins that can see stuff like the groups that are using the bot, sats in the bot etc. 
- - Seperate queue: When folks type /queue, and the bot shows the queue, can we differentiate between what is added by plebs and what is the background playlist? Maybe by not showing the background playlist at all? We could create our own queue that is separate from the background playlist. If we manage our own queue we could also introduce features like upvoting items in the queue. 
+ - Seperate queue + add mempool.space queue design: When folks type /queue, and the bot shows the queue, it would be cool it looked like the mempool.space ux and nice to see what is added by users and which tracks are just background playlist tracks.
+- Function where user who added track can remove it from the queue and get auto-refund (for miss-clicks/wrong selections)
 - Song duration and time left displayed in TG somehow
 - Stats: /stats command to see the top jukebox stats, most requested track, top 10 of users adding tracks to the queue. 
  - NOSTR connectivity: Chat embedded on the website (NOSTR maybe?) Endusers can toggle this on or of to be dislplayed in their own videofeed. Preferably should not requre a login but users should be able to set a username or use nostr or twitter login to chat. How would this look like when there are multiple instances of the JukeBox running? Would the admin of a group provide a NOSTR private key for the bot to use in this group?
  - Web API: the ability to use the bot through a Web API. How should this work for multiple groups? Provide an API endpoint in the Group Admin chat? This should preferably be a REST API (search, results, pay, queue, currentplaying). Actually the current playing track is a kind of (limited) REST API already.
  - Congestion control #1: limmeting folks to add more tracks if the queue gets to a certain size and they already added 2 tracks in a row. This is dependent on the seperate queue function.  
  - Congestion control #2: Increase cost per added track per track that is still waiting in the queue. This is dependent on the seperate queue. 
+ - Congestion control #3: Up- and/or Downvote tracks within the queue by paying extra
  - Connect the bot to NOSTR: Users can add a NOSTR private key to their private chat (which I wouldn't do). And then in a private chat with the bot enable/disable NOSTR through a command. The JukeboxBot uses that key to post a message when a track is played.  
  - Silent disco feature! 3-channels, crowd is the dj! (this works right now, but in a somewhat convoluted way)
  - Congestion control: For busy moments, a mode where only n of x requested tracks get added to the list (fair chance). This will probably increase the load even more. Just make more requests, best way is to increase the price. 
