@@ -14,6 +14,7 @@ Not only for Radiostations, but also for live events, venues, bars and pubs, bus
 ## Our goals
 - Integrating with Wavlake with the Jukebox Lightning Bot
 So musicians get their fair share of sats that flow through the Jukebox
+Update on this: We have someone looking into it. The way the bot is currently set up, we are not quite ready for going the podcasting 2.0 route. This will howver not be forgotten. Currently work is being done on a demo to see if we can create a Proof of Cocnept for payments over Lightning and perhaps some coördination over Nostr for this. Will update when we know more. 
 - Making the Lightning Jukebox Bot more modular as to easily allow for plugging in/out more media-players & -libraries and to further bot integration over more platforms
 - Getting the bot to nostr. This process is slowly underway, see: #npub1wqtq2k9cawq2hkwz474xdm6ef0drmdhn4fk59hpyuex5l0ewa9rsj9a4cz
 
