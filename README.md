@@ -36,7 +36,7 @@ If you want to test out the functionality, there are a few options. Tune in via 
 You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
 If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
 
-The Jukebox uses LNbits in the back, meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
+The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to everyone working on that project, this would not be possible without you!), meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
 
 ## TG commands for the bot
 - /faq to show short list of options (needs updating)
