@@ -12,11 +12,23 @@ Not only for Radiostations, but also for live events, venues, bars and pubs, bus
 - It works very well for parties, pubs, or wherever else you want folks to have acces to a Lightning enabled Jukebox Bot. **GREAT FOR ORANGE PILLING FRENS & FAM!**
 
 ## Our goals
-- Integrating with Wavlake with the Jukebox Lightning Bot
-So musicians get their fair share of sats that flow through the Jukebox
-Update on this: We have someone looking into it. The way the bot is currently set up, we are not quite ready for going the podcasting 2.0 route. This will howver not be forgotten. Currently work is being done on a demo to see if we can create a Proof of Cocnept for payments over Lightning and perhaps some coördination over Nostr for this. Will update when we know more. 
-- Making the Lightning Jukebox Bot more modular as to easily allow for plugging in/out more media-players & -libraries and to further bot integration over more platforms
-- Getting the bot to nostr. This process is slowly underway, see: #npub1wqtq2k9cawq2hkwz474xdm6ef0drmdhn4fk59hpyuex5l0ewa9rsj9a4cz
+1. v4v Proof of Concept of getting musicians paid directly whenever a track is /added via the bot. We have someone looking into it. The way the bot is currently set up, we are prob not quite ready for going the podcasting 2.0 route. This will however not be forgotten. Currently work is being done on a demo to see if we can create a Proof of Concept for payments over Lightning and perhaps some coördination over Nostr for this. Will update when we know more.
+
+2. tip_nz  and Jamesviggy requested to make it possible for ingame streaming of the radio and in game jukebox functionality too. I like the id. We would probably need a .m3u or something of the audio only. Idk what would be involved in getting the functionality in game. Maybe it is as easy as projecting the web-interface to some kind of in-game plane? If the best route is doing via linnode or going dedicated hardware route, I don't know.
+
+3. Hero suggested bulding a physical jukebox, I like it, and might try design some kind of template. Although it may be better to postpone a bit. At least until I finish work on some other projects
+
+3b. Better web-interface functionality, Lums had some ideas on that. Maybe parlay with Hero and make me a flowchart once you know what is best SF can do graphics for it.
+
+4. Getting the functionality to nostr. Steps have been made by @Herovk (the TG commands that are working now in TG to also work over nostr somehow) This process is slowly underway, see: #npub1wqtq2k9cawq2hkwz474xdm6ef0drmdhn4fk59hpyuex5l0ewa9rsj9a4cz
+
+5. Making LNbits extension of the bot
+
+6. Keeping things as modular as possible
+
+7. Seeing if we can find someone to start work on making hooking in other libraries (tidal/ youtube / maybe personal libraries via winamp or some player) an option too.
+
+8. There are more ideas, but this is plenty for now.
 
 ## General info
 If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/naddr1qqjrswfevvukxvrr95cx2vt9956xyepn94snxdfs95urwwryxe3x2wfjvscn2q3qeaz6dwsnvwkha5sn5puwwyxjgy26uusundrm684lg3vw4ma5c2jsxpqqqpmxwe2sz27) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
