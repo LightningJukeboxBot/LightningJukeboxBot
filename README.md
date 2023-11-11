@@ -38,7 +38,9 @@ If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio
 
 The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to everyone working on that project, this would not be possible without you!), meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
 
-## TG commands for the bot
+## FAQ
+
+### TG commands for the bot
 - /faq to show short list of options (needs updating)
 - /add artist and track title (to add music to the /queue)
 - /history
@@ -51,7 +53,6 @@ The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to
 - /dj (used as a reply to someone to send sats. Example /dj 21 sends 21 sats)
 - /couple, /decouple, /setclientid and /setclientsecret are commands to connect your own music player to this bot and start your own Jukebox! For now, there is only Sptify Premiums upport.
 
-## FAQ
 #### How do I couple the bot to my own Spotify Premium account?
 - For now, you are sadly still required to use Telegram to connect the bot to your own Premium Spotify account. **Please keep in mind, that if you later want to stream the audio to a Telegram group, you must be OWNER of that group!** *(There is a difference between being owner and admin. Only owners can retrieve RTMP + streaming Key from a TG group)* If you are certain you don't want to stream the music into that TG group at a later date, you can just be admin. The bot will act within that group, only as a remote to your Spotify. 
 1. Invite the [Jukebox Bot](https://t.me/Jukebox_Lightning_bot) to an existing or new Telegram Group
