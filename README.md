@@ -1,4 +1,4 @@
-This software is still in development and very much alpha. Use and intgeract with it at your own risk. There are still bugs and things will probably go awry sometimes. 
+This software is still in development and very much alpha. Use and interact with it at your own risk. There are still bugs and things will probably go awry sometimes. 
 
 # A Bitcoin enabled Jukebox
 *Please consider donating some sats to [our Geyser.fund](https://geyser.fund/project/jukeboxbot), thank you!*
