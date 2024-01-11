@@ -33,7 +33,7 @@ Not only for Radiostations, but also for live events, venues, bars and pubs, bus
 8. There are more ideas, but this is plenty for now.
 
 ## General info
-If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/naddr1qqjrswfevvukxvrr95cx2vt9956xyepn94snxdfs95urwwryxe3x2wfjvscn2q3qeaz6dwsnvwkha5sn5puwwyxjgy26uusundrm684lg3vw4ma5c2jsxpqqqpmxwe2sz27) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
+If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/noderunnersradio) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
 
 You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
 If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
