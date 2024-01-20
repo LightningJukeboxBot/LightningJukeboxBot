@@ -5,7 +5,7 @@ This software is still in development and very much alpha. Use and interact with
 ![ssets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/main/Assets/LightningJukeboxBot.jpg)
 
 Our trust in DJ's has been broken, and we will make them obsolete! ;)
-*Except for [Rootzoll](https://twitter.com/rootzoll), he the man!* 
+*Except for [Rootzoll](https://twitter.com/rootzoll) & [DJ Valerie B LOVE](https://twitter.com/djvalerieblove), and other such Bitcoin friendly DJ's!* 
 
 ## What we achieved:
 - We want the crowd to be the DJ. Our **Jukebox Bot** makes this possible.
@@ -151,15 +151,6 @@ Just give the /web command to print out QR codes with you unique web-interface l
  - Faster payment feedback
  - Payment feedback in payment HTML page
  - Create nicely designed payment page for funding
-
-## Test
-Connect bot to test group
-Disconnect from spotify
-queue
-history
-add
-
-*We still like some DJ's don't worry. You can pauze the bot any time if you want to play dictator and ruin everyone's fun :p ;)
 
 ## Disclaimer
 It is your own responsibility to mind licensing and copyright laws in your region.
