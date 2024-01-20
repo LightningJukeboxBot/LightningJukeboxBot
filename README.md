@@ -160,3 +160,6 @@ history
 add
 
 *We still like some DJ's don't worry. You can pauze the bot any time if you want to play dictator and ruin everyone's fun :p ;)
+
+## Disclaimer
+It is your own responsibility to mind licensing and copyright laws in your region.
