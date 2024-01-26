@@ -152,11 +152,5 @@ Just give the /web command to print out QR codes with you unique web-interface l
  - Payment feedback in payment HTML page
  - Create nicely designed payment page for funding
 
-## Test
-Connect bot to test group
-Disconnect from spotify
-queue
-history
-add
-
-*We still like some DJ's don't worry. You can pauze the bot any time if you want to play dictator and ruin everyone's fun :p ;)
+## DISCLAIMER:
+You are responsible for using this and bot and any third party software it may interect with in line with the licensing laws in your region. 
