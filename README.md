@@ -66,7 +66,7 @@ The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to
 7. Click 'Edit Settings' and add **EXACTLY** this url https://jukebox.lighting/spotify under 'Redirect URIs'. Do not forget to click 'Add' and 'Save'
 8. Copy the Client ID and give the bot this command in a Private Message and paste the client ID after it: /setclientid PasteClientID
 9. Copy the Client Secret and give the bot this command in a Private Message and paste the secret after it: /setclientsecret PasteClientID
-10. Now, make sure your spotify is playing music. *(We recommend setting a playlist to reteat continuously)*
+10. Now, make sure your spotify is playing music. *(We recommend setting a playlist to repeat continuously)*
 11. Next, return to the group you made the bot admin of and type this command: /couple
 12. The bot should give you a message with a button to click to finalize coupling your account. Click it!
 13. The browser should open up, and you will see this message if all went well: *Authorisation Succesfull! You can close this window now.*
@@ -86,7 +86,7 @@ Just give the /web command to print out QR codes with you unique web-interface l
 6. Add sources (select spotify exe), you may choose to add a microphone or imagery for your video feed
 7. **Important**: set all audio outputs under 'Audio Mixer' to  -3 dB
 8. If you are owner of a TG group, you can find the RTMP settings behind the symbol on the dopright (**TG-desktop op ONLY!**) that looks like a speech-balloon with three vertical lines in it.
-9. Enter the RTMP werver of your TG group into OBS settings
+9. Enter the RTMP server of your TG group into OBS settings
 10. Do the same for the key
 11. Click, start streaming to begin streaming into TG
 12. If you want to ouput to multiple locations, [use this plugin](https://obsproject.com/forum/resources/multiple-rtmp-outputs-plugin.964/)
