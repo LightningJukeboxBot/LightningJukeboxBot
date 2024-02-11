@@ -153,15 +153,16 @@ var createUI = (currentqueue, results) => {
     setHeight("20px")(red);
     setHeight("20px")(green);
     setHeight("20px")(blue);
-    const setTabStyle = (tab) => {
+    const setTabStyle = (tab, active = true) => {
       const style = tab.style;
       style.width = tabwidth + `rem`;
       style.position = "absolute";
       style.bottom = "0";
-      style.height = "-webkit-fill-available";
+      style.height = active ? "100%" : "60%";
       style.borderRadius = "5px 5px 0 0";
       style.display = "grid";
       style.placeItems = "center";
+      style.transition = "height 0.5s ease";
     };
     const setRedCb = (cb) => {
       red.onclick = cb;
@@ -172,11 +173,21 @@ var createUI = (currentqueue, results) => {
     const setBlueCb = (cb) => {
       blue.onclick = cb;
     };
+    const setTabsHeights2 = (color) => {
+      [red, green, blue].forEach((e) => {
+        if (e.id === color) {
+          console.log(e.id);
+          setTabStyle(e);
+        } else {
+          setTabStyle(e, false);
+        }
+      });
+    };
     [red, green, blue].forEach((e) => setTabStyle(e));
     container.appendChild(red);
     container.appendChild(green);
     container.appendChild(blue);
-    return [container, [setRedCb, setGreebCb, setBlueCb]];
+    return [container, [setRedCb, setGreebCb, setBlueCb], setTabsHeights2];
   };
   const createDisplay = () => {
     const container = createDiv();
@@ -464,7 +475,7 @@ var createUI = (currentqueue, results) => {
     return [container, setColor];
   };
   const webui = createWebui();
-  const [tabs, tabEvents] = createTabs();
+  const [tabs, tabEvents, setTabsHeights] = createTabs();
   const [display, setDisplayColor] = createDisplay();
   const header = createHeader("NIRVANA - SMELLS LIKE TEEN SPIRIT");
   const [infos, setInfosOnClick, setInfosTextColor] = createInfos("21 SATS PER TRACK & PER DOWN VOTE");
@@ -491,6 +502,7 @@ var createUI = (currentqueue, results) => {
   setDisplayColor(activeTab);
   setFooterColor(activeTab);
   setPlaceholderColor(activeTab);
+  setTabsHeights(activeTab);
   webui.appendChild(tabs);
   webui.appendChild(display);
   display.appendChild(header);
@@ -510,6 +522,7 @@ var createUI = (currentqueue, results) => {
     setQueueBgColor(tab);
     setVoteColor(tab);
     setTracksInfoColor(tab);
+    setTabsHeights(tab);
   };
   tabEvents.forEach((es) => es((e) => {
     const element = e.target;

@@ -105,7 +105,11 @@ const createUI = (currentqueue: string[], results?: string[]) => {
     setWebUIStyle();
     return container;
   };
-  const createTabs = (): [HTMLElement, [eventCb, eventCb, eventCb]] => {
+  const createTabs = (): [
+    HTMLElement,
+    [eventCb, eventCb, eventCb],
+    colorCb
+  ] => {
     const container = createDiv();
     container.id = "tabs-area";
     container.style.position = "relative";
@@ -146,15 +150,16 @@ const createUI = (currentqueue: string[], results?: string[]) => {
     setHeight("20px")(red);
     setHeight("20px")(green);
     setHeight("20px")(blue);
-    const setTabStyle = (tab: HTMLElement) => {
+    const setTabStyle = (tab: HTMLElement, active: boolean = true) => {
       const style = tab.style;
       style.width = tabwidth + `rem`;
       style.position = "absolute";
       style.bottom = "0";
-      style.height = "-webkit-fill-available";
+      style.height = active ? "100%" : "60%";
       style.borderRadius = "5px 5px 0 0";
       style.display = "grid";
       style.placeItems = "center";
+      style.transition = "height 0.5s ease";
     };
     const setRedCb = (cb: (e: MouseEvent) => void) => {
       red.onclick = cb;
@@ -165,11 +170,21 @@ const createUI = (currentqueue: string[], results?: string[]) => {
     const setBlueCb = (cb: (e: MouseEvent) => void) => {
       blue.onclick = cb;
     };
+    const setTabsHeights = (color: string) => {
+      [red, green, blue].forEach((e) => {
+        if (e.id === color) {
+          console.log(e.id);
+          setTabStyle(e);
+        } else {
+          setTabStyle(e, false);
+        }
+      });
+    };
     [red, green, blue].forEach((e) => setTabStyle(e));
     container.appendChild(red);
     container.appendChild(green);
     container.appendChild(blue);
-    return [container, [setRedCb, setGreebCb, setBlueCb]];
+    return [container, [setRedCb, setGreebCb, setBlueCb], setTabsHeights];
   };
   const createDisplay = (): [HTMLElement, colorCb] => {
     const container = createDiv();
@@ -482,7 +497,7 @@ const createUI = (currentqueue: string[], results?: string[]) => {
   };
 
   const webui = createWebui();
-  const [tabs, tabEvents] = createTabs();
+  const [tabs, tabEvents, setTabsHeights] = createTabs();
   const [display, setDisplayColor] = createDisplay();
   const header = createHeader("NIRVANA - SMELLS LIKE TEEN SPIRIT");
   const [infos, setInfosOnClick, setInfosTextColor] = createInfos(
@@ -513,6 +528,7 @@ const createUI = (currentqueue: string[], results?: string[]) => {
   setDisplayColor(activeTab);
   setFooterColor(activeTab);
   setPlaceholderColor(activeTab);
+  setTabsHeights(activeTab);
 
   webui.appendChild(tabs);
   webui.appendChild(display);
@@ -533,6 +549,8 @@ const createUI = (currentqueue: string[], results?: string[]) => {
     setQueueBgColor(tab);
     setVoteColor(tab);
     setTracksInfoColor(tab);
+    setTabsHeights(tab);
+    // console.log("cb");
   };
   tabEvents.forEach((es) =>
     es((e) => {
@@ -574,6 +592,7 @@ const createUI = (currentqueue: string[], results?: string[]) => {
 
 const body = document.body;
 ///// CLIENT
+
 const results = getResults();
 const queue = getQueue();
 const [ui, inputValueCb, searchResultCb, setVotesCb, showResult] =
