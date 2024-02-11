@@ -1,9 +1,96 @@
 // web/src/setup.ts
+var innerRed = `#ff8a8d`;
 var darkRed = `#c50200`;
 var superDark = `#720000`;
+var greenLight = `#a5f782`;
+var greencolor = `#73d04c`;
+var blueLight = `#8ba5f6`;
+var bluecolor = `#5e84fc`;
+var tabwidth = 6;
+var tabHeight = 7;
+var footerHeight = 7;
+var tabIconsSize = 32;
 var medSection = 6;
 var bigSection = 9;
 var spaces = [medSection, medSection, bigSection];
+var tabsSettings = {
+  tabSize: `${tabIconsSize}px`,
+  height: (active) => active ? "100%" : "60%",
+  width: tabwidth + `rem`,
+  position: "absolute",
+  bottom: "0",
+  borderRadius: "5px 5px 0 0",
+  display: "grid",
+  placeItems: "center",
+  transition: "height 0.5s ease",
+  container: {
+    id: "tab-area",
+    position: "relative",
+    height: tabHeight + "cqh"
+  },
+  redTab: {
+    id: "red-tab",
+    iconFilename: "Red-tab-icon",
+    icon: { id: "red-tab-icon" },
+    bgColor: darkRed
+  },
+  greenTab: {
+    id: "green-tab",
+    iconFilename: "green-tab-icon",
+    icon: { id: "green-tab-icon" },
+    bgColor: greencolor,
+    left: tabwidth + `rem`
+  },
+  blueTab: {
+    id: "blue-tab",
+    iconFilename: "blue-tab-icon",
+    icon: { id: "blue-tab-icon" },
+    bgColor: bluecolor,
+    left: tabwidth * 2 + `rem`
+  }
+};
+var displaySettings = {
+  container: {
+    id: "display-area",
+    height: 100 - [tabHeight, footerHeight].reduce((p, c) => p + c) + "cqh",
+    containerType: "size"
+  }
+};
+var footerSettings = {
+  container: {
+    id: "footer-container",
+    subcontainer: {
+      id: "footer-subcontainer",
+      style: {
+        gridTemplateColumns: "1fr 1fr 1fr 1fr",
+        placeSelf: "center",
+        placeItems: "center",
+        width: "90cqw"
+      }
+    },
+    style: {
+      height: footerHeight + `cqh`,
+      placeContent: "center",
+      placeItems: "center"
+    }
+  },
+  icons: {
+    style: {
+      height: "24px",
+      cursor: "pointer",
+      attribute1: { key: "href" },
+      attribute2: { key: "target", value: "_blank" },
+      placeSelf: "center",
+      palceItems: "center"
+    }
+  }
+};
+
+// web/src/lib/tabColorsMap.ts
+var tabColorsMap = new Map;
+tabColorsMap.set(tabsSettings.redTab.id, innerRed);
+tabColorsMap.set(tabsSettings.greenTab.id, greenLight);
+tabColorsMap.set(tabsSettings.blueTab.id, blueLight);
 
 // web/src/utils.ts
 var setMargin = (margin) => (element) => element.style.margin = margin;

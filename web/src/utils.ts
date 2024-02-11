@@ -1,4 +1,5 @@
 import { bigSection, medSection, spaces } from "./setup";
+import { tabColorsMap } from "./lib/tabColorsMap";
 
 export const openPopUp = (url: string, target: string, features: string) =>
   window.open(url, target, features);
@@ -13,6 +14,7 @@ export const setDisplay = (display: string) => (element: HTMLElement) =>
   (element.style.display = display);
 export const setBorderRadius = (radius: string) => (element: HTMLElement) =>
   (element.style.borderRadius = radius);
+
 // utils
 export const setMargin0 = setMargin("0");
 export const setMargin1rem = setMargin("1rem");
@@ -28,6 +30,13 @@ export const setElementStyle = (element: HTMLElement, text: HTMLElement) => {
   setBorderRadius("4px")(element);
   text.style.padding = "0.3rem";
   text.style.color = "black";
+};
+export const setElementColor = (element: HTMLElement) => (color: string) => {
+  element.style.color = tabColorsMap.get(color);
+};
+
+export const setElementBgColor = (element: HTMLElement) => (color: string) => {
+  element.style.backgroundColor = tabColorsMap.get(color);
 };
 
 export const createDiv = () => document.createElement("div");
