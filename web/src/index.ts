@@ -515,13 +515,10 @@ const createUI = (currentqueue: string[], results?: string[]) => {
   const [queue, votesCbs, setQueueBgColor, setVoteColor, setTracksInfoColor] =
     createQueue(currentqueue);
   const [footer, setFooterColor] = createFooter([
-    [makeIconPath("telegram-icon"), "urltelegram"],
-    [
-      makeIconPath("github-cion"),
-      "https://github.com/LightningJukeboxBot/LightningJukeboxBot",
-    ],
-    [makeIconPath("x-icon"), "urlx"],
-    [makeIconPath("nrfm-icon"), "urlnrfm"],
+    [makeIconPath("telegram-icon"), telegramLink],
+    [makeIconPath("github-cion"), githubLink],
+    [makeIconPath("x-icon"), xLink],
+    [makeIconPath("nrfm-icon"), nrfmLink],
   ]);
   const activeTab = "red-tab";
   setMargin0(body);
