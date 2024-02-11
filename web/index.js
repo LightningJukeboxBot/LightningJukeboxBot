@@ -18,6 +18,10 @@ var tabIconsSize = 32;
 var medSection = 6;
 var bigSection = 9;
 var spaces = [medSection, medSection, bigSection];
+var telegramLink = "https://tnl.productions";
+var githubLink = "https://github.com/LightningJukeboxBot/LightningJukeboxBot";
+var xLink = "https://tnl.productions";
+var nrfmLink = "https://tnl.productions";
 
 // web/src/utils.ts
 var openPopUp = (url, target, features) => window.open(url, target, features);
@@ -204,7 +208,8 @@ var createUI = (currentqueue, results) => {
     container.id = "jb-header";
     setHeight9cqh(container);
     const nowPlaying = createP();
-    nowPlaying.textContent = "NOW PLAYING: " + songinfostext;
+    const makeText = (track) => `NOW PLAYING: ${track}`;
+    nowPlaying.textContent = makeText(songinfostext);
     const setNowPlayingStyle = () => {
       const style = nowPlaying.style;
       const margintb = "0.3rem";
@@ -217,10 +222,13 @@ var createUI = (currentqueue, results) => {
       style.borderBottom = "solid 1px white";
       style.fontSize = fontMid;
     };
+    const setNowPlayingTrack2 = (track) => {
+      nowPlaying.textContent = makeText(track);
+    };
     setNowPlayingStyle();
     setDisplayFlex(container);
     container.appendChild(nowPlaying);
-    return container;
+    return [container, setNowPlayingTrack2];
   };
   const createInfos = (text) => {
     const container = createDiv();
@@ -477,7 +485,7 @@ var createUI = (currentqueue, results) => {
   const webui = createWebui();
   const [tabs, tabEvents, setTabsHeights] = createTabs();
   const [display, setDisplayColor] = createDisplay();
-  const header = createHeader("NIRVANA - SMELLS LIKE TEEN SPIRIT");
+  const [header, setNowPlayingTrack] = createHeader("NIRVANA - SMELLS LIKE TEEN SPIRIT");
   const [infos, setInfosOnClick, setInfosTextColor] = createInfos("21 SATS PER TRACK & PER DOWN VOTE");
   const [searchbar, setPlaceholderColor, inputValueCb, setIconSrc] = createSearchbar("red-search");
   const main = createMain();
@@ -538,12 +546,26 @@ var createUI = (currentqueue, results) => {
   setInfosOnClick(async (e) => {
     openPopUp("http://127.0.0.1:5500/web/popup.html", "_blank", "width=286, height=466");
   });
-  return [webui, inputValueCb, searchResultCb, setVotesCb, showResult];
+  return [
+    webui,
+    inputValueCb,
+    searchResultCb,
+    setVotesCb,
+    showResult,
+    setNowPlayingTrack
+  ];
 };
 var body = document.body;
 var results = getResults();
 var queue = getQueue();
-var [ui, inputValueCb, searchResultCb, setVotesCb, showResult] = createUI(queue);
+var [
+  ui,
+  inputValueCb,
+  searchResultCb,
+  setVotesCb,
+  showResult,
+  setNowPlayingTrack
+] = createUI(queue);
 body.prepend(ui);
 inputValueCb((e) => {
   console.log(e);
@@ -551,3 +573,4 @@ inputValueCb((e) => {
 });
 searchResultCb((e) => console.log(e.currentTarget));
 setVotesCb((e) => console.log(e.currentTarget), (e) => console.log(e.currentTarget));
+setTimeout(() => setNowPlayingTrack("Gotek - Antistress"), 3000);

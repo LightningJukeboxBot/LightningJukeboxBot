@@ -16,6 +16,10 @@ import {
   tabIconsSize,
   tabwidth,
   vote,
+  telegramLink,
+  githubLink,
+  xLink,
+  nrfmLink,
 } from "./setup";
 import {
   createButton,
@@ -50,6 +54,7 @@ const getQueue = () => {
 const createUI = (currentqueue: string[], results?: string[]) => {
   type eventCb = (cb: (e: MouseEvent) => void) => void;
   type colorCb = (color: string) => void;
+  type trackCb = (track: string) => void;
   type resultSetter = (res: string[]) => [HTMLElement, eventCb][];
 
   const map = new Map();
@@ -197,14 +202,15 @@ const createUI = (currentqueue: string[], results?: string[]) => {
 
     return [container, setColor];
   };
-  const createHeader = (songinfostext: string) => {
+  const createHeader = (songinfostext: string): [HTMLElement, trackCb] => {
     const container = createDiv();
     container.style.placeItems = "center";
     container.style.placeContent = "space-evenly";
     container.id = "jb-header";
     setHeight9cqh(container);
     const nowPlaying = createP();
-    nowPlaying.textContent = "NOW PLAYING: " + songinfostext;
+    const makeText = (track: string) => `NOW PLAYING: ${track}`;
+    nowPlaying.textContent = makeText(songinfostext);
     const setNowPlayingStyle = () => {
       const style = nowPlaying.style;
       const margintb = "0.3rem";
@@ -217,10 +223,13 @@ const createUI = (currentqueue: string[], results?: string[]) => {
       style.borderBottom = "solid 1px white";
       style.fontSize = fontMid;
     };
+    const setNowPlayingTrack: trackCb = (track) => {
+      nowPlaying.textContent = makeText(track);
+    };
     setNowPlayingStyle();
     setDisplayFlex(container);
     container.appendChild(nowPlaying);
-    return container;
+    return [container, setNowPlayingTrack];
   };
   const createInfos = (text: string): [HTMLElement, eventCb, colorCb] => {
     const container = createDiv();
@@ -499,7 +508,9 @@ const createUI = (currentqueue: string[], results?: string[]) => {
   const webui = createWebui();
   const [tabs, tabEvents, setTabsHeights] = createTabs();
   const [display, setDisplayColor] = createDisplay();
-  const header = createHeader("NIRVANA - SMELLS LIKE TEEN SPIRIT");
+  const [header, setNowPlayingTrack] = createHeader(
+    "NIRVANA - SMELLS LIKE TEEN SPIRIT"
+  );
   const [infos, setInfosOnClick, setInfosTextColor] = createInfos(
     "21 SATS PER TRACK & PER DOWN VOTE"
   );
@@ -578,12 +589,20 @@ const createUI = (currentqueue: string[], results?: string[]) => {
       "width=286, height=466"
     );
   });
-  return [webui, inputValueCb, searchResultCb, setVotesCb, showResult] as [
+  return [
+    webui,
+    inputValueCb,
+    searchResultCb,
+    setVotesCb,
+    showResult,
+    setNowPlayingTrack,
+  ] as [
     HTMLElement,
     (cb: (inputvalue: string) => void) => void,
     (cb: (e: MouseEvent) => void) => void,
     (down: (e: MouseEvent) => void, up: (e: MouseEvent) => void) => void,
-    resultSetter
+    resultSetter,
+    trackCb
   ];
 };
 
@@ -592,8 +611,14 @@ const body = document.body;
 
 const results = getResults();
 const queue = getQueue();
-const [ui, inputValueCb, searchResultCb, setVotesCb, showResult] =
-  createUI(queue);
+const [
+  ui,
+  inputValueCb,
+  searchResultCb,
+  setVotesCb,
+  showResult,
+  setNowPlayingTrack,
+] = createUI(queue);
 
 body.prepend(ui);
 
@@ -608,3 +633,4 @@ setVotesCb(
   (e) => console.log(e.currentTarget),
   (e) => console.log(e.currentTarget)
 );
+setTimeout(() => setNowPlayingTrack("Gotek - Antistress"), 3000);
