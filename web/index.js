@@ -1,31 +1,76 @@
+// web/src/setup.ts
+var vote = true;
+var innerRed = `#ff8a8d`;
+var darkRed = `#c50200`;
+var superDark = `#720000`;
+var greenLight = `#a5f782`;
+var greencolor = `#73d04c`;
+var greenDark = `#27821a`;
+var blueLight = `#8ba5f6`;
+var bluecolor = `#5e84fc`;
+var blueDark = `#0d459d`;
+var fontMid = `"1.3rem"`;
+var tabwidth = 6;
+var tabHeight = 7;
+var footerHeight = 7;
+var gridTemplate = "1fr 5fr 1fr";
+var tabIconsSize = 32;
+var medSection = 6;
+var bigSection = 9;
+var spaces = [medSection, medSection, bigSection];
+
+// web/src/utils.ts
+var openPopUp = (url, target, features) => window.open(url, target, features);
+var setMargin = (margin) => (element) => element.style.margin = margin;
+var setHeight = (height) => (element) => element.style.height = height;
+var setDisplay = (display) => (element) => element.style.display = display;
+var setBorderRadius = (radius) => (element) => element.style.borderRadius = radius;
+var setMargin0 = setMargin("0");
+var setMargin1rem = setMargin("1rem");
+var setHeight6cqh = setHeight(`${medSection}cqh`);
+var setHeight9cqh = setHeight(`${bigSection}cqh`);
+var setHeight91cqh = setHeight(`${100 - spaces.reduce((p, c) => p + c)}cqh`);
+var setDisplayFlex = setDisplay("flex");
+var setDisplayGrid = setDisplay("grid");
+var setElementStyle = (element, text) => {
+  setMargin("3px")(element);
+  setBorderRadius("4px")(element);
+  text.style.padding = "0.3rem";
+  text.style.color = "black";
+};
+var createDiv = () => document.createElement("div");
+var createSvg = (src, height = "1rem") => {
+  const svg = document.createElement("img");
+  svg.setAttribute("src", src);
+  setHeight(height)(svg);
+  return svg;
+};
+var createP = () => {
+  const p = document.createElement("p");
+  setMargin0(p);
+  return p;
+};
+var createButton = (image) => {
+  const button = document.createElement("button");
+  button.style.border = "none";
+  button.style.backgroundColor = "white";
+  button.style.borderRadius = "4px";
+  const svg = createSvg(image);
+  svg.style.height = "1.3rem";
+  button.appendChild(svg);
+  return button;
+};
+var makeIconPath = (icon) => `../Assets/icons/${icon}.svg`;
+var makeLinearGradient = (colora, colorb) => `linear-gradient(180deg,${colora},${colorb})`;
+
 // web/src/index.ts
-console.log("test");
-var createUI = () => {
-  const vote = true;
-  const innerRed = `#ff8a8d`;
-  const darkRed = `#c50200`;
-  const superDark = `#720000`;
-  const greenLight = `#a5f782`;
-  const greencolor = `#73d04c`;
-  const greenDark = `#27821a`;
-  const blueLight = `#8ba5f6`;
-  const bluecolor = `#5e84fc`;
-  const blueDark = `#0d459d`;
-  const fontMid = `"1.3rem"`;
-  const tabwidth = 6;
-  const tabHeight = 7;
-  const footerHeight = 7;
-  const gridTemplate = "1fr 5fr 1fr";
-  const tabIconsSize = 32;
-  const medSection = 6;
-  const bigSection = 9;
-  const spaces = [medSection, medSection, bigSection];
-  const getResults = () => {
-    return new Array(25).fill("EMPTY");
-  };
-  const getQueue = () => {
-    return new Array(25).fill("I WILL BE THERE");
-  };
+var getResults = () => {
+  return new Array(25).fill("EMPTY");
+};
+var getQueue = () => {
+  return new Array(25).fill("I WILL BE THERE");
+};
+var createUI = (currentqueue, results) => {
   const map = new Map;
   map.set("red-tab", innerRed);
   map.set("green-tab", greenLight);
@@ -36,8 +81,6 @@ var createUI = () => {
   const setElementBgColor = (element) => (color) => {
     element.style.backgroundColor = map.get(color);
   };
-  const makeLinearGradient = (colora, colorb) => `linear-gradient(180deg,${colora},${colorb})`;
-  const makeIconPath = (icon) => `../Assets/icons/${icon}.svg`;
   const redGradient = makeLinearGradient(darkRed, superDark);
   const alldarkred = makeLinearGradient(superDark, superDark);
   const greenGradient = makeLinearGradient(greencolor, greenDark);
@@ -65,45 +108,6 @@ var createUI = () => {
   placeholderColors.set("green-tab-icon", greencolor);
   placeholderColors.set("blue-tab", bluecolor);
   placeholderColors.set("blue-tab-icon", bluecolor);
-  const setMargin = (margin) => (element) => element.style.margin = margin;
-  const setHeight = (height) => (element) => element.style.height = height;
-  const setDisplay = (display2) => (element) => element.style.display = display2;
-  const setBorderRadius = (radius) => (element) => element.style.borderRadius = radius;
-  const setMargin0 = setMargin("0");
-  const setMargin1rem = setMargin("1rem");
-  const setHeight6cqh = setHeight(`${medSection}cqh`);
-  const setHeight9cqh = setHeight(`${bigSection}cqh`);
-  const setHeight91cqh = setHeight(`${100 - spaces.reduce((p, c) => p + c)}cqh`);
-  const setDisplayFlex = setDisplay("flex");
-  const setDisplayGrid = setDisplay("grid");
-  const setElementStyle = (element, text) => {
-    setMargin("3px")(element);
-    setBorderRadius("4px")(element);
-    text.style.padding = "0.3rem";
-    text.style.color = "black";
-  };
-  const createDiv = () => document.createElement("div");
-  const createSvg = (src, height = "1rem") => {
-    const svg = document.createElement("img");
-    svg.setAttribute("src", src);
-    setHeight(height)(svg);
-    return svg;
-  };
-  const createP = () => {
-    const p = document.createElement("p");
-    setMargin0(p);
-    return p;
-  };
-  const createButton = (image) => {
-    const button = document.createElement("button");
-    button.style.border = "none";
-    button.style.backgroundColor = "white";
-    button.style.borderRadius = "4px";
-    const svg = createSvg(image);
-    svg.style.height = "1.3rem";
-    button.appendChild(svg);
-    return button;
-  };
   const createWebui = () => {
     const container = createDiv();
     container.id = "webui";
@@ -288,7 +292,7 @@ var createUI = () => {
     container.style.gridTemplateRows = "1fr 1.4fr";
     return container;
   };
-  const createSearchResult = (results) => {
+  const createSearchResult = (results2) => {
     const container = createDiv();
     container.id = "results-area";
     container.style.overflow = "scroll";
@@ -308,16 +312,25 @@ var createUI = () => {
       };
       return [container2, setSearchResultCb];
     };
-    const resultsElements = results.map(createResult);
-    resultsElements.forEach((e) => container.appendChild(e[0]));
     const setResultBackgroundColor2 = setElementBgColor(container);
-    return [
-      container,
-      resultsElements.map((e) => e[1]),
-      setResultBackgroundColor2
-    ];
+    const showResult2 = (res) => {
+      const resultsElements = res.map(createResult);
+      resultsElements.forEach((e) => container.appendChild(e[0]));
+      return resultsElements;
+    };
+    if (results2) {
+      const resultsElements = showResult2(results2);
+      return [
+        container,
+        resultsElements.map((e) => e[1]),
+        setResultBackgroundColor2,
+        showResult2
+      ];
+    } else {
+      return [container, [], setResultBackgroundColor2, showResult2];
+    }
   };
-  const createQueue = (currentqueue) => {
+  const createQueue = (currentqueue2) => {
     const container = createDiv();
     container.style.overflow = "hidden";
     setDisplayGrid(container);
@@ -399,7 +412,7 @@ var createUI = () => {
     const setTrackInfoColor = (color) => setElementColor(tracksnumber)(color);
     content.style.marginTop = "0.2rem";
     content.style.marginBottom = "0.2rem";
-    const queuelements = currentqueue.map(createQueueElement);
+    const queuelements = currentqueue2.map(createQueueElement);
     queuelements.forEach((e) => content.appendChild(e[0]));
     container.appendChild(queueheader);
     container.appendChild(content);
@@ -457,8 +470,13 @@ var createUI = () => {
   const [infos, setInfosOnClick, setInfosTextColor] = createInfos("21 SATS PER TRACK & PER DOWN VOTE");
   const [searchbar, setPlaceholderColor, inputValueCb, setIconSrc] = createSearchbar("red-search");
   const main = createMain();
-  const [searchResults, searchResultCbSetters, setResultBackgroundColor] = createSearchResult(getResults());
-  const [queue, votesCbs, setQueueBgColor, setVoteColor, setTracksInfoColor] = createQueue(getQueue());
+  const [
+    searchResults,
+    searchResultCbSetters,
+    setResultBackgroundColor,
+    showResult
+  ] = createSearchResult(results);
+  const [queue, votesCbs, setQueueBgColor, setVoteColor, setTracksInfoColor] = createQueue(currentqueue);
   const [footer, setFooterColor] = createFooter([
     [makeIconPath("telegram-icon"), "urltelegram"],
     [
@@ -497,23 +515,29 @@ var createUI = () => {
     const element = e.target;
     setActive(element.id);
   }));
-  const searchResultCb = (cb) => searchResultCbSetters.forEach((e) => e(cb));
+  const searchResultCb = (cb) => {
+    if (searchResultCbSetters.length !== 0)
+      searchResultCbSetters.forEach((e) => e(cb));
+  };
   const setVotesCb = (down, up) => {
     const downs = votesCbs[0];
     const ups = votesCbs[1];
     downs.forEach((d) => d(down));
     ups.forEach((d) => d(up));
   };
-  return [webui, setInfosOnClick, inputValueCb, searchResultCb, setVotesCb];
+  setInfosOnClick(async (e) => {
+    openPopUp("http://127.0.0.1:5500/web/popup.html", "_blank", "width=286, height=466");
+  });
+  return [webui, inputValueCb, searchResultCb, setVotesCb, showResult];
 };
 var body = document.body;
-var [ui, setInfosOnClick, inputValueCb, searchResultCb, setVotesCb] = createUI();
+var results = getResults();
+var queue = getQueue();
+var [ui, inputValueCb, searchResultCb, setVotesCb, showResult] = createUI(queue);
 body.prepend(ui);
-setInfosOnClick((e) => {
-  console.log(e.target);
-});
 inputValueCb((e) => {
   console.log(e);
+  showResult(results);
 });
 searchResultCb((e) => console.log(e.currentTarget));
 setVotesCb((e) => console.log(e.currentTarget), (e) => console.log(e.currentTarget));
