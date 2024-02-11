@@ -1,38 +1,56 @@
-console.log("test");
+import {
+  innerRed,
+  bigSection,
+  blueDark,
+  blueLight,
+  bluecolor,
+  darkRed,
+  fontMid,
+  footerHeight,
+  greenDark,
+  greenLight,
+  greencolor,
+  gridTemplate,
+  superDark,
+  tabHeight,
+  tabIconsSize,
+  tabwidth,
+  vote,
+} from "./setup";
+import {
+  createButton,
+  createDiv,
+  createP,
+  createSvg,
+  makeIconPath,
+  makeLinearGradient,
+  openPopUp,
+  setBorderRadius,
+  setDisplayFlex,
+  setDisplayGrid,
+  setElementStyle,
+  setHeight,
+  setHeight6cqh,
+  setHeight91cqh,
+  setHeight9cqh,
+  setMargin0,
+  setMargin1rem,
+} from "./utils";
+
 export {};
 
-const createUI = () => {
+const getResults = () => {
+  return new Array(25).fill("EMPTY");
+};
+
+const getQueue = () => {
+  return new Array(25).fill("I WILL BE THERE");
+};
+
+const createUI = (currentqueue: string[], results?: string[]) => {
   type eventCb = (cb: (e: MouseEvent) => void) => void;
   type colorCb = (color: string) => void;
-
-  const vote = true;
-
-  const innerRed = `#ff8a8d`;
-  const darkRed = `#c50200`;
-  const superDark = `#720000`;
-  const greenLight = `#a5f782`;
-  const greencolor = `#73d04c`;
-  const greenDark = `#27821a`;
-  const blueLight = `#8ba5f6`;
-  const bluecolor = `#5e84fc`;
-  const blueDark = `#0d459d`;
-  const fontMid = `"1.3rem"`;
-  const tabwidth = 6;
-  const tabHeight = 7;
-  const footerHeight = 7;
-  const gridTemplate = "1fr 5fr 1fr";
-  const tabIconsSize = 32;
-  const medSection = 6;
-  const bigSection = 9;
-  const spaces = [medSection, medSection, bigSection];
-
-  const getResults = () => {
-    return new Array(25).fill("EMPTY");
-  };
-
-  const getQueue = () => {
-    return new Array(25).fill("I WILL BE THERE");
-  };
+  type resultSetter = (res: string[]) => [HTMLElement, eventCb][];
 
   const map = new Map();
   map.set("red-tab", innerRed);
@@ -44,11 +62,6 @@ const createUI = () => {
   const setElementBgColor = (element: HTMLElement) => (color: string) => {
     element.style.backgroundColor = map.get(color);
   };
-
-  const makeLinearGradient = (colora: string, colorb: string) =>
-    `linear-gradient(180deg,${colora},${colorb})`;
-
-  const makeIconPath = (icon: string) => `../Assets/icons/${icon}.svg`;
 
   const redGradient = makeLinearGradient(darkRed, superDark);
   const alldarkred = makeLinearGradient(superDark, superDark);
@@ -78,54 +91,6 @@ const createUI = () => {
   placeholderColors.set("green-tab-icon", greencolor);
   placeholderColors.set("blue-tab", bluecolor);
   placeholderColors.set("blue-tab-icon", bluecolor);
-
-  const setMargin = (margin: string) => (element: HTMLElement) =>
-    (element.style.margin = margin);
-  const setHeight = (height: string) => (element: HTMLElement) =>
-    (element.style.height = height);
-  const setDisplay = (display: string) => (element: HTMLElement) =>
-    (element.style.display = display);
-  const setBorderRadius = (radius: string) => (element: HTMLElement) =>
-    (element.style.borderRadius = radius);
-  // utils
-  const setMargin0 = setMargin("0");
-  const setMargin1rem = setMargin("1rem");
-  const setHeight6cqh = setHeight(`${medSection}cqh`);
-  const setHeight9cqh = setHeight(`${bigSection}cqh`);
-  const setHeight91cqh = setHeight(
-    `${100 - spaces.reduce((p, c) => p + c)}cqh`
-  );
-  const setDisplayFlex = setDisplay("flex");
-  const setDisplayGrid = setDisplay("grid");
-  const setElementStyle = (element: HTMLElement, text: HTMLElement) => {
-    setMargin("3px")(element);
-    setBorderRadius("4px")(element);
-    text.style.padding = "0.3rem";
-    text.style.color = "black";
-  };
-
-  const createDiv = () => document.createElement("div");
-  const createSvg = (src: string, height: string = "1rem") => {
-    const svg = document.createElement("img");
-    svg.setAttribute("src", src);
-    setHeight(height)(svg);
-    return svg;
-  };
-  const createP = () => {
-    const p = document.createElement("p");
-    setMargin0(p);
-    return p;
-  };
-  const createButton = (image: string) => {
-    const button = document.createElement("button");
-    button.style.border = "none";
-    button.style.backgroundColor = "white";
-    button.style.borderRadius = "4px";
-    const svg = createSvg(image);
-    svg.style.height = "1.3rem";
-    button.appendChild(svg);
-    return button;
-  };
   //// UI
   const createWebui = () => {
     const container = createDiv();
@@ -333,8 +298,8 @@ const createUI = () => {
     return container;
   };
   const createSearchResult = (
-    results: string[]
-  ): [HTMLElement, eventCb[], colorCb] => {
+    results?: string[]
+  ): [HTMLElement, eventCb[], colorCb, resultSetter] => {
     const container = createDiv();
     container.id = "results-area";
     container.style.overflow = "scroll";
@@ -357,14 +322,23 @@ const createUI = () => {
       };
       return [container, setSearchResultCb];
     };
-    const resultsElements = results.map(createResult);
-    resultsElements.forEach((e) => container.appendChild(e[0]));
     const setResultBackgroundColor = setElementBgColor(container);
-    return [
-      container,
-      resultsElements.map((e) => e[1]),
-      setResultBackgroundColor,
-    ];
+    const showResult = (res: string[]) => {
+      const resultsElements = res.map(createResult);
+      resultsElements.forEach((e) => container.appendChild(e[0]));
+      return resultsElements;
+    };
+    if (results) {
+      const resultsElements = showResult(results);
+      return [
+        container,
+        resultsElements.map((e) => e[1]),
+        setResultBackgroundColor,
+        showResult,
+      ];
+    } else {
+      return [container, [], setResultBackgroundColor, showResult];
+    }
   };
   const createQueue = (
     currentqueue: string[]
@@ -517,10 +491,14 @@ const createUI = () => {
   const [searchbar, setPlaceholderColor, inputValueCb, setIconSrc] =
     createSearchbar("red-search");
   const main = createMain();
-  const [searchResults, searchResultCbSetters, setResultBackgroundColor] =
-    createSearchResult(getResults());
+  const [
+    searchResults,
+    searchResultCbSetters,
+    setResultBackgroundColor,
+    showResult,
+  ] = createSearchResult(results);
   const [queue, votesCbs, setQueueBgColor, setVoteColor, setTracksInfoColor] =
-    createQueue(getQueue());
+    createQueue(currentqueue);
   const [footer, setFooterColor] = createFooter([
     [makeIconPath("telegram-icon"), "urltelegram"],
     [
@@ -562,8 +540,10 @@ const createUI = () => {
       setActive(element.id);
     })
   );
-  const searchResultCb = (cb: (e: MouseEvent) => void) =>
-    searchResultCbSetters.forEach((e) => e(cb));
+  const searchResultCb = (cb: (e: MouseEvent) => void) => {
+    if (searchResultCbSetters.length !== 0)
+      searchResultCbSetters.forEach((e) => e(cb));
+  };
   const setVotesCb = (
     down: (e: MouseEvent) => void,
     up: (e: MouseEvent) => void
@@ -573,30 +553,37 @@ const createUI = () => {
     downs.forEach((d) => d(down));
     ups.forEach((d) => d(up));
   };
-  return [webui, setInfosOnClick, inputValueCb, searchResultCb, setVotesCb] as [
+  setInfosOnClick(async (e) => {
+    // const test = await import("./popup");
+    // console.log(test.ciao);
+
+    openPopUp(
+      "http://127.0.0.1:5500/web/popup.html",
+      "_blank",
+      "width=286, height=466"
+    );
+  });
+  return [webui, inputValueCb, searchResultCb, setVotesCb, showResult] as [
     HTMLElement,
-    eventCb,
     (cb: (inputvalue: string) => void) => void,
     (cb: (e: MouseEvent) => void) => void,
-    (down: (e: MouseEvent) => void, up: (e: MouseEvent) => void) => void
+    (down: (e: MouseEvent) => void, up: (e: MouseEvent) => void) => void,
+    resultSetter
   ];
 };
 
 const body = document.body;
 ///// CLIENT
-const [ui, setInfosOnClick, inputValueCb, searchResultCb, setVotesCb] =
-  createUI();
+const results = getResults();
+const queue = getQueue();
+const [ui, inputValueCb, searchResultCb, setVotesCb, showResult] =
+  createUI(queue);
 
 body.prepend(ui);
 
-// da portare in funzione
-
-setInfosOnClick((e) => {
-  console.log(e.target);
-});
-
 inputValueCb((e) => {
   console.log(e);
+  showResult(results);
 });
 
 searchResultCb((e) => console.log(e.currentTarget));
