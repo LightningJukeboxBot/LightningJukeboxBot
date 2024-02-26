@@ -8,6 +8,11 @@ var getQueue = () => {
   return new Array(25).fill("I WILL BE THERE");
 };
 
+const queryString = window.location.search;
+const urlParams = new URLSearchParams(queryString);
+const chat_id = parseInt(urlParams.get('chat_id'),10);
+
+
 // web/src/setup.ts
 var vote = true;
 var innerRed = `#ff8a8d`;
@@ -280,7 +285,7 @@ var createButton = (image) => {
   button.appendChild(svg);
   return button;
 };
-var makeIconPath = (icon) => `../Assets/icons/${icon}.svg`;
+var makeIconPath = (icon) => `../assets/icons/${icon}.svg`;
 var makeLinearGradient = (colora, colorb) => `linear-gradient(180deg,${colora},${colorb})`;
 
 // web/src/createWebui.ts
@@ -590,6 +595,14 @@ var createSearchResult = (settings, results) => {
   };
   const setResultBackgroundColor = setElementBgColor(container);
   const showResult = (res) => {
+      // remove all  previous search results
+      let child = container.lastElementChild;
+      while (child) {
+            container.removeChild(child);
+            child = container.lastElementChild;
+      }
+
+	
     const resultsElements = res.map(createResult);
     resultsElements.forEach((e) => container.appendChild(e[0]));
     return resultsElements;
@@ -824,7 +837,7 @@ var createUI = (currentqueue, root, results) => {
 
 // web/src/index.ts
 var body = document.body;
-var results = getResults();
+var results = []; //getResults();
 var queue = getQueue();
 var [
   ui,
@@ -837,10 +850,49 @@ var [
 ] = createUI(queue, body);
 body.prepend(ui);
 inputValueCb((e) => {
-  console.log(e);
-  showResult(results);
+    const request = new XMLHttpRequest();
+    // the search API call is sent as a POST to /jukebox/web/{jukebox id}/search
+    // where the content of the message is {'query':'query string'}
+    // the result is a JSON object with the search results
+    showResult([]);
+    request.open("POST", "/jukebox/web/"+chat_id+"/search"); 
+    request.setRequestHeader("Accept", "application/json");	
+    request.setRequestHeader("Content-Type", "application/json"); 
+    request.onreadystatechange = function() {
+      if (this.readyState == 4 && this.status == 200) {
+        obj = JSON.parse(this.responseText);
+          if ( obj.status == 200 ) {
+	      results = [];
+	      for(let i=0;(i<obj.results.length);i++) {
+		  // search results contain a track reference and a title
+		  let title = obj.results[i].title;
+		  let trackref = obj.results[i].track_id;
+
+		  results[results.length] = title;
+
+		  
+              }
+	      showResult(results);
+          }	  
+      }
+    };
+    console.log(e);
+    request.send(JSON.stringify({query:e}));
+
 });
 searchResultCb((e) => console.log(e.currentTarget));
 setVotesCb((e) => console.log(e.currentTarget), (e) => console.log(e.currentTarget));
-setTimeout(() => setNowPlayingTrack("Gotek - Antistress"), 3000);
+setInterval(() => {
+    const request = new XMLHttpRequest();
+    request.open("GET", "/jukebox/status.json?chat_id=" + chat_id);     
+    request.setRequestHeader("Accept", "application/json");
+    request.onreadystatechange = function() {
+	if (this.readyState == 4 && this.status == 200) {
+            obj = JSON.parse(this.responseText);
+	    let title = obj.title;
+	    setNowPlayingTrack(title);	    
+	}
+    }
+    request.send();
+},10000);
 setTimeout(() => setText("now its fucking 420 sats per track!"), 6000);
