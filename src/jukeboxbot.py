@@ -784,7 +784,7 @@ async def dj(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # parse the amount to be paid
     amount = await spotifyhelper.get_price(update.effective_chat.id)
-    result = re.search("/[a-z]+(\s+([0-9]+))?\s*$",update.message.text)
+    result = re.search("/[A-Za-z]+(\s+([0-9]+))?\s*$",update.message.text)
     if result is not None:
         amount = result.groups()[1]
         if amount is None:
