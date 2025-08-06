@@ -40,6 +40,7 @@ if __version_info__ < (20, 0, 0, "alpha", 1):
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+import tidalapi
 
 
 from telegram import (
@@ -67,6 +68,7 @@ import userhelper
 from userhelper import User
 import spotifyhelper
 from spotifyhelper import SpotifySettings, CacheJukeboxHandler
+import tidalhelper
 import settings
 import jukeboxtexts
 import invoicehelper
@@ -240,6 +242,208 @@ async def disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode='HTML',
             text=jukeboxtexts.spotify_authorisation_removed_error)
         context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})        
+
+# Tidal coupling commands
+@debounce
+@adminonly
+async def tidal_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # get tidal settings for the user
+    tps = await tidalhelper.get_tidal_settings(update.effective_user.id)    
+    
+    # this command has to be execute from within a group
+    if update.message.chat.type == "private":
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            parse_mode='HTML',
+            text=f"""
+To connect this bot to your Tidal account, you have to create an app in the Tidal Developer Portal.
+
+1. Go to the Tidal Developer Portal and create a new application.
+2. Record the 'Client ID' and 'Client Secret'. 
+3. Add EXACTLY this url <pre>{settings.tidal_redirect_uri}</pre> as a redirect URI in your app settings.
+4. Use the /tsetclientid and /tsetclientsecret commands to configure the 'Client ID' and 'Client Secret'. 
+5. Give the '/tcouple' command in the group that you want to connect to your account.
+""")
+        
+        # check that client_id is not None
+        if tps.client_id is None:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="No Tidal client ID set. Use /tsetclientid to set it.")
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=f"Tidal client ID is set: {tps.client_id}")
+            
+        # check that client secret is not None
+        if tps.client_secret is None:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="No Tidal client secret set. Use /tsetclientsecret to set it.")
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="Tidal client secret is set.")
+
+        # hint the user for the connect command
+        if tps.client_id is not None and tps.client_secret is not None:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="Both Tidal client_id and client_secret are set. Execute the /tcouple command in the group that you want to connect to the bot")
+        return
+
+    # send message in group to go to private chat
+    bot_me = await context.bot.get_me()
+
+    # if both variables are not none, ask the user to authorize
+    if tps.client_id is not None and tps.client_secret is not None:
+        # get a tidal session 
+        session = await tidalhelper.get_tidal_session(update.effective_chat.id)
+        if session is not None:
+            message = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="A Tidal player is already connected to this group chat. disconnect it first using the /tdecouple command before connecting a new one")
+            context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})
+            return
+            
+        session = await tidalhelper.init_tidal_session(update.effective_chat.id)
+
+        # send instructions in the group
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Click the button below to continue the authorization in private chat.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Go to private chat",url=f"https://t.me/{bot_me.username}")]
+            ]))
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})
+
+        state = base64.b64encode(f"{update.effective_chat.id}:{update.effective_user.id}".encode('ascii')).decode('ascii')
+        
+        # send a message to the private chat of the bot
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Click the button below to authorize Tidal access:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Authorize Tidal player",url=f"{settings.tidal_redirect_uri}?state={state}")]
+            ]))
+    else:
+        # send a message that configuration is required
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Additional Tidal configuration is required, execute this command in a private chat with me.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"Take me there",url=f"https://t.me/{bot_me.username}")]
+            ]))
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})
+
+@debounce
+@adminonly        
+async def tidal_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # this command can only be used in group chats, send instructions if used in a private chat
+    if update.message.chat.type == "private":
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            parse_mode='HTML',
+            text="Execute the /tdecouple command in a group where you want the Tidal player disconnected")
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})        
+        return
+
+    # delete the tidal session
+    result = await tidalhelper.delete_tidal_session(update.effective_chat.id)
+    
+    if result == True:        
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            parse_mode='HTML',
+            text="Removed Tidal player from group. To reconnect, an admin should perform the /tcouple command to authorize the bot.")            
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})        
+    else:
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            parse_mode='HTML',
+            text="Error while removing Tidal player from group")
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})        
+
+async def tidal_set_client_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Use the /tsetclientid command in a private chat with me.")
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})
+        return
+        
+    result = re.search("/tsetclientid\s+([A-Za-z0-9\-\_]+)$",update.message.text)
+    if result is None:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Use command as follows: /tsetclientid <your_tidal_client_id>")
+        return
+
+    client_id = result.groups()[0]
+    tps = await tidalhelper.get_tidal_settings(update.effective_user.id)
+    tps.client_id = client_id
+    await tidalhelper.save_tidal_settings(tps)
+
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=f"Tidal client ID updated: {client_id}")
+
+async def tidal_set_client_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message.chat.type != "private":
+        message = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Use the /tsetclientsecret command in a private chat with me.")
+        context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})        
+        return
+        
+    result = re.search("/tsetclientsecret\s+([A-Za-z0-9\-\_]+)$",update.message.text)
+    if result is None:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="Use command as follows: /tsetclientsecret <your_tidal_client_secret>")
+        return
+
+    client_secret = result.groups()[0]
+    
+    tps = await tidalhelper.get_tidal_settings(update.effective_user.id)
+    tps.client_secret = client_secret
+    await tidalhelper.save_tidal_settings(tps)
+
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=f"Tidal client secret updated. Type /tcouple for current settings and instructions.")
+
+async def tidal_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Test command to verify Tidal integration"""
+    if update.message.chat.type == "private":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Execute the /ttest command in a group instead of the private chat.")
+        return
+    
+    # Test search functionality
+    searchstr = update.message.text.split(' ', 1)
+    if len(searchstr) > 1:
+        query = searchstr[1]
+    else:
+        query = "test song"
+    
+    try:
+        tracks = await tidalhelper.search_tidal_tracks(query, 3)
+        if tracks:
+            result_text = f"Tidal search test for '{query}':\n\n"
+            for i, track in enumerate(tracks[:3], 1):
+                result_text += f"{i}. {track['artist']} - {track['title']}\n"
+            result_text += f"\nFound {len(tracks)} tracks total."
+        else:
+            result_text = f"No Tidal results found for '{query}'"
+    except Exception as e:
+        result_text = f"Tidal search error: {str(e)}"
+    
+    message = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=result_text)
+    context.job_queue.run_once(delete_message, settings.delete_message_timeout_medium, data={'message':message})
 
 # Connect a spotify player to the bot, the connect command
 @debounce
@@ -674,17 +878,27 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text=f"Execute the /add command in the group instead of the private chat.")
         return
     
-    # get an auth manager, if no auth manager is available, dump a message
+    # check what players are available
     auth_manager = await spotifyhelper.get_auth_manager(update.effective_chat.id)
-    if auth_manager is None:
+    tidal_session = await tidalhelper.get_tidal_session(update.effective_chat.id)
+    active_player = await tidalhelper.get_active_player(update.effective_chat.id)
+    
+    if auth_manager is None and tidal_session is None:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             parse_mode='HTML',
-            text="Bot not connected to player. The admin should perform the /couple command to authorize the bot.")
+            text="No music player connected. The admin should perform the /couple or /tcouple command to authorize a music service.")
         return
 
-    # create spotify instance
-    sp = spotipy.Spotify(auth_manager=auth_manager)
+    # create instances based on available services
+    sp = None
+    tidal = None
+    
+    if auth_manager is not None:
+        sp = spotipy.Spotify(auth_manager=auth_manager)
+    
+    if tidal_session is not None:
+        tidal = tidal_session
     
     # validate the search string
     searchstr = update.message.text.split(' ',1)
@@ -1298,6 +1512,11 @@ async def main() -> None:
     application.add_handler(CommandHandler(['stack','balance'], balance)) # view wallet balance
     application.add_handler(CommandHandler('couple', connect)) # connect to spotify account
     application.add_handler(CommandHandler('decouple', disconnect)) # disconnect from spotify account
+    application.add_handler(CommandHandler('tcouple', tidal_connect)) # connect to tidal account
+    application.add_handler(CommandHandler('tdecouple', tidal_disconnect)) # disconnect from tidal account
+    application.add_handler(CommandHandler('tsetclientid', tidal_set_client_id)) # set tidal client id
+    application.add_handler(CommandHandler('tsetclientsecret', tidal_set_client_secret)) # set tidal client secret
+    application.add_handler(CommandHandler('ttest', tidal_test)) # test tidal integration
     application.add_handler(CommandHandler('fund',fund)) # add funds to wallet
     application.add_handler(CommandHandler('history', history)) # view history of tracks
     application.add_handler(CommandHandler('link',link)) # view LNDHUB QR 
@@ -1511,6 +1730,72 @@ async def main() -> None:
 <head>
   <meta charset="UTF-8">
   <title>Authorisation succesfull!</title>
+  <link rel="stylesheet" href="/jukebox/assets/JukeboxBot.css">
+</head>
+<body>
+  <div class="container">
+    <div class="image-container">
+      <div class="image-content">
+        <img src="/jukebox/assets/auth_success.png" alt="JukeboxBot" />
+    </div>
+  </div>
+</body>
+</html>    
+""") 
+
+    async def tidal_callback(request: Request) -> PlainTextResponse:
+        """
+        This function handles the callback from Tidal when authorizing request to an account
+        """
+
+        logging.info("Got callback from Tidal")
+
+        if 'code' not in request.query_params:
+            logging.error("no code in response from Tidal")
+            # callback without code
+            return Response()
+
+        code = request.query_params["code"]
+        if not re.search("^[A-Za-z0-9\-\_]+$",code):
+            logging.warning("Tidal authorisation code does not match regex")
+            return Response()
+
+        state = request.query_params["state"]
+        if not re.search("^[0-9A-Za-z\-]+",state):
+            logging.warning("Tidal state parameter does not match regex")
+            return Response()
+
+        try:
+            state = base64.b64decode(state.encode('ascii')).decode('ascii')        
+            [chatid, userid] = state.split(':')
+            chatid = int(chatid)            
+            userid = int(userid)
+        except:
+            logging.error("Failure during Tidal state query parameter parsing")
+            return Response()
+
+        logging.info(f"Tidal callback for {chatid} {userid} with code {code}")
+
+        try:
+            session = await tidalhelper.get_tidal_session(chatid)
+            if session is not None:
+                # Handle Tidal OAuth authentication here
+                # Note: This will need to be implemented once we have the official Tidal API
+                await userhelper.set_group_owner(chatid, userid)
+                await application.bot.send_message(
+                    chat_id=userid,
+                    text=f"Tidal connected to the chat. All revenues of requested tracks are coming your way. Execute the /tdecouple command in the group to remove the authorisation.")
+        except Exception as e:            
+            logging.error(e)
+            logging.error("Failure during Tidal session instantiation")
+            return Response()
+
+        return Response("""    
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Tidal Authorisation Successful!</title>
   <link rel="stylesheet" href="/jukebox/assets/JukeboxBot.css">
 </head>
 <body>
@@ -1795,6 +2080,7 @@ async def main() -> None:
             Route(f"/jukebox/telegram", telegram, methods=["GET","POST"]),
             Route("/jukebox/lnbitscallback", lnbits_lnurlp_callback, methods=["POST"]),
             Route("/spotify", spotify_callback, methods=["GET"]),
+            Route("/tidal", tidal_callback, methods=["GET"]),
             Route("/jukebox/payinvoice",payinvoice_callback, methods=["GET"]),
             Route("/jukebox/invoicecallback",invoicepaid_callback, methods=["POST"]),
             Route("/jukebox/status.json",jukebox_status, methods=["GET"]),

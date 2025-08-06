@@ -17,6 +17,9 @@ def init():
     global fund_min
     global domain
     global spotify_redirect_uri
+    global tidal_redirect_uri
+    global tidal_client_id
+    global tidal_client_secret
     global bot_token
     global delete_message_timeout_short
     global delete_message_timeout_medium
@@ -52,6 +55,7 @@ def init():
     # set secret token for telegram
     secret_token = "".join(random.sample(string.ascii_letters,12))
     spotify_redirect_uri=f'https://{domain}/spotify' # this must literaly match the config in spotify
+    tidal_redirect_uri=f'https://{domain}/tidal' # this must literaly match the config in Tidal
     max_connections = 5
 
     # webserver port
@@ -73,6 +77,10 @@ def init():
     bot_id=int(os.environ['BOT_ID'])
     donation_fee = 21  # default donation fee
     superadmins = [int(superadmin) for superadmin in os.environ['SUPERADMINS'].split(',')]
+    
+    # Tidal configuration (optional)
+    tidal_client_id = os.environ.get('TIDAL_CLIENT_ID')
+    tidal_client_secret = os.environ.get('TIDAL_CLIENT_SECRET')
 
     environment = env
     if env == 'production':    
