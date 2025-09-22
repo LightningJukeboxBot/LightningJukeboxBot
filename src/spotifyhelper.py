@@ -92,6 +92,13 @@ def add_to_queue(sp, spotify_uri_list):
 def get_track_title_from_item(item):
     if item is None:
       return "No item"
+
+    uri = item['uri']
+    title = settings.rds.hget(f"spotify_track_title",uri)
+    if title is not None:
+        title = title.decode()
+        return title
+
     if not 'artists' in item:
       return "No artists"
     if item['artists'][0] is None:
@@ -106,7 +113,7 @@ def get_track_title_from_item(item):
 
     title = f"{artist} - {track}"
 
-    uri = item['uri']
+    
     
     logging.info(f"Storing '{title}'  under '{uri}'")
     settings.rds.hset("spotify_track_title",uri,title)
@@ -118,17 +125,13 @@ def get_track_title_from_uri(sp, uri):
     """
     Get a readable version of the track title
     """
-    logging.info(f"get track title from URI: {uri}" )
     title = settings.rds.hget(f"spotify_track_title",uri)
     if title is not None:
         title = title.decode()
-        logging.info(f"returning {title}")
         return title
     
     item = sp.track(uri)
 
-
-    logging.info(f"calling get track title from item")
     return get_track_title_from_item(item)
 
 async def get_price(chat_id):

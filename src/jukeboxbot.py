@@ -1091,7 +1091,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.job_queue.run_once(callback_manage_queue, interval - 15, name=f"{chat_id}:manage_queue", data=chat_id, job_kwargs = {'misfire_grace_time':None})
     
 async def next_in_queue(chat_id: int, spotify_next) -> None:
-    logging.info(f"next in queue: {chat_id}")
+    logging.info(f"{chat_id}:next in queue")
 
     try:
         # get the auth manager
@@ -1103,11 +1103,11 @@ async def next_in_queue(chat_id: int, spotify_next) -> None:
         if ((chat_id in application.bot_data) and ('queue' in application.bot_data[chat_id]) and (len(application.bot_data[chat_id]['queue']) > 0)):
             next_in_queue_uri = list(application.bot_data[int(chat_id)]['queue'].keys())[0]                        
 
-            logging.info(f"Adding next in queue {next_in_queue_uri} to sp queue")
+            logging.info(f"{chat_id}:Adding next in queue '{next_in_queue_uri}' to sp queue")
             
             sp.add_to_queue(next_in_queue_uri)
             
-            # it is better not to remove                                    
+            # and remove from the bot queue
             application.bot_data[int(chat_id)]['queue'].pop(next_in_queue_uri)
 
         # skip to the next track
@@ -1115,9 +1115,9 @@ async def next_in_queue(chat_id: int, spotify_next) -> None:
             sp.next_track()
 
     except spotipy.oauth2.SpotifyOauthError as err:
-        logging.error(f"SpotifyOAuth error")
+        logging.error(f"{chat_id}:SpotifyOAuth error")
     except Exception as err:
-        logging.error(f"Unhandled exception in callback_manage_queue {type(err).__name__}")
+        logging.error(f"{chat_id}:Unhandled exception in callback_manage_queue {type(err).__name__}")
         
 async def callback_manage_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1125,7 +1125,7 @@ async def callback_manage_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     chat_id = int(context.job.data)
     
-    logging.info(f"Callback manage queue for chat: {chat_id}")
+    logging.info(f"{chat_id}:Callback manage queue")
 
     await next_in_queue(chat_id,False)
             
@@ -1251,6 +1251,13 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # validate payment conditions
     payment_required = True
     amount_to_pay = int(track_price * len(spotify_uri_list))
+    
+    sp_track = sp.track(spotify_uri_list[0])        
+    sp_track_len = sp_track['duration_ms'] / 1000
+    if ( sp_track_len > 600 ):
+        amount_to_pay = 20 * amount_to_pay
+    if ( sp_track_len > 900 ):
+        amount_to_pay = 50 * amount_to_pay
     
     
     logging.info(f"Amount to pay = {amount_to_pay}")
@@ -1449,7 +1456,7 @@ async def main() -> None:
     application.add_handler(CommandHandler(["start","faq"],start))  # help message
     application.add_handler(CommandHandler('dj', dj))  # pay another user    
     application.add_handler(CommandHandler('web', web))  # display the web URL, or disable/enable web
-    #application.add_handler(CommandHandler('skip', skip))  # allow the admin to skip a track
+    application.add_handler(CommandHandler('skip', skip))  # allow the admin to skip a track
 
     application.add_handler(CallbackQueryHandler(callback_button))
     application.job_queue.run_repeating(regular_cleanup, 12 * 3600)
@@ -1648,9 +1655,9 @@ async function sendPayment() {{
         
         amount_to_pay = int(await spotifyhelper.get_price(chat_id))
         if ( track_len > 600 ):
-            amount_to_pay = 10 * amount_to_pay
+            amount_to_pay = 100 * amount_to_pay
         if ( track_len > 1200 ):
-            amount_to_pay = 10 * amount_to_pay
+            amount_to_pay = 100 * amount_to_pay
 #            amount_to_pay = 10 * amount_
 #        elif ( track_len > 600 ):
 #            amount_to_pay = amount_to_pay * 1.0166428 ** (track_len - 300)
