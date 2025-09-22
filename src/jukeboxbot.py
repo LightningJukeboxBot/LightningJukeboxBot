@@ -278,12 +278,12 @@ def create_queue_button_list(context, sp, chat_id: int):
     for uri in context.bot_data[chat_id]['queue']:
         amount = context.bot_data[chat_id]['queue'][uri]
         if amount > 100000000 - 1:
-            qtitle = f"Up next: {spotifyhelper.get_track_title(sp.track(uri))}"        
+            qtitle = f"Up next: {spotifyhelper.get_track_title_from_uri(sp,uri)}"        
             button_list.append([
                 InlineKeyboardButton(qtitle, callback_data = 0)
             ])
         else:
-            qtitle = f"{count}. {spotifyhelper.get_track_title(sp.track(uri))} ({amount} sats)"        
+            qtitle = f"{count}. {spotifyhelper.get_track_title_from_uri(sp,uri)} ({amount} sats)"        
             button_list.append([
                 InlineKeyboardButton(qtitle, callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.upvote,uri)))
             ])
@@ -297,34 +297,28 @@ def create_queue_button_list(context, sp, chat_id: int):
 #(message="Execute the /queue command in the group instead of the private chat.")
 async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # get an auth managher, if no auth manager is available, dump a message
-    sp = await spotifyhelper.get_sp(update.effective_chat.id)
+    chat_id = int(update.effective_chat.id)    
+    sp = await spotifyhelper.get_sp(chat_id)
     if not sp:
         await send_telegram_message(
             context=context,
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text="Could not obtain player instance",
             delete_timeout=settings.delete_message_timeout_short)
         return
     
-    # get the current track
-    try:
-        track = sp.current_user_playing_track()
-    except:
-        track = None
-
-    title = "Nothing is playing at the moment"    
-    if track:                    
-        title = "🎵 {title} 🎵".format(title=spotifyhelper.get_track_title(track['item']))
+    # get the current track title from cache
+    if len(application.bot_data[chat_id]['now_playing_title']) == 0:
+        title = "Nothing is playing at the moment"    
+    else:                    
+        title = application.bot_data[chat_id]['now_playing_title']
+        
+    title = f"🎵 {title} 🎵"
 
     title += "\n\nUse the /add command to add your favourite track to the queue, or click on a track to pump it to the top of the queue."
 
-    #try:
-    #    result = sp.queue()
-    #    title +=  "\n\nUp next: " + spotifyhelper.get_track_title(result['queue'][0])
-    #except:
-    #    pass
         
-    if update.effective_chat.id in context.bot_data and 'queue' in context.bot_data[update.effective_chat.id] and len(context.bot_data[update.effective_chat.id]['queue']) > 0:
+    if chat_id in context.bot_data and 'queue' in context.bot_data[chat_id] and len(context.bot_data[chat_id]['queue']) > 0:
         pass
     else:
         title += "\nRequest queue is empty."
@@ -333,7 +327,7 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context=context,
         chat_id=update.effective_chat.id,
         text=title,
-        reply_markup=InlineKeyboardMarkup(create_queue_button_list(context, sp, update.effective_chat.id)),
+        reply_markup=InlineKeyboardMarkup(create_queue_button_list(context, sp, chat_id)),
         delete_timeout=settings.delete_message_timeout_medium
     )
 
@@ -637,6 +631,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
     # search for tracks
     numtries: int = 3
     while numtries > 0:
+        numtries -= 1
         try:
             result = sp.search(searchstr,type='track',limit=limit,offset=offset)
         except spotipy.oauth2.SpotifyOauthError:
@@ -648,7 +643,6 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
             return
             
         except spotipy.exceptions.SpotifyException:
-            numtries -= 1
             if numtries == 0:
                 # spotify still triggers an exception
                 logging.error("Spotify returned and exception, not returning search result")
@@ -666,7 +660,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
         tracktitles  = {}
         button_list = []
         for item in result['tracks']['items']:            
-            title = spotifyhelper.get_track_title(item)
+            title = spotifyhelper.get_track_title_from_item(item)
             if title not in tracktitles:
                 tracktitles[title] = 1
                 button_list.append([InlineKeyboardButton(title, callback_data = telegramhelper.add_command(TelegramCommand(update.effective_user.id,telegramhelper.add,item['uri'])))])
@@ -884,7 +878,7 @@ async def web(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return the Web URL where tracks can be requested using a browser
     """
     userid: int = update.effective_user.id
-    chat_id = update.effective_chat.id
+    chat_id: int = update.effective_chat.id
     
     if update.message.chat.type == "private":
         return
@@ -999,13 +993,21 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(context.job.data)
     logging.info(f"Callback now playing for chat: {chat_id}")
 
+
+
+
+    
     # default interval
     interval = settings.max_spotify_poll_interval
 
     # make sure that chat_id exists in bot_data
     if not chat_id in application.bot_data:
-        application.bot_data[chat_id] = {}
-
+        application.bot_data[chat_id] = {
+            'now_playing_title': ''
+        }
+        
+        
+        
     try:
         application.bot_data[chat_id]['last_poll'] = time()
 
@@ -1023,8 +1025,10 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
         # query the current track
         title = "Nothing playing at the moment"
         if currenttrack is not None and 'item' in currenttrack and currenttrack['item'] is not None:
-            title = spotifyhelper.get_track_title(currenttrack['item'])
-        
+            logging.info("calling get_track_title_from_item")
+            title = spotifyhelper.get_track_title_from_item(currenttrack['item'])
+            application.bot_data[chat_id]['now_playing_title'] = title
+                        
             # update history
             await spotifyhelper.update_history(chat_id, title)                
 
@@ -1047,7 +1051,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
                 elif err.message == "Message is not modified":
                     logging.info("Message is not modified")
                 else:
-                    logging.error(f"BadRequest with unknown error message: {err.message}")                                               
+                    logging.error(f"BadRequest in {chat_id} with unknown error message: {err.message}")                                               
             except Exception as err:
                 logging.error(f"Exception of type {type(err).__name__} when refreshing now playing in chat {chat_id}")                
         else:
@@ -1067,7 +1071,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
                     logging.info(f"Bot has insufficient privileges in chat {chat_id}")
                     await spotifyhelper.delete_chat(chat_id)
                 else:
-                    logging.error(f"BadRequest with unknown error message: {err.message}")                                       
+                    logging.error(f"BadRequest in {chat_id} with unknown error message: {err.message}")                                       
             except Exception as e:
                 logging.error(f"exception when sending message to chat {chat_id} of type {type(e).__name__}")                            
     except spotipy.oauth2.SpotifyOauthError:
@@ -1075,6 +1079,8 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     except RuntimeError as err:
         logging.error(f"Caught runtime error {err}")
+    except NameError as err:
+        logging.error(f"Caught NameError error {err}")
     except Exception as err:
         logging.error(f"Unhandled exception in callback_now_playing {type(err).__name__}")
         
@@ -1157,6 +1163,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     This functions handles all button presses that are fed back into the application
     """
     key = update.callback_query.data
+    chat_id = int(update.effective_chat.id)
 
     # CallbackQueries need to be answered, even if no notification to the user is needed    
     # Some clients may have trouble otherwise. See https://core.telegram.org/bots/api#callbackquery    
@@ -1197,16 +1204,9 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await invoicehelper.delete_invoice(invoice.payment_hash)
         return    
 
-    # the commands from here on modify a list of tracks to be queue
-    # and we have to check hat we have spotify available
-    # get an auth managher, if no auth manager is available, dump a message
-    sp = await spotifyhelper.get_sp(update.effective_chat.id)
-    if not sp:
-        return
-
     # verify that player is available, otherwise it has no use to queue a track
-    track = sp.current_user_playing_track()
-    if track is None:
+    #track = sp.current_user_playing_track()
+    if len(application.bot_data[chat_id]['now_playing_title']) == 0: 
         message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             parse_mode='HTML',
@@ -1214,10 +1214,19 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})        
         return
 
-
     # get the track price
     track_price = int(await spotifyhelper.get_price(update.effective_chat.id))
-                                            
+
+    # the commands from here on modify a list of tracks to be queue
+    # and we have to check hat we have spotify available
+    # get an auth managher, if no auth manager is available, dump a message
+    sp = await spotifyhelper.get_sp(chat_id)
+    if not sp:
+        return
+
+
+
+    
     # Play a random track from a playlist
     spotify_uri_list = []          
     if  command.command == telegramhelper.add:
@@ -1252,12 +1261,13 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if payment_required == False:
         # TODO: change this if it is an upvote
         #spotifyhelper.add_to_queue(sp, spotify_uri_list)
-        add_to_queue_or_upvote(spotify_uri_list[0],update.effective_chat.id,0)
+        logging.info(f"No payment required")
+        add_to_queue_or_upvote(spotify_uri_list[0],chat_id,0)
         
 
         for uri in spotify_uri_list:
 
-            tracktitle = spotifyhelper.get_track_title(sp.track(uri))
+            tracktitle = spotifyhelper.get_track_title_from_uri(sp,uri)
             
             try:
                 if command.command == telegramhelper.upvote:
@@ -1277,34 +1287,33 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             try:
                 await context.bot.send_message(
-                    chat_id=update.effective_user.id,
+                    chat_id=chat_id,
                     parse_mode='HTML',
                     text=f"You paid {amount_to_pay} sats for  '{tracktitle}'.")
             except:
                 pass
-
-            try:
-                async with aiomqtt.Client("localhost") as client:
-                    await client.publish(f"{update.effective_chat.id}/added_to_queue", payload=tracktitle)
-            except:
-                logging.error("Exception when publishing queue add to mqtt")
-                pass
-        
 
             
         # return 
         return
         
     # create an invoice title
-    invoice_title = f"'{spotifyhelper.get_track_title(sp.track(spotify_uri_list[0]))}'"
+    logging.info("Creating invoice")
+    invoice_title = f"{spotifyhelper.get_track_title_from_uri(sp,spotify_uri_list[0])}"
     for i in range(1,len(spotify_uri_list)):
-        title += f",'{spotifyhelper.get_track_title(sp.track(spotify_uri_list[0]))}'"
+        title += f",'{spotifyhelper.get_track_title_from_uri(sp,spotify_uri_list[0])}"
 
+
+    logging.info("get user and reciptient")
     # create the invoice
     # the owner is the one that has his spotify player connected
     recipient = await userhelper.get_group_owner(update.effective_chat.id)
     invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
 
+
+    logging.info(f"Got invoice")
+
+    
     # get the user wallet and try to pay the invoice
     user = await userhelper.get_or_create_user(update.effective_user.id,update.effective_user.username)
     invoice.user = user
@@ -1317,9 +1326,15 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if command.command == telegramhelper.upvote:
         invoice.command = telegramhelper.upvote
 
+
+    logging.info(f"invoice copmmand")
+        
     # pay the invoice
     payment_result = await invoicehelper.pay_invoice(invoice.user, invoice)
 
+
+    logging.info(f"Got payment result")
+    
     # if payment success
     if payment_result['result'] == True:
         # TODO: change this if it is an upvote        
@@ -1434,7 +1449,7 @@ async def main() -> None:
     application.add_handler(CommandHandler(["start","faq"],start))  # help message
     application.add_handler(CommandHandler('dj', dj))  # pay another user    
     application.add_handler(CommandHandler('web', web))  # display the web URL, or disable/enable web
-    application.add_handler(CommandHandler('skip', skip))  # allow the admin to skip a track
+    #application.add_handler(CommandHandler('skip', skip))  # allow the admin to skip a track
 
     application.add_handler(CallbackQueryHandler(callback_button))
     application.job_queue.run_repeating(regular_cleanup, 12 * 3600)
@@ -1640,7 +1655,7 @@ async function sendPayment() {{
 #        elif ( track_len > 600 ):
 #            amount_to_pay = amount_to_pay * 1.0166428 ** (track_len - 300)
         recipient = await userhelper.get_group_owner(chat_id)
-        invoice_title = f"'{spotifyhelper.get_track_title(track)}'"
+        invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
         invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
         if invoice is None:
             return JSONResponse({"status":400,"message":"Payments not available"})
@@ -1707,10 +1722,10 @@ async function sendPayment() {{
         # search for tracks
         numtries: int = 3
         while numtries > 0:
+            numtries -= 1
             try:
                 result = sp.search(query)
             except spotipy.exceptions.SpotifyException:
-                numtries -= 1
                 if numtries == 0:
                     logging.error("Spotify returned and exception, not returning search result")
                     return JSONResponse({"status":400,"message":"Search currently unavailable"})
@@ -1727,7 +1742,7 @@ async function sendPayment() {{
         tracktitles  = {}
 
         for item in result['tracks']['items']:            
-            title = spotifyhelper.get_track_title(item)
+            title = spotifyhelper.get_track_title_from_item(item)
             track_id = item['uri']
             result = re.search("^spotify:track:([A-Z0-9a-z]+)$",track_id)
             if not result:
@@ -1750,69 +1765,32 @@ async function sendPayment() {{
 
     async def web_api_status(request: Request) -> JSONResponse:
         chat_id = int(request.path_params['chat_id'])
-        sp = await spotifyhelper.get_sp(chat_id)
-        if not sp:
-            return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
 
         message = {
             'now':{},
-            'queue':[],
             'price': await spotifyhelper.get_price(chat_id),
             'donation': await spotifyhelper.get_donation_fee(chat_id)
         }
-        
-        track = sp.current_user_playing_track()
-        message['now']['title'] = "Nothing is playing at the moment"
-        
-        if track:
-            message['now']['title'] = spotifyhelper.get_track_title(track['item'])        
 
-        for uri in application.bot_data[chat_id]['queue']:
-            message['queue'].append({
-                'title':spotifyhelper.get_track_title(sp.track(uri)),
-                'track_id':uri,
-                'amount':application.bot_data[chat_id]['queue'][uri]})
+               
+        message['now']['title'] = "Nothing is playing at the moment"
+        if len(application.bot_data[chat_id]['now_playing_title']) > 0:
+            message['now']['title'] = application.bot_data[chat_id]['now_playing_title']
+        
+
+        if not chat_id in application.bot_data:
+            application.bot_data[chat_id] = {}
+        if not 'queue' in application.bot_data[chat_id]:
+            application.bot_data[chat_id]['queue'] = {}
+
 
         message['status'] = 200
         return JSONResponse(message)
 
     # get the songs that are played
     async def web_api_playlist(request: Request) -> JSONResponse:
-        chat_id = int(request.path_params['chat_id'])
-        sp = await spotifyhelper.get_sp(chat_id)
-        if not sp:
-            return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
-
-        message = {
-            'now':{},
-            'queue':[],
-            'playlist':[],
-            'price': await spotifyhelper.get_price(chat_id),
-            'donation': await spotifyhelper.get_donation_fee(chat_id)
-        }
-        
-        track = sp.current_user_playing_track()
-        message['now']['title'] = "Nothing is playing at the moment"
-        
-        if track:
-            message['now']['title'] = spotifyhelper.get_track_title(track['item'])        
-
-        for uri in application.bot_data[chat_id]['queue']:
-            message['queue'].append({
-                'title':spotifyhelper.get_track_title(sp.track(uri)),
-                'track_id':uri,
-                'amount':application.bot_data[chat_id]['queue'][uri]})
-            
-        history = await spotifyhelper.get_history(chat_id,20)
-        for title in history:
-            message['playlist'].append({
-                'title': title
-                })
-            
-        message['status'] = 200
-        return JSONResponse(message)
-
-
+        return JSONResponse({"status":400,"message":"Currently unavailable"})
+    
     
     async def jukebox_status(request: Request) -> JSONResponse:
         if 'chat_id' not in request.query_params:
@@ -1820,19 +1798,13 @@ async function sendPayment() {{
         
         chat_id = int(request.query_params["chat_id"])
 
-        sp = await spotifyhelper.get_sp(chat_id)
-        if not sp:
-            return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
-        
-        # get the current track
-        track = sp.current_user_playing_track()
         title = "Nothing is playing at the moment"
-        if track:
-            title = spotifyhelper.get_track_title(track['item'])
+        if 'now_playing_title' in application.bot_data[chat_id]:
+            if len(application.bot_data[chat_id]['now_playing_title']) > 0:
+                title = application.bot_data[chat_id]['now_playing_title']
 
         return JSONResponse({"title":title})
-
-
+        
     async def spotify_callback(request: Request) -> PlainTextResponse:
         """
         This function handles the callback from spotify when authorizing request to an account
@@ -2069,10 +2041,10 @@ async function sendPayment() {{
         # search for tracks
         numtries: int = 3
         while numtries > 0:
+            numtries -= 1
             try:
                 result = sp.search(query)
             except spotipy.exceptions.SpotifyException:
-                numtries -= 1
                 if numtries == 0:
                     logging.error("Spotify returned and exception, not returning search result")
                     return JSONResponse({"status":400,"message":"Search currently unavailable"})
@@ -2088,7 +2060,7 @@ async function sendPayment() {{
         results = []
 
         for item in result['tracks']['items']:            
-            title = spotifyhelper.get_track_title(item)
+            title = spotifyhelper.get_track_title_from_item(item)
             track_id = item['uri']
             result = re.search("^spotify:track:([A-Z0-9a-z]+)$",track_id)
             if not result:
@@ -2165,7 +2137,7 @@ async function sendPayment() {{
 #        elif ( track_len > 600 ):
 #            amount_to_pay = amount_to_pay * 1.0166428 ** (track_len - 300)
         recipient = await userhelper.get_group_owner(chat_id)
-        invoice_title = f"'{spotifyhelper.get_track_title(track)}'"
+        invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
         invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
         if invoice is None:
             return JSONResponse({"status":400,"message":"Payments not available"})
