@@ -13,8 +13,16 @@ Our trust in DJ's has been broken, and we will make them obsolete! ;)
 Not only for Radiostations, but also for live events, venues, bars and pubs, businesess, you name it!
 - You want a three channel silent disco for your #bitcoin meetup, conference of festival? We got you covered!
 - It works very well for parties, pubs, or wherever else you want folks to have acces to a Lightning enabled Jukebox Bot. **GREAT FOR ORANGE PILLING FRENS & FAM!**
+## General info
+If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/noderunnersradio) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
 
-## Our goals
+You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
+If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
+
+The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to everyone working on that project, this would not be possible without you!), meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
+
+## Ideas for ruther development
+
 1. v4v Proof of Concept of getting musicians paid directly whenever a track is /added via the bot. We have someone looking into it. The way the bot is currently set up, we are prob not quite ready for going the podcasting 2.0 route. This will however not be forgotten. Currently work is being done on a demo to see if we can create a Proof of Concept for payments over Lightning and perhaps some coördination over Nostr for this. Will update when we know more.
 
 2. tip_nz  and Jamesviggy requested to make it possible for ingame streaming of the radio and in game jukebox functionality too. I like the id. We would probably need a .m3u or something of the audio only. Idk what would be involved in getting the functionality in game. Maybe it is as easy as projecting the web-interface to some kind of in-game plane? If the best route is doing via linnode or going dedicated hardware route, I don't know.
@@ -33,13 +41,6 @@ Not only for Radiostations, but also for live events, venues, bars and pubs, bus
 
 8. There are more ideas, but this is plenty for now.
 
-## General info
-If you want to test out the functionality, there are a few options. Tune in via our [zap.stream](https://zap.stream/noderunnersradio) or [radio.noderunners.org](https://radio.noderunners.org/) and use their [unique web-interface](https://jukebox.lighting/jukebox/web/-1001672416970) to add music to the queue.
-
-You can even spin up your own Radio with our Jukebox Lightning Bot! When you do, you will get your own unique web-interface. For now, you must still chat with the bot via Telegram to accomplish this. You may find the bot on Telegram as '[@Jukebox_Lightning_bot](https://t.me/Jukebox_Lightning_bot)'
-If you need help, tag @noderunnersFM or @artdesignbySF in the [Noderunners Radio Telegram](https://t.me/noderunnersradio), or contact us via other channels. Of course you are welcome to just come hangout and play us your favorite tunes. **There is a bit more functionality available in Telegram right now than compared to the web-interface.**
-
-The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to everyone working on that project, this would not be possible without you!), meaning each user that comes in via TG gets their own unique LNbits wallet which they can connect to their mobile solution. End users need not use Telegram to add tracks to the /queue, as they can just use the web-interface.
 
 ## FAQ
 
