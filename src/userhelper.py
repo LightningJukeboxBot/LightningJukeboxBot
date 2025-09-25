@@ -143,7 +143,6 @@ async def get_or_create_user(userid: int,username: str = None) -> User:
     if userdata is not None:
         try:
             user.loadJson(userdata)
-            logging.info("Got the fast path for retrieving the user")
             return user
         except AssertionError:
             if userdata == b'null':

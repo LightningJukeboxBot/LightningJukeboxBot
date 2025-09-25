@@ -83,10 +83,10 @@ settings.init()
 # add to local player
 def add_to_queue_or_upvote(uri, chat_id, amount):
     if not isinstance(uri,str):
-        logging.error("uri is not a string")
+        logging.error(f"{chat_id}:uri is not a string")
         return
     if not isinstance(amount,int):
-        logging.error("amount is not an integer")
+        logging.error(f"{chat_id}:amount is not an integer")
         return
     
     if not chat_id in application.bot_data:
@@ -154,15 +154,16 @@ async def service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     This command sends a service message to all Jukebot group owners, that is all users marked as owner of a group
     """
     userid: int = update.effective_user.id
+    chat_id: int = update.effective_chat.id,
 
     if userid not in settings.superadmins:
-        logging.info(f"User {userid} is not a superadmin. Access to stats denied")
+        logging.info(f"{chat_id}:User {userid} is not a superadmin. Access to stats denied")
         return
 
     result = re.search("^/service \S.*",update.message.text)
     if result is None:
         message = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=f"Use the /service command as follows: /service <message>\nThe message is sent to all owners of bot")
         return
 
@@ -194,13 +195,14 @@ async def service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @debounce
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # do not show balance in other than private chats
+    chat_id : int = update.effective_chat.id
     if update.message.chat.type != "private":
         bot_me = await context.bot.get_me()
         
         # direct the user to their private chat
         await send_telegram_message(
             context=context,
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=jukeboxtexts.balance_in_group,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"Take me there",url=f"https://t.me/{bot_me.username}")]
@@ -215,7 +217,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     balance = await userhelper.get_balance(user)
     
     # create a message with the balance
-    logging.info(f"User {user.userid} balance is {balance} sats")
+    logging.info(f"{chat_id}:User {user.userid} balance is {balance} sats")
     await send_telegram_message(
         context=context,
         chat_id=update.effective_chat.id,
@@ -599,13 +601,14 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
     If a playlist URL is provided, that playlist is used
     This function only works in a group chat
     """
+    chat_id : int = update.effective_chat.id
     
     # get an auth manager, if no auth manager is available, dump a message
-    sp = await spotifyhelper.get_sp(update.effective_chat.id)
+    sp = await spotifyhelper.get_sp(chat_id)
     if not sp:
         await send_telegram_message(
             context=context,
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text="Could not obtain player instance",
             delete_timeout=settings.delete_message_timeout_short)
         return
@@ -618,7 +621,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
 
         await send_telegram_message(
             context=context,
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=f"@{update.effective_user.username} suggests to play tracks from the '{result['name']}' playlist.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(f"Pay {await spotifyhelper.get_price(update.effective_chat.id)} sats for a random track", callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.playrandom,playlistid)))
@@ -636,7 +639,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
             result = sp.search(searchstr,type='track',limit=limit,offset=offset)
         except spotipy.oauth2.SpotifyOauthError:
             # spotify not properly authenticated
-            logging.info("Spotify Oauth error")
+            logging.info(f"{chat_id}:Spotify Oauth error")
             message = await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text="Music player not available, search aborted.")
@@ -645,12 +648,12 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
         except spotipy.exceptions.SpotifyException:
             if numtries == 0:
                 # spotify still triggers an exception
-                logging.error("Spotify returned and exception, not returning search result")
+                logging.error(f"{chat_id}:Spotify returned and exception, not returning search result")
                 message = await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text="Music player unavailable, search aborted.")
                 return
-            logging.warning("Spotify returned and exception, retrying")
+            logging.warning(f"{chat_id}:Spotify returned and exception, retrying")
             continue
         
         break
@@ -792,18 +795,22 @@ async def callback_paid_invoice(invoice: Invoice):
     if invoice is None:
         logging.error("Invoice is None")
         return
-    logging.info("callback_paid_invoice")
-    logging.info(invoice.toJson())
-    
+
     if invoice.chat_id is None:
         logging.error("Invoice chat_id is None")
         return
 
+    chat_id = invoice.chat_id
+    logging.info(f"{chat_id}:callback_paid_invoice")
+
+    
+
+    
     if await invoicehelper.delete_invoice(invoice.payment_hash) == False:
-        logging.info("invoicehelper.delete_invoice returned False")
+        logging.info(f"{chat_id}:invoicehelper.delete_invoice returned False")
         return
     try:
-        logging.info(f"Trying to delete chat_id {invoice.chat_id}, messageid {invoice.message_id}")
+        logging.info(f"{chat_id}:Trying to delete messageid {invoice.message_id}")
         await application.bot.delete_message(invoice.chat_id,invoice.message_id)            
     except:
         pass
@@ -831,7 +838,7 @@ async def callback_paid_invoice(invoice: Invoice):
             parse_mode='HTML',
             text=message)
     except:
-        logging.error("Could not  send message to the group that track was added to the /queue")
+        logging.error(f"{chat_id}:Could not  send message to the group that track was added to the /queue")
     
 
     if False:
@@ -841,7 +848,7 @@ async def callback_paid_invoice(invoice: Invoice):
                 parse_mode='HTML',
                 text=f"You paid {invoice.amount_to_pay} sats for '{invoice.title}'.")
         except:
-            logging.info("Could not send individual message to user that")
+            logging.info(f"{chat_id}:Could not send individual message to user")
     
      # make donation to the bot
     jukeboxbot = await userhelper.get_or_create_user(settings.bot_id)
@@ -997,7 +1004,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
     plans the callback for updating the queue
     """
     chat_id = int(context.job.data)
-    logging.info(f"Callback now playing for chat: {chat_id}")
+    logging.info(f"{chat_id}:Callback now playing")
 
 
 
@@ -1020,7 +1027,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         sp = await spotifyhelper.get_sp(chat_id)
         if not sp:            
-            logging.error("No auth manager after succesfull payment")
+            logging.error(f"{chat_id}:No sp after succesfull payment")
             raise
     
 
@@ -1031,7 +1038,6 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
         # query the current track
         title = "Nothing playing at the moment"
         if currenttrack is not None and 'item' in currenttrack and currenttrack['item'] is not None:
-            logging.info("calling get_track_title_from_item")
             title = spotifyhelper.get_track_title_from_item(currenttrack['item'])
             application.bot_data[chat_id]['now_playing_title'] = title
                         
@@ -1042,56 +1048,56 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
             interval  = ( currenttrack['item']['duration_ms'] - currenttrack['progress_ms'] ) / 1000
 
         if 'now_playing_message' in application.bot_data[chat_id]:
-            logging.info(f"Now playing message is present in bot_data")
+            logging.info(f"{chat_id}:Now playing message is present in bot_data")
             try:
                 [message_id, prev_title] = application.bot_data[chat_id]['now_playing_message']
                 if prev_title != title:                    
                     await context.bot.editMessageText(title,chat_id=chat_id,message_id=message_id)
                     application.bot_data[chat_id]['now_playing_message'] = [ message_id, title ]
-                    logging.info(f"Now playing {title} in chat {chat_id}")
+                    logging.info(f"{chat_id}:Now playing: '{title}'")
             except BadRequest as err:
                 if err.message == "Message to edit not found":
-                    logging.info("Now playing message not found, deleting from local cache")
+                    logging.info(f"{chat_id}:Now playing message not found, deleting from local cache")
                     del application.bot_data[chat_id]['now_playing_message']
                     interval = 30
                 elif err.message == "Message is not modified":
-                    logging.info("Message is not modified")
+                    logging.info(f"{chat_id}:Message is not modified")
                 else:
-                    logging.error(f"BadRequest in {chat_id} with unknown error message: {err.message}")                                               
+                    logging.error(f"{chat_id}:BadRequest with unknown error message: {err.message}")                                               
             except Exception as err:
                 logging.error(f"Exception of type {type(err).__name__} when refreshing now playing in chat {chat_id}")                
         else:
-            logging.info(f"Creating new pinned message in chat: {chat_id}")
+            logging.info(f"{chat_id}:Creating new pinned message")
             try:
                 message = await context.bot.send_message(text=title,chat_id=chat_id)
                 application.bot_data[chat_id]['now_playing_message'] = [ message.id, title ]
                 await context.bot.pin_chat_message(chat_id=chat_id, message_id=message.id)
             except ChatMigrated as err:
-                logging.info(f"Chat migrated from {chat_id} to {err.new_chat_id}. Deleting old settings")
+                logging.info(f"{chat_id}:Chat migrated from to {err.new_chat_id}. Deleting old settings")
                 await spotifyhelper.delete_chat(chat_id)
             except BadRequest as err:
                 if err.message == "Chat not found":
-                    logging.info(f"Chat not found, deleting chat {chat_id}")
+                    logging.info(f"{chat_id}:Chat not found, deleting")
                     await spotifyhelper.delete_chat(chat_id)
                 elif err.message == "Not enough rights to send text messages to the chat":
-                    logging.info(f"Bot has insufficient privileges in chat {chat_id}")
+                    logging.info(f"{chat_id}:Bot has insufficient privileges")
                     await spotifyhelper.delete_chat(chat_id)
                 else:
-                    logging.error(f"BadRequest in {chat_id} with unknown error message: {err.message}")                                       
+                    logging.error(f"{chat_id}:BadRequest with unknown error message: {err.message}")                                       
             except Exception as e:
-                logging.error(f"exception when sending message to chat {chat_id} of type {type(e).__name__}")                            
+                logging.error(f"{chat_id}:exception when sending message of type {type(e).__name__}")                            
     except spotipy.oauth2.SpotifyOauthError:
-        logging.error("Spotify OAuth error. Exiting for now")
+        logging.error(f"{chat_id}:Spotify OAuth error")
         return
     except RuntimeError as err:
-        logging.error(f"Caught runtime error {err}")
+        logging.error(f"{chat_id}:Caught runtime error")
     except NameError as err:
-        logging.error(f"Caught NameError error {err}")
+        logging.error(f"{chat_id}:Caught NameError error")
     except Exception as err:
-        logging.error(f"Unhandled exception in callback_now_playing {type(err).__name__}")
+        logging.error(f"{chat_id}:Unhandled exception in callback_now_playing {type(err).__name__}")
         
 
-    logging.info(f"Next run in {interval} seconds")
+    logging.info(f"{chat_id}:Next run in {interval} seconds")
     if interval > 0:
         context.job_queue.run_once(callback_now_playing, interval + 5, name=f"{chat_id}:now_playing",data=chat_id, job_kwargs = {'misfire_grace_time':None})
         context.job_queue.run_once(callback_manage_queue, interval - 15, name=f"{chat_id}:manage_queue", data=chat_id, job_kwargs = {'misfire_grace_time':None})
@@ -1099,19 +1105,54 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def next_in_queue(chat_id: int, spotify_next) -> None:
     logging.info(f"{chat_id}:next in queue")
 
+    # do nothing when there is no queue
+    if chat_id not in application.bot_data:
+        return
+    if 'queue' not in application.bot_data[chat_id]:
+        return
+    if len(application.bot_data[chat_id]['queue']) == 0:
+        return
+
+    
     try:
         # get the auth manager
         sp = await spotifyhelper.get_sp(chat_id)
         if not sp:
             raise
 
+        try:
+            queue = sp.queue()
+            logging.info(f"{chat_id}:Queue length = {len(queue['queue'])}")
+            if queue:
+                queued_uri = None
+                if 'queued' in application.bot_data[chat_id]:
+                    queued_uri = application.bot_data[chat_id]['queued']
+                    logging.info(f"{chat_id}:Queued = {queued_uri} ")
+                bQueued = False
+                for item in queue['queue']:
+                    if (queued_uri is not None) and (queued_uri == item['uri']):
+                        bQueued = True
+                if bQueued:
+                    logging.info(f"{chat_id}:Queued item in queue, not adding another track")
+                    return
+        
+        except Exception as err:
+            logging.error("Caught exception")
+            
+                
         # add next track to the player queue
         if ((chat_id in application.bot_data) and ('queue' in application.bot_data[chat_id]) and (len(application.bot_data[chat_id]['queue']) > 0)):
+
+            
             next_in_queue_uri = list(application.bot_data[int(chat_id)]['queue'].keys())[0]                        
 
             logging.info(f"{chat_id}:Adding next in queue '{next_in_queue_uri}' to sp queue")
+
+            
             
             sp.add_to_queue(next_in_queue_uri)
+            application.bot_data[chat_id]['queued'] = next_in_queue_uri
+
             
             # and remove from the bot queue
             application.bot_data[int(chat_id)]['queue'].pop(next_in_queue_uri)
@@ -1120,8 +1161,12 @@ async def next_in_queue(chat_id: int, spotify_next) -> None:
         if spotify_next:
             sp.next_track()
 
+    except spotipy.exceptions.SpotifyException as err:
+        logging.error(f"{chat_id}:SpotiyException, failed to add track to the queue code='{err.code}' msg='{err.msg}'")
     except spotipy.oauth2.SpotifyOauthError as err:
         logging.error(f"{chat_id}:SpotifyOAuth error")
+    except RuntimeError as err:
+        logging.error(f"Caught runtime error {err}")
     except Exception as err:
         logging.error(f"{chat_id}:Unhandled exception in callback_manage_queue {type(err).__name__}")
         
@@ -1268,9 +1313,9 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 spotify_uri_list.append(item['track']['uri'])
     elif command.command == telegramhelper.upvote:
         spotify_uri_list = [command.data]
-        logging.info(f"Upvote of {command.data}")
+        logging.info(f"{chat_id}:Upvote of {command.data}")
     else:
-        logging.error(f"Unknown command: {command.command}")
+        logging.error(f"{chat_id}:Unknown command: {command.command}")
         return
 
     # validate payment conditions
@@ -1278,7 +1323,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     amount_to_pay = get_amount_to_pay(sp, track_price, spotify_uri_list)
     
     
-    logging.info(f"Amount to pay = {amount_to_pay}")
+    logging.info(f"{chat_id}:Amount to pay = {amount_to_pay}")
     if amount_to_pay == 0:
         payment_required = False
             
@@ -1286,7 +1331,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if payment_required == False:
         # TODO: change this if it is an upvote
         #spotifyhelper.add_to_queue(sp, spotify_uri_list)
-        logging.info(f"No payment required")
+        logging.info(f"{chat_id}:No payment required")
         add_to_queue_or_upvote(spotify_uri_list[0],chat_id,0)
         
 
@@ -1323,22 +1368,18 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
         
     # create an invoice title
-    logging.info("Creating invoice")
+    logging.info(f"{chat_id}:Creating invoice")
     invoice_title = f"{spotifyhelper.get_track_title_from_uri(sp,spotify_uri_list[0])}"
     for i in range(1,len(spotify_uri_list)):
         title += f",'{spotifyhelper.get_track_title_from_uri(sp,spotify_uri_list[0])}"
 
 
-    logging.info("get user and reciptient")
     # create the invoice
     # the owner is the one that has his spotify player connected
     recipient = await userhelper.get_group_owner(update.effective_chat.id)
     invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
 
 
-    logging.info(f"Got invoice")
-
-    
     # get the user wallet and try to pay the invoice
     user = await userhelper.get_or_create_user(update.effective_user.id,update.effective_user.username)
     invoice.user = user
@@ -1352,13 +1393,11 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         invoice.command = telegramhelper.upvote
 
 
-    logging.info(f"invoice copmmand")
-        
     # pay the invoice
     payment_result = await invoicehelper.pay_invoice(invoice.user, invoice)
 
 
-    logging.info(f"Got payment result")
+    logging.info(f"{chat_id}:Got payment result")
     
     # if payment success
     if payment_result['result'] == True:
@@ -1388,14 +1427,14 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode='HTML',
                 text=f"You paid {amount_to_pay} sats for {invoice_title}.")
         except:
-            logging.info("Could not send message to user")
+            logging.info(f"{chat_id}:Could not send message to user")
 
             
         try:
             async with aiomqtt.Client("localhost") as client:
                 await client.publish(f"{update.effective_chat.id}/added_to_queue", payload=invoice_title)
         except:
-            logging.error("Exception when publishing queue add to mqtt")
+            logging.error(f"{chat_id}:Exception when publishing queue add to mqtt")
             pass
 
             
