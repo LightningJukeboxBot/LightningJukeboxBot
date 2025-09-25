@@ -853,11 +853,17 @@ async def callback_paid_invoice(invoice: Invoice):
         result = await invoicehelper.pay_invoice(donator, donation_invoice)
 
 @debounce
-@adminonly
 @group_chat_only
 async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id=update.effective_chat.id
 
+    userid: int = update.effective_user.id
+
+    if userid not in settings.superadmins:
+        return
+    
+
+    
     await next_in_queue(chat_id, True)
     
     # remove now_playing and manage_queue jobs
@@ -1156,7 +1162,26 @@ async def check_spotify_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
             context.job_queue.run_once(callback_now_playing, 2, name=f"{chat_id}:now_playing", data=chat_id, job_kwargs = {'misfire_grace_time':None})
 
     context.job.data = {'first':False}
+
+def get_amount_to_pay(sp, track_price: int, spotify_uri_list):
+    if track_price == 0:
+        return 0
+    if len(spotify_uri_list) == 0:
+        return 0
+
+    amount_to_pay = 0
+    for uri in spotify_uri_list:
+        track = sp.track(uri)         
+        track_len = track['duration_ms'] / 1000
         
+        if track_len < 300:
+            amount_to_pay += track_price
+        else:
+            amount_to_pay += int((track_len * track_price)  / 180)
+
+    return amount_to_pay
+
+    
 #callback for button presses
 async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1250,14 +1275,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # validate payment conditions
     payment_required = True
-    amount_to_pay = int(track_price * len(spotify_uri_list))
-    
-    sp_track = sp.track(spotify_uri_list[0])        
-    sp_track_len = sp_track['duration_ms'] / 1000
-    if ( sp_track_len > 600 ):
-        amount_to_pay = 20 * amount_to_pay
-    if ( sp_track_len > 900 ):
-        amount_to_pay = 50 * amount_to_pay
+    amount_to_pay = get_amount_to_pay(sp, track_price, spotify_uri_list)
     
     
     logging.info(f"Amount to pay = {amount_to_pay}")
@@ -1649,18 +1667,9 @@ async function sendPayment() {{
         sp = await spotifyhelper.get_sp(chat_id)
         if not sp:
             return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
-
-        track = sp.track(track_id)        
-        track_len = track['duration_ms'] / 1000
         
-        amount_to_pay = int(await spotifyhelper.get_price(chat_id))
-        if ( track_len > 600 ):
-            amount_to_pay = 100 * amount_to_pay
-        if ( track_len > 1200 ):
-            amount_to_pay = 100 * amount_to_pay
-#            amount_to_pay = 10 * amount_
-#        elif ( track_len > 600 ):
-#            amount_to_pay = amount_to_pay * 1.0166428 ** (track_len - 300)
+        amount_to_pay = get_amount_to_pay(sp, int(await spotifyhelper.get_price(chat_id)), [track_id])
+
         recipient = await userhelper.get_group_owner(chat_id)
         invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
         invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
