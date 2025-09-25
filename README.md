@@ -3,7 +3,7 @@ This software is still in development and very much alpha. Use and interact with
 # A Bitcoin enabled Jukebox
 *Please consider donating some sats to [our Geyser.fund](https://geyser.fund/project/jukeboxbot), thank you!*
 
-![Assets/20230307-Bot-logo-new.jpg](https://github.com/LightningJukeboxBot/LightningJukeboxBot/blob/dev/Assets/LightningJukeboxBot.jpg)
+![Lightning Jukebox Bot](assets/20230307-Bot-logo-new.jpg)
 
 Our trust in DJ's has been broken, and we will make them obsolete! ;)
 *Except for [Rootzoll](https://twitter.com/rootzoll), he the man!* 
