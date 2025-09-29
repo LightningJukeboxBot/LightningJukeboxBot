@@ -1219,7 +1219,7 @@ def get_amount_to_pay(sp, track_price: int, spotify_uri_list):
         track = sp.track(uri)         
         track_len = track['duration_ms'] / 1000
         
-        if track_len < 300:
+        if track_len < 600:
             amount_to_pay += track_price
         else:
             amount_to_pay += int((track_len * track_price)  / 180)
@@ -1829,15 +1829,17 @@ async function sendPayment() {{
 
                
         message['now']['title'] = "Nothing is playing at the moment"
-        if len(application.bot_data[chat_id]['now_playing_title']) > 0:
-            message['now']['title'] = application.bot_data[chat_id]['now_playing_title']
-        
+
 
         if not chat_id in application.bot_data:
             application.bot_data[chat_id] = {}
         if not 'queue' in application.bot_data[chat_id]:
             application.bot_data[chat_id]['queue'] = {}
 
+        if 'now_playing_title' in application.bot_data[chat_id] and len(application.bot_data[chat_id]['now_playing_title']) > 0:
+            message['now']['title'] = application.bot_data[chat_id]['now_playing_title']
+        
+            
 
         message['status'] = 200
         return JSONResponse(message)
