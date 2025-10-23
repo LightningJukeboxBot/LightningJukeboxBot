@@ -63,7 +63,12 @@ class LNbits:
 
     # create a user and initial wallet
     async def createUser(self, name):
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:\
+            # TODO: remove usermanager dependency
+            # probably /users/api/v1/user
+            # requires userid
+            # requires to be an admin
+            # external_id can be used as reference
             response = await client.post(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/users",
                 headers={'X-Api-Key':self._admin_adminkey},
@@ -79,6 +84,9 @@ class LNbits:
     # delete user and their wallets
     async def deleteUser(self, lnbitsuserid):
         async with httpx.AsyncClient() as client:
+            # TODO: remove usermanager dependency
+            # First remove all wallets of the account DELETE /users/api/v1/user/{userid}/wallets
+            # Testing learns that deleting a wallet appears to be a bit problematic. Let wallets and users live forever? 
             response = await client.delete(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/users/{lnbitsuserid}",
                 headers={'X-Api-Key':self._admin_adminkey})
@@ -89,6 +97,9 @@ class LNbits:
         return None
         
         async with httpx.AsyncClient() as client:
+            # TODO: replace this to remove usermanager dependency
+            # Lijkt te werken: POST  to /users/api/v1/user/{user_id}/wallet
+            # requires usr of admin in the URL. 
             response = await client.post(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/wallets",
                 headers={'X-Api-Key':self._admin_invoicekey},
@@ -104,6 +115,7 @@ class LNbits:
     async def enableExtension(self, name, lnbitsuserid):
         # enable extension for user wallet
         async with httpx.AsyncClient() as client:
+            # TODO rewrite this to remove usermanager dependency: Update user to add extensions
             response = await client.post(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/extensions?extension={name}&userid={lnbitsuserid}&active=true",
                 headers={'X-Api-Key': self._admin_invoicekey})
@@ -193,14 +205,19 @@ class LNbits:
     # get all wallets in lnbits
     async def getWallets(self):
         async with httpx.AsyncClient() as client:
+            # TODO: replace this to remove dependency of usermanager
+            # /api/v1/wallet/paginated
+            # this function can also filter on external id, 
             response = await client.get(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/wallets",
                 headers = {"X-Api-Key": self._admin_adminkey})
             return json.loads(response.text)
 
-    # get all wallets in lnbits
+    # get all users in lnbits
     async def getUsers(self):
         async with httpx.AsyncClient() as client:
+            # TODO: replace this to remove dependency of usermanager
+            # GET /users/api/v1/user
             response = await client.get(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/users",
                 headers = {"X-Api-Key": self._admin_adminkey})
@@ -209,6 +226,8 @@ class LNbits:
     # return the wallet for a specific user
     async def getWallet(self, lnbitsuserid):
         async with httpx.AsyncClient() as client:
+            # TODO: rewrite this to get the wallet of a specific user
+            # /users/api/v1/user/{user_id}/wallet
             response = await client.get(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/wallets/{lnbitsuserid}",
                 headers = {"X-Api-Key": self._admin_adminkey})
