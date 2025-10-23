@@ -2,6 +2,10 @@ import json
 import httpx
 import logging
 
+# TODO: verify the LNbits version
+# /api/v1/status on v1
+# or just an environment variable call to /openapi.json contains version field
+
 class LNbits:
     def __init__(self, protocol, host, admin_adminkey, admin_invoicekey, admin_usrkey):
         self.protocol = protocol
@@ -10,6 +14,19 @@ class LNbits:
         self._admin_invoicekey = admin_invoicekey
         self._admin_usrkey = admin_usrkey
 
+        # do a call to /openapi.json to determine version
+        with httpx.Client() as client:
+            response = client.get(f"{self.protocol}://{self.host}/openapi.json")
+            result = json.loads(response.text)
+            version = result['info']['version']
+            if version[0] == '0':
+                self._pre_version_one = True
+            else:
+                self._pre_version_one = False
+        
+        print(f"LNbits initialized with pre one version: {self._pre_version_one}")
+
+                            
     # get balance
     async def getBalance(self, invoicekey):
         async with httpx.AsyncClient() as client:
@@ -226,7 +243,7 @@ class LNbits:
     # return the wallet for a specific user
     async def getWallet(self, lnbitsuserid):
         async with httpx.AsyncClient() as client:
-            # TODO: rewrite this to get the wallet of a specific user
+            # TODO: rewrite this to get the wallet of a specific user and remove usermanager dependency
             # /users/api/v1/user/{user_id}/wallet
             response = await client.get(
                 f"{self.protocol}://{self.host}/usermanager/api/v1/wallets/{lnbitsuserid}",
