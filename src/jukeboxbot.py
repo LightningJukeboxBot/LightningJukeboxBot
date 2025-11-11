@@ -2001,47 +2001,97 @@ async function sendPayment() {{
               <div class="search-result-container"></div>
               <div class="search-result-container"></div>
             </div>
+            <div class="button-container">
+              <div class="button-text play-text">PLAY IT!</div>
+              <div class="button-text cancel-text">CANCEL</div>
+            </div>
           </div>
         </div>
       </div>
     </form>
   </body>
   <script>
-   const req1 = new XMLHttpRequest();	
-   req1.onreadystatechange = function() {{
-      if (this.readyState == 4 && this.status == 200) {{
-        obj = JSON.parse(this.responseText);
-        if ( obj.status == 200 ) {{
-          var nodes = document.querySelectorAll(".search-result-container");
-          for(let i=0;(i<obj.results.length);i++) {{
-            nodes[i].innerText = obj.results[i].title;
-            nodes[i].onclick = function(){{
-              req2.open("GET","/jukebox/web/{chat_id}/add?track_id=" + obj.results[i].track_id);
-              req2.setRequestHeader("Accept", "application/json");	
-              req2.setRequestHeader("Content-Type", "application/json"); 
-              req2.send();             
-            }};
-          }}
-        }}
-      }}
-   }};
+   const req1 = new XMLHttpRequest();
+   let selectedTrackId = null;
+   document.addEventListener('DOMContentLoaded', function() {{
+     req1.onreadystatechange = function() {{
+       if (this.readyState == 4 && this.status == 200) {{
+         obj = JSON.parse(this.responseText);
+         if ( obj.status == 200 ) {{
+           var nodes = document.querySelectorAll(".search-result-container");
+           for(let i=0;(i<obj.results.length);i++) {{
+             nodes[i].innerText = obj.results[i].title;
+             nodes[i].onclick = function(){{
+               // Remove selected class from all results
+               document.querySelectorAll('.search-result-container').forEach(node => {{
+                 node.classList.remove('selected');
+               }});
 
-   const req2 = new XMLHttpRequest();
-   req2.onreadystatechange = function() {{        
-      if (this.readyState == 4 && this.status == 200) {{
-        obj = JSON.parse(this.responseText);
-        if ( obj.status == 200 ) {{
-          window.location.href = obj.payment_url;
-        }}
-      }}
-   }};
+               // Add selected class to clicked result
+               this.classList.add('selected');
 
-  function submitSearch() {{  
-    req1.open("POST", "/jukebox/web/{chat_id}/search"); 
-    req1.setRequestHeader("Accept", "application/json");	
-    req1.setRequestHeader("Content-Type", "application/json"); 
-    req1.send(JSON.stringify({{query:document.getElementsByName("query")[0].value}}));
-  }}  
+               // Show play button
+               document.querySelector('.play-text').classList.add('visible');
+               document.querySelector('.button-container').style.height = '178px';
+
+               // Switch background image
+               document.querySelector('.image-container img').src = '/jukebox/assets/jukeboxbot_addmusic_2buttons.png';
+               document.querySelector('.image-content').style.aspectRatio = '762/1067';
+               document.querySelector('.button-container').style.height = '164px';
+
+               // Store selected track
+               selectedTrackId = obj.results[i].track_id;
+             }};
+           }}
+         }}
+       }}
+     }};
+
+     const req2 = new XMLHttpRequest();
+     req2.onreadystatechange = function() {{
+       if (this.readyState == 4 && this.status == 200) {{
+         obj = JSON.parse(this.responseText);
+         if ( obj.status == 200 ) {{
+           window.location.href = obj.payment_url;
+         }}
+       }}
+     }};
+
+     document.querySelector('.play-text').onclick = function() {{
+       this.classList.add('loading');
+       req2.open("GET","/jukebox/web/{chat_id}/add?track_id=" + selectedTrackId);
+       req2.setRequestHeader("Accept", "application/json");
+       req2.setRequestHeader("Content-Type", "application/json");
+       req2.send();
+     }};
+
+     document.querySelector('.cancel-text').onclick = function() {{
+       // Clear search results
+       document.querySelectorAll('.search-result-container').forEach(function(node) {{
+         node.innerText = '';
+         node.classList.remove('selected');
+       }});
+
+       // Clear search input
+       document.getElementsByName('query')[0].value = '';
+
+       // Hide play button
+       document.querySelector('.play-text').classList.remove('visible');
+       document.querySelector('.button-container').style.height = '84px';
+
+       // Switch back to original image
+       document.querySelector('.image-container img').src = '/jukebox/assets/jukeboxbot_addmusic.png';
+       document.querySelector('.image-content').style.aspectRatio = '762/977';
+       document.querySelector('.button-container').style.height = '80px';
+     }};
+   }});
+
+   function submitSearch() {{
+     req1.open("POST", "/jukebox/web/{chat_id}/search");
+     req1.setRequestHeader("Accept", "application/json");
+     req1.setRequestHeader("Content-Type", "application/json");
+     req1.send(JSON.stringify({{query:document.getElementsByName("query")[0].value}}));
+   }}  
 
   </script> </html>""")
 
