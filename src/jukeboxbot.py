@@ -1226,6 +1226,24 @@ def get_amount_to_pay(sp, track_price: int, spotify_uri_list):
 
     return amount_to_pay
 
+
+async def queue_free_web_track(chat_id: int, track_id: str, invoice_title: str) -> None:
+    add_to_queue_or_upvote(track_id, chat_id, 0)
+
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            parse_mode='HTML',
+            text=f"{random.choice(anonyms)} added {invoice_title} to the /queue.")
+    except Exception:
+        logging.info(f"{chat_id}:Could not send web queue message")
+
+    try:
+        async with aiomqtt.Client("localhost") as client:
+            await client.publish(f"{chat_id}/added_to_queue", payload=invoice_title)
+    except Exception:
+        logging.error(f"{chat_id}:Exception when publishing web queue add to mqtt")
+
     
 #callback for button presses
 async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1706,11 +1724,23 @@ async function sendPayment() {{
         sp = await spotifyhelper.get_sp(chat_id)
         if not sp:
             return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
-        
+
+        track = sp.track(track_id)
         amount_to_pay = get_amount_to_pay(sp, int(await spotifyhelper.get_price(chat_id)), [track_id])
+        invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
+
+        if amount_to_pay == 0:
+            await queue_free_web_track(chat_id, track_id, invoice_title)
+            return JSONResponse({
+                "status":200,
+                "result":{
+                    "title":invoice_title,
+                    "amount":0,
+                    "queued":True
+                }
+            })
 
         recipient = await userhelper.get_group_owner(chat_id)
-        invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
         invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
         if invoice is None:
             return JSONResponse({"status":400,"message":"Payments not available"})
@@ -2007,31 +2037,57 @@ async function sendPayment() {{
     </form>
   </body>
   <script>
-   const req1 = new XMLHttpRequest();	
+   const req1 = new XMLHttpRequest();
+   const req2 = new XMLHttpRequest();
+
+   function requestTrack(trackId, node) {{
+      node.innerText = "Loading...";
+      req2.open("GET","/jukebox/web/{chat_id}/add?track_id=" + encodeURIComponent(trackId));
+      req2.setRequestHeader("Accept", "application/json");
+      req2.setRequestHeader("Content-Type", "application/json");
+      req2.send();
+   }}
+
    req1.onreadystatechange = function() {{
       if (this.readyState == 4 && this.status == 200) {{
-        obj = JSON.parse(this.responseText);
+        const obj = JSON.parse(this.responseText);
         if ( obj.status == 200 ) {{
-          var nodes = document.querySelectorAll(".search-result-container");
+          const nodes = document.querySelectorAll(".search-result-container");
+          nodes.forEach(function(node) {{
+            node.innerText = "";
+            node.onclick = null;
+            node.onkeydown = null;
+            node.removeAttribute("role");
+            node.removeAttribute("tabindex");
+          }});
           for(let i=0;(i<obj.results.length);i++) {{
-            nodes[i].innerText = obj.results[i].title;
+            const track = obj.results[i];
+            nodes[i].innerText = track.title;
+            nodes[i].setAttribute("role", "button");
+            nodes[i].tabIndex = 0;
             nodes[i].onclick = function(){{
-              req2.open("GET","/jukebox/web/{chat_id}/add?track_id=" + obj.results[i].track_id);
-              req2.setRequestHeader("Accept", "application/json");	
-              req2.setRequestHeader("Content-Type", "application/json"); 
-              req2.send();             
+              requestTrack(track.track_id, nodes[i]);
+            }};
+            nodes[i].onkeydown = function(event) {{
+              if (event.key === "Enter" || event.key === " ") {{
+                event.preventDefault();
+                requestTrack(track.track_id, nodes[i]);
+              }}
             }};
           }}
         }}
       }}
    }};
 
-   const req2 = new XMLHttpRequest();
    req2.onreadystatechange = function() {{        
       if (this.readyState == 4 && this.status == 200) {{
-        obj = JSON.parse(this.responseText);
-        if ( obj.status == 200 ) {{
+        const obj = JSON.parse(this.responseText);
+        if ( obj.status == 200 && obj.payment_url ) {{
           window.location.href = obj.payment_url;
+        }} else if ( obj.status == 200 && obj.queued ) {{
+          window.location.href = "/jukebox/assets/jukeboxbot_invoicepaid.html";
+        }} else {{
+          alert(obj.message || "Unable to request track.");
         }}
       }}
    }};
@@ -2193,8 +2249,18 @@ async function sendPayment() {{
 #            amount_to_pay = 10 * amount_
 #        elif ( track_len > 600 ):
 #            amount_to_pay = amount_to_pay * 1.0166428 ** (track_len - 300)
-        recipient = await userhelper.get_group_owner(chat_id)
         invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
+
+        if amount_to_pay == 0:
+            await queue_free_web_track(chat_id, track_id, invoice_title)
+            return JSONResponse({
+                "status":200,
+                "queued":True,
+                "payment_url":"/jukebox/assets/jukeboxbot_invoicepaid.html",
+                "title":invoice_title
+            })
+
+        recipient = await userhelper.get_group_owner(chat_id)
         invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
         if invoice is None:
             return JSONResponse({"status":400,"message":"Payments not available"})
