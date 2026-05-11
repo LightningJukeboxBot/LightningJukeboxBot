@@ -49,6 +49,7 @@ The Jukebox uses [LNbits](https://github.com/lnbits) in the back (many thanks to
 - /add artist and track title (to add music to the /queue)
 - /history
 - /queue (see upcoming tracks (need to still differentiate between added tracks and those in the background playlist))
+- /boost queue-position sats (pump a queued song by a custom amount, for example /boost 2 100)
 - /stack (takes you to PM with the bot to view your stack
 - /fund (folks can pay per track as they /add, or preload their Jukebox stack with the /fund command)
 - /refund invoice (allows users to send sats from their /stack to any invoice)

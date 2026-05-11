@@ -317,7 +317,7 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         
     title = f"🎵 {title} 🎵"
 
-    title += "\n\nUse the /add command to add your favourite track to the queue, or click on a track to pump it to the top of the queue."
+    title += "\n\nUse the /add command to add your favourite track to the queue, click on a track to pump it by the track price, or use /boost &lt;position&gt; &lt;sats&gt; to pump a track by any amount."
 
         
     if chat_id in context.bot_data and 'queue' in context.bot_data[chat_id] and len(context.bot_data[chat_id]['queue']) > 0:
@@ -332,6 +332,107 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=InlineKeyboardMarkup(create_queue_button_list(context, sp, chat_id)),
         delete_timeout=settings.delete_message_timeout_medium
     )
+
+
+@debounce
+@group_chat_only
+async def boost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = int(update.effective_chat.id)
+
+    result = re.search(r"^/(boost|pump)(?:@\w+)?\s+([0-9]+)\s+([0-9]+)\s*$", update.message.text, re.IGNORECASE)
+    if result is None:
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text="Use command as follows: /boost &lt;queue position&gt; &lt;sats&gt;",
+            delete_timeout=settings.delete_message_timeout_medium)
+        return
+
+    queue_position = int(result.groups()[1])
+    amount_to_pay = int(result.groups()[2])
+    if queue_position < 1 or amount_to_pay < 1:
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text="Queue position and sats must be greater than zero.",
+            delete_timeout=settings.delete_message_timeout_medium)
+        return
+
+    if chat_id not in application.bot_data or 'queue' not in application.bot_data[chat_id] or len(application.bot_data[chat_id]['queue']) == 0:
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text="Request queue is empty.",
+            delete_timeout=settings.delete_message_timeout_short)
+        return
+
+    queue_items = list(application.bot_data[chat_id]['queue'].keys())
+    if queue_position > len(queue_items):
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text=f"Queue position {queue_position} is not available.",
+            delete_timeout=settings.delete_message_timeout_medium)
+        return
+
+    sp = await spotifyhelper.get_sp(chat_id)
+    if not sp:
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text="Could not obtain player instance",
+            delete_timeout=settings.delete_message_timeout_short)
+        return
+
+    spotify_uri = queue_items[queue_position - 1]
+    invoice_title = spotifyhelper.get_track_title_from_uri(sp, spotify_uri)
+    recipient = await userhelper.get_group_owner(chat_id)
+    invoice = await invoicehelper.create_invoice(recipient, amount_to_pay, invoice_title)
+    if invoice is None:
+        await send_telegram_message(
+            context=context,
+            chat_id=chat_id,
+            text="Payments not available.",
+            delete_timeout=settings.delete_message_timeout_short)
+        return
+
+    user = await userhelper.get_or_create_user(update.effective_user.id, update.effective_user.username)
+    invoice.user = user
+    invoice.title = invoice_title
+    invoice.recipient = recipient
+    invoice.spotify_uri_list = [spotify_uri]
+    invoice.chat_id = chat_id
+    invoice.amount_to_pay = amount_to_pay
+    invoice.command = telegramhelper.upvote
+
+    payment_result = await invoicehelper.pay_invoice(invoice.user, invoice)
+    if payment_result['result'] == True:
+        add_to_queue_or_upvote(spotify_uri, chat_id, amount_to_pay)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            parse_mode='HTML',
+            text=f"@{update.effective_user.username} pumped {invoice_title} to {int(context.bot_data[chat_id]['queue'][spotify_uri])} sats.")
+
+        jukeboxbot = await userhelper.get_or_create_user(settings.bot_id)
+        donation_amount : int = await spotifyhelper.get_donation_fee(invoice.chat_id)
+        donation_amount = min(donation_amount, invoice.amount_to_pay)
+        if donation_amount > 0:
+            donation_invoice = await invoicehelper.create_invoice(jukeboxbot, donation_amount, "donation to the bot")
+            result = await invoicehelper.pay_invoice(recipient, donation_invoice)
+        return
+
+    message = await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"@{update.effective_user.username} pump '{invoice_title}' in the /queue with {amount_to_pay} sats?\n\nClick to pay below or fund the bot with /fund@Jukebox_Lightning_bot.",
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"Pay {amount_to_pay} sats",url=f"https://{settings.domain}/jukebox/payinvoice?payment_hash={invoice.payment_hash}"),
+            InlineKeyboardButton('Cancel', callback_data = telegramhelper.add_command(TelegramCommand(update.effective_user.id,telegramhelper.cancelinvoice,invoice)))
+        ]]))
+
+    invoice.message_id = message.id
+    await invoicehelper.save_invoice(invoice)
+    application.job_queue.run_once(check_invoice_callback, 15, data = invoice)
 
 
     
@@ -830,7 +931,7 @@ async def callback_paid_invoice(invoice: Invoice):
     try:
         message = f"{random.choice(anonyms)} added '{invoice.title}' to the queue."        
         if invoice.command == telegramhelper.upvote:
-            f"{random.choice(anonyms)} pumped '{invoice.title}' with {invoice.amount_to_pay} sats."
+            message = f"{random.choice(anonyms)} pumped '{invoice.title}' with {invoice.amount_to_pay} sats."
 
         await send_telegram_message(
             context=application,
@@ -1506,6 +1607,7 @@ async def main() -> None:
     application.add_handler(CommandHandler('refund', pay)) # pay a lightning invoice
     application.add_handler(CommandHandler('price', price)) # set the track price
     application.add_handler(CommandHandler('queue', queue)) # view the queue
+    application.add_handler(CommandHandler(['boost','pump'], boost)) # pump a queued track by any amount
     application.add_handler(CommandHandler('service', service)) # service notifications to bot users
     application.add_handler(CommandHandler("setclientsecret",spotify_settings)) # set the secret for a spotify app
     application.add_handler(CommandHandler("setclientid",spotify_settings))  # set the clientid or a spotify app
