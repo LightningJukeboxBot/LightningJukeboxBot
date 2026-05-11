@@ -81,7 +81,26 @@ jukeboxtexts.init()
 settings.init()
 
 # add to local player
-def add_to_queue_or_upvote(uri, chat_id, amount):
+def get_queue_requester_name(user):
+    if user is None:
+        return None
+
+    username = getattr(user, "username", None)
+    if username:
+        if str(username).startswith("@"):
+            return str(username)
+        return f"@{username}"
+
+    first_name = getattr(user, "first_name", None)
+    last_name = getattr(user, "last_name", None)
+    name = " ".join(filter(None, [first_name, last_name]))
+    if name:
+        return name
+
+    return None
+
+
+def add_to_queue_or_upvote(uri, chat_id, amount, requester_name=None):
     if not isinstance(uri,str):
         logging.error(f"{chat_id}:uri is not a string")
         return
@@ -93,12 +112,17 @@ def add_to_queue_or_upvote(uri, chat_id, amount):
         application.bot_data[chat_id] = {}
     if not 'queue' in application.bot_data[chat_id]:
         application.bot_data[chat_id]['queue'] = {}
+    if not 'queue_requesters' in application.bot_data[chat_id]:
+        application.bot_data[chat_id]['queue_requesters'] = {}
         
     # upvote in the queue or add to queue
     if uri in application.bot_data[chat_id]['queue']:
         application.bot_data[chat_id]['queue'][uri] += amount
     else:
         application.bot_data[chat_id]['queue'][uri] = amount
+
+    if requester_name and uri not in application.bot_data[chat_id]['queue_requesters']:
+        application.bot_data[chat_id]['queue_requesters'][uri] = requester_name
         
     # reorder the queue by highest paying amount
     sorted_queue = sorted(application.bot_data[chat_id]['queue'].items(), key=lambda x:x[1], reverse=True)
@@ -279,13 +303,15 @@ def create_queue_button_list(context, sp, chat_id: int):
     
     for uri in context.bot_data[chat_id]['queue']:
         amount = context.bot_data[chat_id]['queue'][uri]
+        requester_name = context.bot_data[chat_id].get('queue_requesters', {}).get(uri)
+        requester_text = f" - {requester_name}" if requester_name else ""
         if amount > 100000000 - 1:
-            qtitle = f"Up next: {spotifyhelper.get_track_title_from_uri(sp,uri)}"        
+            qtitle = f"Up next: {spotifyhelper.get_track_title_from_uri(sp,uri)}{requester_text}"
             button_list.append([
                 InlineKeyboardButton(qtitle, callback_data = 0)
             ])
         else:
-            qtitle = f"{count}. {spotifyhelper.get_track_title_from_uri(sp,uri)} ({amount} sats)"        
+            qtitle = f"{count}. {spotifyhelper.get_track_title_from_uri(sp,uri)}{requester_text} ({amount} sats)"
             button_list.append([
                 InlineKeyboardButton(qtitle, callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.upvote,uri)))
             ])
@@ -825,7 +851,11 @@ async def callback_paid_invoice(invoice: Invoice):
         return
     
     # change this if it is an upvote
-    add_to_queue_or_upvote(invoice.spotify_uri_list[0],invoice.chat_id,invoice.amount_to_pay)
+    add_to_queue_or_upvote(
+        invoice.spotify_uri_list[0],
+        invoice.chat_id,
+        invoice.amount_to_pay,
+        get_queue_requester_name(invoice.user))
     
     try:
         message = f"{random.choice(anonyms)} added '{invoice.title}' to the queue."        
@@ -1156,6 +1186,7 @@ async def next_in_queue(chat_id: int, spotify_next) -> None:
             
             # and remove from the bot queue
             application.bot_data[int(chat_id)]['queue'].pop(next_in_queue_uri)
+            application.bot_data[int(chat_id)].get('queue_requesters', {}).pop(next_in_queue_uri, None)
 
         # skip to the next track
         if spotify_next:
@@ -1332,7 +1363,11 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # TODO: change this if it is an upvote
         #spotifyhelper.add_to_queue(sp, spotify_uri_list)
         logging.info(f"{chat_id}:No payment required")
-        add_to_queue_or_upvote(spotify_uri_list[0],chat_id,0)
+        add_to_queue_or_upvote(
+            spotify_uri_list[0],
+            chat_id,
+            0,
+            get_queue_requester_name(update.effective_user))
         
 
         for uri in spotify_uri_list:
@@ -1403,7 +1438,11 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if payment_result['result'] == True:
         # TODO: change this if it is an upvote        
         #spotifyhelper.add_to_queue(sp, spotify_uri_list)
-        add_to_queue_or_upvote(invoice.spotify_uri_list[0],invoice.chat_id,invoice.amount_to_pay)
+        add_to_queue_or_upvote(
+            invoice.spotify_uri_list[0],
+            invoice.chat_id,
+            invoice.amount_to_pay,
+            get_queue_requester_name(invoice.user))
 
         if invoice.command == telegramhelper.upvote:
             # update the queue message
