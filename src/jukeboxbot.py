@@ -80,6 +80,24 @@ anonyms = ['Hal Finney','Satoshi Nakamoto']
 jukeboxtexts.init()
 settings.init()
 
+def get_telegram_display_name(user):
+    username = getattr(user, "username", None)
+    if username:
+        return f"@{html.escape(str(username))}"
+
+    first_name = getattr(user, "first_name", None)
+    last_name = getattr(user, "last_name", None)
+    name = " ".join(filter(None, [first_name, last_name]))
+    if name:
+        return html.escape(name)
+
+    user_id = getattr(user, "id", None)
+    if user_id:
+        return f"user {user_id}"
+
+    return "Unknown user"
+
+
 # add to local player
 def add_to_queue_or_upvote(uri, chat_id, amount):
     if not isinstance(uri,str):
@@ -622,7 +640,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
         await send_telegram_message(
             context=context,
             chat_id=chat_id,
-            text=f"@{update.effective_user.username} suggests to play tracks from the '{result['name']}' playlist.",
+            text=f"{get_telegram_display_name(update.effective_user)} suggests to play tracks from the '{result['name']}' playlist.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(f"Pay {await spotifyhelper.get_price(update.effective_chat.id)} sats for a random track", callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.playrandom,playlistid)))
             ]]),
@@ -1248,6 +1266,8 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logging.info("Command is None")
         return
 
+    user_display_name = get_telegram_display_name(update.effective_user)
+
     # parse the callback data.
     # TODO: Should convert this into an access reference map pattern
 
@@ -1346,12 +1366,12 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         parse_mode='HTML',
-                        text=f"@{update.effective_user.username} pumped '{tracktitle}' to {int(application.bot_data[update.effective_chat.id]['queue'][uri])} sats.")
+                        text=f"{user_display_name} pumped '{tracktitle}' to {int(application.bot_data[update.effective_chat.id]['queue'][uri])} sats.")
                 else:
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         parse_mode='HTML',
-                        text=f"@{update.effective_user.username} added '{tracktitle}' to the /queue.")
+                        text=f"{user_display_name} added '{tracktitle}' to the /queue.")
             except:
                 pass
 
@@ -1414,12 +1434,12 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 parse_mode='HTML',
-                text=f"@{update.effective_user.username} pumped {invoice_title} to {int(context.bot_data[update.effective_chat.id]['queue'][invoice.spotify_uri_list[0]])} sats")
+                text=f"{user_display_name} pumped {invoice_title} to {int(context.bot_data[update.effective_chat.id]['queue'][invoice.spotify_uri_list[0]])} sats")
         else:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 parse_mode='HTML',
-                text=f"@{update.effective_user.username} added {invoice_title} to the /queue.")
+                text=f"{user_display_name} added {invoice_title} to the /queue.")
             
         try:
             await context.bot.send_message(
@@ -1455,7 +1475,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if invoice.command == telegramhelper.upvote:
         message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"@{update.effective_user.username} pump '{invoice_title}' in the /queue?\n\nClick to pay below or fund the bot with /fund@Jukebox_Lightning_bot.",       
+            text=f"{user_display_name} pump '{invoice_title}' in the /queue?\n\nClick to pay below or fund the bot with /fund@Jukebox_Lightning_bot.",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[        
                 InlineKeyboardButton(f"Pay {amount_to_pay} sats",url=f"https://{settings.domain}/jukebox/payinvoice?payment_hash={invoice.payment_hash}"),
@@ -1464,7 +1484,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"@{update.effective_user.username} add '{invoice_title}' to the /queue?\n\nClick to pay below or fund the bot with /fund@Jukebox_Lightning_bot.",       
+            text=f"{user_display_name} add '{invoice_title}' to the /queue?\n\nClick to pay below or fund the bot with /fund@Jukebox_Lightning_bot.",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup([[        
                 InlineKeyboardButton(f"Pay {amount_to_pay} sats",url=f"https://{settings.domain}/jukebox/payinvoice?payment_hash={invoice.payment_hash}"),
