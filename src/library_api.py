@@ -4,14 +4,16 @@ library_api.py -- minimal HTTP API backing the site's search box.
 
     GET  /api/search?q=...   -> JSON list of playable local tracks
     POST /api/request        -> body: q=... ; records a miss in the wanted list
+    POST /api/play           -> body: artist=...&title=... ; queues it live on air
 
-Talks only to the local SQLite library index and the shared Redis wanted-list.
-No Telegram, no LNbits, no bot dependency -- safe to run standalone, ahead of
-the real bot deployment.
+Talks only to the local SQLite library index, the shared Redis wanted-list, and
+Liquidsoap's request socket. No Telegram, no LNbits, no bot dependency -- safe
+to run standalone, ahead of the real bot deployment.
 """
 
 import asyncio
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -19,13 +21,16 @@ import redis
 from resolvers.local import LocalResolver
 from resolvers.wanted import WantedQueue
 from resolvers.chain import ResolverChain
+from liquidsoap_control import push_track
 
 DB_PATH = "/var/lib/jukebox/library.db"
 PORT = 7100
+PLAY_COOLDOWN_S = 10  # basic anti-spam: don't let requests hammer the live queue
 
 rds = redis.Redis(db=2)
 wanted = WantedQueue(rds=rds)
 chain = ResolverChain(resolvers=[LocalResolver(DB_PATH)], wanted=wanted, base_price=21)
+_last_play_at = 0.0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,8 +59,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/request":
-            return self._json(404, {"error": "not found"})
+        if parsed.path == "/api/request":
+            return self._handle_request()
+        if parsed.path == "/api/play":
+            return self._handle_play()
+        return self._json(404, {"error": "not found"})
+
+    def _handle_request(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode()
         qs = parse_qs(raw)
@@ -65,6 +75,42 @@ class Handler(BaseHTTPRequestHandler):
 
         votes = asyncio.run(wanted.add(q))
         self._json(200, {"votes": votes, "message": "Added to the wanted list"})
+
+    def _handle_play(self):
+        global _last_play_at
+
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode()
+        qs = parse_qs(raw)
+        artist = (qs.get("artist") or [""])[0].strip()
+        title = (qs.get("title") or [""])[0].strip()
+        if not artist or not title:
+            return self._json(400, {"error": "missing artist/title"})
+
+        now = time.time()
+        if now - _last_play_at < PLAY_COOLDOWN_S:
+            wait = round(PLAY_COOLDOWN_S - (now - _last_play_at))
+            return self._json(429, {"error": f"Too many requests, try again in {wait}s"})
+
+        # Never trust a client-supplied path -- re-look-up the track ourselves so
+        # only files actually in the indexed library can ever be queued.
+        local = chain.by_name["local"]
+        matches = asyncio.run(local.search(f"{artist} {title}", limit=5))
+        track = next(
+            (t for t in matches
+             if t.artist.strip().lower() == artist.lower() and t.title.strip().lower() == title.lower()),
+            None,
+        )
+        if not track:
+            return self._json(404, {"error": "Track not found in library"})
+
+        try:
+            push_track(track.local_path)
+            _last_play_at = now
+        except Exception as e:
+            return self._json(500, {"error": f"Could not queue track: {e}"})
+
+        self._json(200, {"message": f"Queued '{track.display()}' -- should play shortly"})
 
     def log_message(self, format, *args):
         pass
