@@ -78,8 +78,18 @@ def queue_rids(socket_path: str = DEFAULT_SOCKET) -> list[str]:
 
 
 def skip(socket_path: str = DEFAULT_SOCKET) -> str:
-    """Skip whatever is currently on air."""
-    return _send(socket_path, "Noderunners_Radio.skip")
+    """Skip whatever is currently on air.
+
+    Noderunners_Radio.skip (the icecast output wrapper) is a no-op in practice --
+    confirmed by testing, on_air stayed the same RID before/after. The actual
+    active leaf source (jukebox or music-test, per request.metadata's "source"
+    field) is what needs the .skip call.
+    """
+    rid = on_air_rid(socket_path)
+    if not rid:
+        return "nothing on air"
+    source = request_metadata(rid, socket_path).get("source", "music-test")
+    return _send(socket_path, f"{source}.skip")
 
 
 def flush_and_skip(socket_path: str = DEFAULT_SOCKET) -> str:
