@@ -14,6 +14,7 @@ live socket with SF present before any endpoint can trigger it, since a typo
 here talks directly to the on-air source.
 """
 
+import re
 import socket
 
 DEFAULT_SOCKET = "/var/run/liquidsoap/noderunners.sock"
@@ -45,6 +46,45 @@ def push_track(local_path: str, socket_path: str = DEFAULT_SOCKET) -> str:
 def queue_status(socket_path: str = DEFAULT_SOCKET) -> str:
     """What's currently queued/playing in the jukebox request source."""
     return _send(socket_path, "jukebox.queue")
+
+
+def _parse_metadata(raw: str) -> dict:
+    """Parse a request.metadata block (key="value" lines, escaped quotes) into a dict."""
+    out = {}
+    for line in raw.splitlines():
+        m = re.match(r'^(\w+)="((?:[^"\\]|\\.)*)"$', line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+def request_metadata(rid: str, socket_path: str = DEFAULT_SOCKET) -> dict:
+    """Track info (artist/title/album/status/...) for one request ID."""
+    return _parse_metadata(_send(socket_path, f"request.metadata {rid}"))
+
+
+def on_air_rid(socket_path: str = DEFAULT_SOCKET) -> str | None:
+    """The RID currently playing on air, if any."""
+    raw = _send(socket_path, "request.on_air").strip().splitlines()
+    rid = raw[0].strip() if raw and raw[0].strip() and raw[0].strip() != "END" else None
+    return rid or None
+
+
+def queue_rids(socket_path: str = DEFAULT_SOCKET) -> list[str]:
+    """RIDs currently sitting in the jukebox queue, in order."""
+    raw = _send(socket_path, "jukebox.queue").strip().splitlines()
+    line = raw[0].strip() if raw else ""
+    return line.split() if line and line != "END" else []
+
+
+def skip(socket_path: str = DEFAULT_SOCKET) -> str:
+    """Skip whatever is currently on air."""
+    return _send(socket_path, "Noderunners_Radio.skip")
+
+
+def flush_and_skip(socket_path: str = DEFAULT_SOCKET) -> str:
+    """Clear the entire jukebox request backlog and skip to the next source."""
+    return _send(socket_path, "jukebox.flush_and_skip")
 
 
 if __name__ == "__main__":
