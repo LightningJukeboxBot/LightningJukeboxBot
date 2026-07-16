@@ -47,6 +47,7 @@ if TELEGRAM_CHAT_BOT_TOKEN:
     telegram_chat = TelegramChatRelay(
         token=TELEGRAM_CHAT_BOT_TOKEN,
         chat_id=int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None,
+        rds=rds,
     )
     telegram_chat.start()
 _last_play_at = 0.0

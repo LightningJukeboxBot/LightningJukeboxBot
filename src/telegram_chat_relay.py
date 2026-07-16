@@ -10,8 +10,15 @@ Bot token lives in the TELEGRAM_CHAT_BOT_TOKEN env var (same pattern as
 JUKEBOX_ADMIN_TOKEN) -- never hardcoded, never sent to the browser. Media
 (GIFs/photos/stickers) is proxied through our own /api/chat/media endpoint
 so the token never appears in a client-facing URL.
+
+History is Redis-backed (same instance the wanted-list already uses) so a
+service restart doesn't wipe the chat -- an in-memory-only deque was the v1
+bug: every `systemctl restart library-api` silently reset visible history
+to empty. Falls back to an in-memory deque only when no Redis client is
+given (standalone/test mode), same pattern as resolvers/wanted.py.
 """
 
+import json
 import logging
 import threading
 import time
@@ -23,6 +30,7 @@ import requests
 API_BASE = "https://api.telegram.org/bot{token}/{method}"
 LONG_POLL_TIMEOUT_S = 25
 MAX_HISTORY = 100
+REDIS_KEY = "telegram_chat:history"
 
 
 def _display_name(frm: dict) -> str:
@@ -51,10 +59,11 @@ def _extract_media(msg: dict) -> Optional[dict]:
 
 
 class TelegramChatRelay:
-    def __init__(self, token: str, chat_id: Optional[int] = None):
+    def __init__(self, token: str, chat_id: Optional[int] = None, rds=None):
         self.token = token
         self.chat_id = chat_id  # None = accept from whatever chat the bot is in
-        self._history = deque(maxlen=MAX_HISTORY)
+        self.rds = rds
+        self._history = deque(maxlen=MAX_HISTORY)  # fallback only, when rds is None
         self._lock = threading.Lock()
         self._offset = 0
         self._thread: Optional[threading.Thread] = None
@@ -94,13 +103,23 @@ class TelegramChatRelay:
                         "date": msg["date"],
                         "media": _extract_media(msg),
                     }
-                    with self._lock:
-                        self._history.append(entry)
+                    self._store(entry)
             except Exception as e:
                 logging.warning("telegram_chat_relay poll failed: %s", e)
                 time.sleep(5)  # back off before retrying; never let a network hiccup kill the thread
 
+    def _store(self, entry: dict):
+        if self.rds is not None:
+            self.rds.rpush(REDIS_KEY, json.dumps(entry))
+            self.rds.ltrim(REDIS_KEY, -MAX_HISTORY, -1)
+            return
+        with self._lock:
+            self._history.append(entry)
+
     def recent(self, n: int = 50) -> list:
+        if self.rds is not None:
+            raw = self.rds.lrange(REDIS_KEY, -n, -1)
+            return [json.loads(r) for r in raw]
         with self._lock:
             return list(self._history)[-n:]
 
