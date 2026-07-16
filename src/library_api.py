@@ -24,6 +24,7 @@ from urllib.parse import urlparse, parse_qs
 
 import redis
 from resolvers.local import LocalResolver
+from resolvers.musicbrainz import MusicBrainzResolver
 from resolvers.wanted import WantedQueue
 from resolvers.chain import ResolverChain
 from liquidsoap_control import push_track, on_air_rid, queue_rids, request_metadata, skip, flush_and_skip
@@ -36,6 +37,7 @@ ADMIN_TOKEN = os.environ.get("JUKEBOX_ADMIN_TOKEN")
 rds = redis.Redis(db=2)
 wanted = WantedQueue(rds=rds)
 chain = ResolverChain(resolvers=[LocalResolver(DB_PATH)], wanted=wanted, base_price=21)
+musicbrainz = MusicBrainzResolver()
 _last_play_at = 0.0
 
 
@@ -132,8 +134,14 @@ class Handler(BaseHTTPRequestHandler):
         if not q:
             return self._json(400, {"error": "missing q"})
 
+        # Only a MusicBrainz-confirmed real song gets added -- keeps the
+        # wanted list a genuine demand signal instead of a typo bin.
+        hits = asyncio.run(musicbrainz.search(q, limit=1))
+        if not hits:
+            return self._json(200, {"votes": 0, "message": "No results found", "added": False})
+
         votes = asyncio.run(wanted.add(q))
-        self._json(200, {"votes": votes, "message": "Added to the wanted list"})
+        self._json(200, {"votes": votes, "message": "Added to the wanted list", "added": True})
 
     def _handle_play(self):
         global _last_play_at
