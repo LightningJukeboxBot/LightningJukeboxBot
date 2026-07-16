@@ -28,6 +28,7 @@ from resolvers.musicbrainz import MusicBrainzResolver
 from resolvers.wanted import WantedQueue
 from resolvers.chain import ResolverChain
 from liquidsoap_control import push_track, on_air_rid, queue_rids, request_metadata, skip, flush_and_skip
+from telegram_chat_relay import TelegramChatRelay
 
 DB_PATH = "/var/lib/jukebox/library.db"
 PORT = 7100
@@ -38,6 +39,16 @@ rds = redis.Redis(db=2)
 wanted = WantedQueue(rds=rds)
 chain = ResolverChain(resolvers=[LocalResolver(DB_PATH)], wanted=wanted, base_price=21)
 musicbrainz = MusicBrainzResolver()
+
+TELEGRAM_CHAT_BOT_TOKEN = os.environ.get("TELEGRAM_CHAT_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # e.g. -1001672416970; optional filter
+telegram_chat = None
+if TELEGRAM_CHAT_BOT_TOKEN:
+    telegram_chat = TelegramChatRelay(
+        token=TELEGRAM_CHAT_BOT_TOKEN,
+        chat_id=int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID else None,
+    )
+    telegram_chat.start()
 _last_play_at = 0.0
 
 
@@ -68,7 +79,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_search(parsed)
         if parsed.path == "/api/admin/status":
             return self._handle_admin_status(parsed)
+        if parsed.path == "/api/chat/recent":
+            return self._handle_chat_recent()
+        if parsed.path == "/api/chat/media":
+            return self._handle_chat_media(parsed)
         return self._json(404, {"error": "not found"})
+
+    def _handle_chat_recent(self):
+        if telegram_chat is None:
+            return self._json(200, {"messages": []})
+        self._json(200, {"messages": telegram_chat.recent(50)})
+
+    def _handle_chat_media(self, parsed):
+        if telegram_chat is None:
+            return self._json(404, {"error": "chat relay not configured"})
+        qs = parse_qs(parsed.query)
+        file_id = (qs.get("file_id") or [""])[0]
+        if not file_id:
+            return self._json(400, {"error": "missing file_id"})
+
+        path = telegram_chat.file_path(file_id)
+        if not path:
+            return self._json(404, {"error": "file not found"})
+
+        upstream = telegram_chat.file_bytes(path)
+        if upstream.status_code != 200:
+            return self._json(502, {"error": "upstream fetch failed"})
+
+        self.send_response(200)
+        self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/octet-stream"))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        for chunk in upstream.iter_content(chunk_size=65536):
+            self.wfile.write(chunk)
 
     def _handle_search(self, parsed):
         qs = parse_qs(parsed.query)
