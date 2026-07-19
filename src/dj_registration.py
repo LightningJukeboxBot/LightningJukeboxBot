@@ -49,7 +49,7 @@ button { padding:10px 20px; background:#f7931a; border:none; border-radius:4px; 
   <input name="name" placeholder="DJ name" required maxlength="40" pattern="[A-Za-z0-9_\\-\\. ]+">
   <button type="submit">Register</button>
 </form>
-{result}
+__RESULT__
 </body></html>"""
 
 
@@ -150,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            return self._html(200, FORM_HTML.format(result=""))
+            return self._html(200, FORM_HTML.replace("__RESULT__", ""))
         self._html(404, "not found")
 
     def do_POST(self):
@@ -163,7 +163,7 @@ class Handler(BaseHTTPRequestHandler):
         name = (qs.get("name") or [""])[0].strip()
 
         if not name:
-            return self._html(400, FORM_HTML.format(result='<p class="err">Enter a name.</p>'))
+            return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Enter a name.</p>'))
 
         try:
             result = create_dj_wallet(name)
@@ -173,9 +173,9 @@ class Handler(BaseHTTPRequestHandler):
               <p>Your Lightning Address:<br><b>{result['lightning_address']}</b></p>
               <p>Split percentages aren't set yet -- Noderunners Radio will configure your share once that's decided.</p>
             </div>"""
-            self._html(200, FORM_HTML.format(result=result_html))
+            self._html(200, FORM_HTML.replace("__RESULT__", result_html))
         except Exception as e:
-            self._html(500, FORM_HTML.format(result=f'<p class="err">Registration failed: {e}</p>'))
+            self._html(500, FORM_HTML.replace("__RESULT__", f'<p class="err">Registration failed: {e}</p>'))
 
 
 def main():
