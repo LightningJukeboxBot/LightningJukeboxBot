@@ -43,6 +43,7 @@ ADMIN_TOKEN = os.environ.get("JUKEBOX_ADMIN_TOKEN")
 PLAY_PRICE_SATS = int(os.environ.get("PLAY_PRICE_SATS", "21"))
 LNBITS_BASE_URL = os.environ.get("LNBITS_BASE_URL", "http://127.0.0.1:5000")
 LNBITS_PLAY_INVOICE_KEY = os.environ.get("LNBITS_PLAY_INVOICE_KEY")
+LNBITS_DONATE_INVOICE_KEY = os.environ.get("LNBITS_DONATE_INVOICE_KEY")
 PENDING_PLAY_TTL_S = 900  # invoice must be paid within 15 minutes or it's dead
 
 rds = redis.Redis(db=2)
@@ -104,6 +105,35 @@ def _is_play_invoice_paid(payment_hash: str) -> bool:
     return bool(paid)
 
 
+def _create_donate_invoice(amount_sats: int) -> dict:
+    resp = requests.post(
+        f"{LNBITS_BASE_URL}/api/v1/payments",
+        headers={"X-Api-Key": LNBITS_DONATE_INVOICE_KEY, "Content-Type": "application/json"},
+        json={"out": False, "amount": amount_sats, "memo": "Noderunners Radio donation"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        "payment_hash": data.get("payment_hash") or data.get("checking_id"),
+        "bolt11": data.get("payment_request") or data.get("bolt11"),
+    }
+
+
+def _is_donate_invoice_paid(payment_hash: str) -> bool:
+    resp = requests.get(
+        f"{LNBITS_BASE_URL}/api/v1/payments/{payment_hash}",
+        headers={"X-Api-Key": LNBITS_DONATE_INVOICE_KEY},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    paid = data.get("paid")
+    if paid is None:
+        paid = data.get("status") == "success" or bool(data.get("details", {}).get("paid"))
+    return bool(paid)
+
+
 def _pending_play_key(payment_hash: str) -> str:
     return f"pending_play:{payment_hash}"
 
@@ -130,6 +160,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_chat_media(parsed)
         if parsed.path == "/api/play/status":
             return self._handle_play_status(parsed)
+        if parsed.path == "/api/donate/status":
+            return self._handle_donate_status(parsed)
         return self._json(404, {"error": "not found"})
 
     def _handle_chat_recent(self):
@@ -196,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_request()
         if parsed.path == "/api/play":
             return self._handle_play()
+        if parsed.path == "/api/donate":
+            return self._handle_donate()
         if parsed.path == "/api/admin/skip":
             return self._handle_admin_action(skip, "Skipped current track")
         if parsed.path == "/api/admin/flush":
@@ -320,6 +354,37 @@ class Handler(BaseHTTPRequestHandler):
             "sats": PLAY_PRICE_SATS,
             "message": f"Pay {PLAY_PRICE_SATS} sats to queue '{track.display()}'",
         })
+
+    def _handle_donate(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode()
+        qs = parse_qs(raw)
+        try:
+            amount = int((qs.get("amount") or ["0"])[0])
+        except ValueError:
+            amount = 0
+        if amount < 1:
+            return self._json(400, {"error": "Enter an amount of at least 1 sat"})
+        if not LNBITS_DONATE_INVOICE_KEY:
+            return self._json(500, {"error": "Donations not configured (LNBITS_DONATE_INVOICE_KEY missing)"})
+        try:
+            invoice = _create_donate_invoice(amount)
+        except Exception as e:
+            return self._json(502, {"error": f"Could not create invoice: {e}"})
+        if not invoice.get("payment_hash") or not invoice.get("bolt11"):
+            return self._json(502, {"error": "LNbits returned an unexpected invoice response"})
+        self._json(200, {"payment_hash": invoice["payment_hash"], "bolt11": invoice["bolt11"], "sats": amount})
+
+    def _handle_donate_status(self, parsed):
+        qs = parse_qs(parsed.query)
+        payment_hash = (qs.get("payment_hash") or [""])[0].strip()
+        if not payment_hash:
+            return self._json(400, {"error": "missing payment_hash"})
+        try:
+            paid = _is_donate_invoice_paid(payment_hash)
+        except Exception as e:
+            return self._json(502, {"error": f"Could not reach LNbits: {e}"})
+        self._json(200, {"paid": paid})
 
     def log_message(self, format, *args):
         pass
