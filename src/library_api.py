@@ -4,15 +4,19 @@ library_api.py -- minimal HTTP API backing the site's search box.
 
     GET  /api/search?q=...        -> JSON list of playable local tracks
     POST /api/request             -> body: q=... ; records a miss in the wanted list
-    POST /api/play                -> body: artist=...&title=... ; queues it live on air
+    POST /api/play                -> body: artist=...&title=... ; creates a PLAY_PRICE_SATS
+                                      LNbits invoice, does NOT queue yet
+    GET  /api/play/status?payment_hash=... -> polls payment; queues the track on air
+                                      the first time it sees the invoice paid
 
     GET  /api/admin/status?token=... -> now-playing + queue, needs JUKEBOX_ADMIN_TOKEN
     POST /api/admin/skip           -> body: token=... ; skips the current on-air track
     POST /api/admin/flush          -> body: token=... ; clears the whole jukebox queue
 
-Talks only to the local SQLite library index, the shared Redis wanted-list, and
-Liquidsoap's request socket. No Telegram, no LNbits, no bot dependency -- safe
-to run standalone, ahead of the real bot deployment.
+Talks to the local SQLite library index, the shared Redis wanted-list,
+Liquidsoap's request socket, and (for /api/play) LNbits directly via
+LNBITS_PLAY_INVOICE_KEY -- a dedicated wallet's invoice/read key, separate
+from any other LNbits wallet on this box.
 """
 
 import asyncio
@@ -23,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import redis
+import requests
 from resolvers.local import LocalResolver
 from resolvers.musicbrainz import MusicBrainzResolver
 from resolvers.wanted import WantedQueue
@@ -34,6 +39,11 @@ DB_PATH = "/var/lib/jukebox/library.db"
 PORT = 7100
 PLAY_COOLDOWN_S = 10  # basic anti-spam: don't let requests hammer the live queue
 ADMIN_TOKEN = os.environ.get("JUKEBOX_ADMIN_TOKEN")
+
+PLAY_PRICE_SATS = int(os.environ.get("PLAY_PRICE_SATS", "21"))
+LNBITS_BASE_URL = os.environ.get("LNBITS_BASE_URL", "http://127.0.0.1:5000")
+LNBITS_PLAY_INVOICE_KEY = os.environ.get("LNBITS_PLAY_INVOICE_KEY")
+PENDING_PLAY_TTL_S = 900  # invoice must be paid within 15 minutes or it's dead
 
 rds = redis.Redis(db=2)
 wanted = WantedQueue(rds=rds)
@@ -64,6 +74,40 @@ def _track_summary(rid: str) -> dict:
     }
 
 
+def _create_play_invoice(memo: str) -> dict:
+    resp = requests.post(
+        f"{LNBITS_BASE_URL}/api/v1/payments",
+        headers={"X-Api-Key": LNBITS_PLAY_INVOICE_KEY, "Content-Type": "application/json"},
+        json={"out": False, "amount": PLAY_PRICE_SATS, "memo": memo},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return {
+        "payment_hash": data.get("payment_hash") or data.get("checking_id"),
+        "bolt11": data.get("payment_request") or data.get("bolt11"),
+    }
+
+
+def _is_play_invoice_paid(payment_hash: str) -> bool:
+    resp = requests.get(
+        f"{LNBITS_BASE_URL}/api/v1/payments/{payment_hash}",
+        headers={"X-Api-Key": LNBITS_PLAY_INVOICE_KEY},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    paid = data.get("paid")
+    if paid is None:
+        # some LNbits versions nest status under "details" or use "status": "success"
+        paid = data.get("status") == "success" or bool(data.get("details", {}).get("paid"))
+    return bool(paid)
+
+
+def _pending_play_key(payment_hash: str) -> str:
+    return f"pending_play:{payment_hash}"
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, payload):
         body = json.dumps(payload).encode()
@@ -84,6 +128,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_chat_recent()
         if parsed.path == "/api/chat/media":
             return self._handle_chat_media(parsed)
+        if parsed.path == "/api/play/status":
+            return self._handle_play_status(parsed)
         return self._json(404, {"error": "not found"})
 
     def _handle_chat_recent(self):
@@ -156,6 +202,46 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_admin_action(flush_and_skip, "Flushed queue and skipped")
         return self._json(404, {"error": "not found"})
 
+    def _handle_play_status(self, parsed):
+        qs = parse_qs(parsed.query)
+        payment_hash = (qs.get("payment_hash") or [""])[0].strip()
+        if not payment_hash:
+            return self._json(400, {"error": "missing payment_hash"})
+
+        raw = rds.get(_pending_play_key(payment_hash))
+        if raw is None:
+            return self._json(404, {"error": "unknown or expired payment_hash"})
+        pending = json.loads(raw)
+
+        if pending.get("queued"):
+            return self._json(200, {"paid": True, "queued": True, "message": pending.get("message", "Already queued")})
+
+        try:
+            paid = _is_play_invoice_paid(payment_hash)
+        except Exception as e:
+            return self._json(502, {"error": f"Could not reach LNbits: {e}"})
+
+        if not paid:
+            return self._json(200, {"paid": False, "queued": False})
+
+        global _last_play_at
+        now = time.time()
+        if now - _last_play_at < PLAY_COOLDOWN_S:
+            wait = round(PLAY_COOLDOWN_S - (now - _last_play_at))
+            return self._json(200, {"paid": True, "queued": False, "message": f"Paid! Queuing in {wait}s (anti-spam)"})
+
+        try:
+            push_track(pending["local_path"])
+            _last_play_at = now
+        except Exception as e:
+            return self._json(500, {"error": f"Paid but could not queue track: {e}"})
+
+        message = f"Queued '{pending['artist']} - {pending['title']}' -- should play shortly"
+        pending["queued"] = True
+        pending["message"] = message
+        rds.setex(_pending_play_key(payment_hash), PENDING_PLAY_TTL_S, json.dumps(pending))
+        self._json(200, {"paid": True, "queued": True, "message": message})
+
     def _handle_admin_action(self, fn, success_message):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode()
@@ -189,8 +275,6 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"votes": votes, "message": "Added to the wanted list", "added": True})
 
     def _handle_play(self):
-        global _last_play_at
-
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode()
         qs = parse_qs(raw)
@@ -199,10 +283,8 @@ class Handler(BaseHTTPRequestHandler):
         if not artist or not title:
             return self._json(400, {"error": "missing artist/title"})
 
-        now = time.time()
-        if now - _last_play_at < PLAY_COOLDOWN_S:
-            wait = round(PLAY_COOLDOWN_S - (now - _last_play_at))
-            return self._json(429, {"error": f"Too many requests, try again in {wait}s"})
+        if not LNBITS_PLAY_INVOICE_KEY:
+            return self._json(500, {"error": "Payments not configured (LNBITS_PLAY_INVOICE_KEY missing)"})
 
         # Never trust a client-supplied path -- re-look-up the track ourselves so
         # only files actually in the indexed library can ever be queued.
@@ -217,12 +299,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "Track not found in library"})
 
         try:
-            push_track(track.local_path)
-            _last_play_at = now
+            invoice = _create_play_invoice(memo=f"Play: {track.display()}")
         except Exception as e:
-            return self._json(500, {"error": f"Could not queue track: {e}"})
+            return self._json(502, {"error": f"Could not create invoice: {e}"})
 
-        self._json(200, {"message": f"Queued '{track.display()}' -- should play shortly"})
+        if not invoice.get("payment_hash") or not invoice.get("bolt11"):
+            return self._json(502, {"error": "LNbits returned an unexpected invoice response"})
+
+        pending = {
+            "artist": track.artist,
+            "title": track.title,
+            "local_path": track.local_path,
+            "queued": False,
+        }
+        rds.setex(_pending_play_key(invoice["payment_hash"]), PENDING_PLAY_TTL_S, json.dumps(pending))
+
+        self._json(200, {
+            "payment_hash": invoice["payment_hash"],
+            "bolt11": invoice["bolt11"],
+            "sats": PLAY_PRICE_SATS,
+            "message": f"Pay {PLAY_PRICE_SATS} sats to queue '{track.display()}'",
+        })
 
     def log_message(self, format, *args):
         pass
