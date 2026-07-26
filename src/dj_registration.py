@@ -23,15 +23,19 @@ hardcoded, never sent to the DJ). Keeps its own small local record of who's
 registered and who's requested slots so SF doesn't have to dig through LNbits by hand.
 """
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, unquote
 
 import requests
 
@@ -41,10 +45,50 @@ DJ_ADMIN_TOKEN = os.environ.get("DJ_ADMIN_TOKEN")
 PORT = int(os.environ.get("DJ_REGISTRATION_PORT", "5001"))
 DB_PATH = os.environ.get("DJ_REGISTRATION_DB", "/opt/lightning-stack/dj_registrations.sqlite3")
 
+# Public domain where LNbits serves .well-known/lnurlp -- what a DJ's Lightning
+# Address must say after the @. LNBITS_BASE_URL is the localhost view and would
+# print a useless 127.0.0.1 address.
+LN_ADDRESS_DOMAIN = os.environ.get("LN_ADDRESS_DOMAIN", "lnbits.plebprojects.com")
+
 TELEGRAM_CHAT_BOT_TOKEN = os.environ.get("TELEGRAM_CHAT_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # public noderunnersradio group
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")  # SF's private DM
-ADMIN_URL = f"https://noderunnersradio.com/dj/admin?token={DJ_ADMIN_TOKEN}"
+# Deliberately NO token in this URL: it rides a Telegram DM, which is not
+# end-to-end encrypted. SF logs in on the captain's console instead.
+ADMIN_URL = "https://noderunnersradio.com/admin"
+
+# Captain login: library_api.py handles the actual username+password login and
+# mints a signed session cookie; we share ADMIN_SESSION_SECRET so that same
+# cookie unlocks the DJ admin here too. Token stays as a fallback.
+ADMIN_SESSION_SECRET = os.environ.get("ADMIN_SESSION_SECRET")
+SESSION_COOKIE = "nr_admin_session"
+
+# --- DJ portal (login + avatar upload) ---------------------------------------
+# Each DJ gets a CLAIM CODE at registration; name + code = their login. The
+# avatar arrives as an already-browser-converted webp/png/jpeg (max ~400 KB,
+# client resizes to 256px) and is served straight from the site's assets.
+AVATAR_DIR = "/home/sf/noderunners-site/assets/avatars"
+AVATAR_MAX_BYTES = 400_000
+PORTAL_COOKIE = "dj_portal"
+PORTAL_TTL_S = 90 * 24 * 3600
+
+
+def _session_valid(val: str) -> bool:
+    if not ADMIN_SESSION_SECRET or not val or "." not in val:
+        return False
+    exp, sig = val.split(".", 1)
+    if not exp.isdigit() or int(exp) < time.time():
+        return False
+    good = hmac.new(ADMIN_SESSION_SECRET.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, good)
+
+# --- Registration gate (added 2026-07-22) ---------------------------------
+# Public DJ sign-up is CLOSED while the donation-split mechanism is still being
+# wired. The Guest DJ Guide is live/readable, but nobody can create a wallet or
+# book a slot yet. The token-gated /admin routes are unaffected.
+# To REOPEN later: set env DJ_REGISTRATION_OPEN=1 (or flip this default to "1"),
+# then: sudo systemctl restart dj-registration
+REGISTRATION_OPEN = os.environ.get("DJ_REGISTRATION_OPEN", "0") == "1"
 
 FORM_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Noderunners Radio -- DJ Registration</title>
@@ -56,12 +100,32 @@ button { padding:10px 20px; background:#f7931a; border:none; border-radius:4px; 
 .result { margin-top: 20px; padding: 14px; border: 1px solid #1d3a42; border-radius: 4px; word-break: break-all; }
 .err { color: #ff6b6b; }
 a { color: #f7931a; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
 </style></head>
 <body>
+<nav style="display:flex;gap:2px;margin:0 0 20px;padding:6px 0;border-bottom:1px solid #1d3a42;font-size:0.7rem;letter-spacing:0.08em;text-transform:uppercase;flex-wrap:wrap;" aria-label="Site menu">
+  <a href="/" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Home</a>
+  <a href="/progress" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Progress</a>
+  <a href="/dj-handbook" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Guest DJ Guide</a>
+  <a href="/manifesto" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Manifesto</a>
+  <a href="/login" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log in</a>
+</nav>
 <h1>Noderunners Radio -- Guest DJ Registration</h1>
 <p>Enter your DJ name to get your own Lightning Address for the split-sat stream. Split percentages aren't decided yet -- this just sets you up to receive once they are.</p>
-<form method="POST" action="/dj/register">
+<form method="POST" action="/register">
   <input name="name" placeholder="DJ name" required maxlength="40" pattern="[A-Za-z0-9_\-\. ]+">
+  <input type="password" name="pass" placeholder="Choose a strong passphrase (min 12 characters)" required minlength="12" maxlength="128">
+  <input type="password" name="pass2" placeholder="Repeat the passphrase" required minlength="12" maxlength="128">
+  <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">Tip: 4+ random words beat l33t gibberish. Password managers welcome aboard.</p>
+  <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">&#9888; Pick your DJ name carefully &mdash; <b>names are set in stone</b> (one DJ = one name = one Lightning Address). Need a change later? Tag <b>@noderunnersfm</b> or <b>@plebroyale</b> in <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">t.me/noderunnersradio</a>.</p>
   <button type="submit">Register</button>
 </form>
 __RESULT__
@@ -80,15 +144,28 @@ button { padding:10px 20px; background:#f7931a; border:none; border-radius:4px; 
 .clock { flex:1; background:#0f262d; border:1px solid #1d3a42; border-radius:4px; padding:8px; text-align:center; }
 .clock .lbl { display:block; font-size:0.7rem; color:#8aa; }
 .clock .val { display:block; font-size:1rem; font-weight:bold; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
 </style></head>
 <body>
 <h1>Request a DJ slot</h1>
 <p>Pick a date and studio-time (Amsterdam) hour. Nothing's confirmed until Noderunners approves it.</p>
 <form method="POST" action="/dj/request-slot">
-  <input name="dj_name" placeholder="Your DJ name" required maxlength="40" pattern="[A-Za-z0-9_\-\. ]+">
+  <input name="dj_name" placeholder="Your DJ name" value="__DJ_NAME__" required maxlength="40" pattern="[A-Za-z0-9_\-\. ]+">
   <input name="telegram_handle" placeholder="Telegram handle, e.g. @yourname" required maxlength="40">
+  <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">No Telegram yet? <a href="https://telegram.org/apps" target="_blank" rel="noopener">Get it here</a>, then set your @username so we can reach you:<br>
+  &bull; iPhone: Settings &rarr; tap your profile &rarr; Username<br>
+  &bull; Android: &#9776; menu &rarr; Settings &rarr; tap your name &rarr; Username</p>
   <input name="nostr_npub" placeholder="Nostr npub (optional)" maxlength="80">
   <input type="date" name="date" id="date" required>
+  <div id="dateEcho" style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;"></div>
   <select name="hour_cet" id="hour_cet" required>
     __HOUR_OPTIONS__
   </select>
@@ -105,6 +182,7 @@ var dateInput = document.getElementById('date');
 var hourSelect = document.getElementById('hour_cet');
 function pad(n) { return String(n).padStart(2, '0'); }
 function update() {
+  document.getElementById('dateEcho').textContent = dateInput.value ? 'Selected: ' + dateInput.value + ' (YYYY-MM-DD)' : '';
   if (!dateInput.value) return;
   var hourCet = parseInt(hourSelect.value, 10);
   var probe = new Date(dateInput.value + 'T12:00:00Z');
@@ -136,10 +214,324 @@ button.reject { background:#3a1d1d; color:#ff6b6b; }
 .pending { color:#f7931a; }
 .approved { color:#7bd88f; }
 .rejected { color:#666; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
 </style></head>
 <body>
 <h1>DJ slot requests</h1>
 __ROWS__
+</body></html>"""
+
+
+CLOSED_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>Guest DJ sign-up -- closed for now / Noderunners Radio</title>
+<style>
+body { background:#0a1a1f; color:#e6eff0; font-family: ui-monospace, monospace; max-width:560px; margin:70px auto; padding:0 22px; line-height:1.6; }
+.card { background:#0f262d; border:1px solid #1d3a42; border-radius:8px; padding:24px 26px; }
+.anchor { font-size:1.7rem; }
+h1 { color:#f7931a; font-size:1.35rem; margin:6px 0 14px; }
+p { color:#c9d6d9; }
+a { color:#f7931a; font-weight:bold; text-decoration:none; }
+.links { margin-top:18px; display:flex; gap:18px; flex-wrap:wrap; font-size:0.92rem; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
+</style></head>
+<body>
+<div class="card">
+  <div class="anchor">&#9875;</div>
+  <h1>Guest DJ sign-up is closed for now</h1>
+  <p>The Dread Node's DJ registration isn't open yet &mdash; we're still wiring her up. Nobody can create a wallet or book a slot just yet.</p>
+  <p>Read the <a href="/dj-handbook">Guest DJ Guide</a> to see exactly how it'll work, and watch the Telegram for the all-aboard.</p>
+  <div class="links">
+    <a href="/dj-handbook">&rarr; Guest DJ Guide</a>
+    <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">&rarr; Telegram</a>
+  </div>
+</div>
+</body></html>"""
+
+
+PORTAL_LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DJ Portal -- Noderunners Radio</title>
+<style>
+body { background:#0a1a1f; color:#e6eff0; font-family: ui-monospace, monospace; max-width: 460px; margin: 60px auto; padding: 0 20px; }
+h1 { color: #f7931a; font-size: 1.3rem; }
+input { width:100%; padding:10px; margin:10px 0; background:#0f262d; border:1px solid #1d3a42; color:#e6eff0; border-radius:4px; box-sizing:border-box; }
+button { padding:10px 20px; background:#f7931a; border:none; border-radius:4px; color:#0a1a1f; font-weight:bold; cursor:pointer; }
+.err { color: #ff6b6b; }
+a { color: #f7931a; }
+p { line-height:1.5; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
+</style></head>
+<body>
+<nav style="display:flex;gap:2px;margin:0 0 20px;padding:6px 0;border-bottom:1px solid #1d3a42;font-size:0.7rem;letter-spacing:0.08em;text-transform:uppercase;flex-wrap:wrap;" aria-label="Site menu">
+  <a href="/" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Home</a>
+  <a href="/progress" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Progress</a>
+  <a href="/dj-handbook" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Guest DJ Guide</a>
+  <a href="/manifesto" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Manifesto</a>
+  <a href="/login" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log in</a>
+</nav>
+<h1>DJ Portal -- log in</h1>
+<p style="color:#8aa4aa;font-size:0.85rem;">One door for the whole crew — DJs and the captain both log in here.</p>
+<form method="POST" action="/login" id="loginForm">
+  <input name="dj_name" id="loginName" placeholder="DJ name" required maxlength="64" autocomplete="username">
+  <input type="password" name="pass" id="loginPass" placeholder="Passphrase" required maxlength="128" autocomplete="current-password">
+  <button type="submit">Log in</button>
+</form>
+<details style="margin-top:16px;"><summary style="cursor:pointer;color:#8aa4aa;">No passphrase yet, or lost it? Use your recovery code</summary>
+  <form method="POST" action="/login">
+    <input name="dj_name" placeholder="DJ name" required maxlength="40">
+    <input name="code" placeholder="Recovery code (21 characters)" required maxlength="32">
+    <button type="submit">Log in with code</button>
+  </form>
+  <p style="color:#8aa4aa;font-size:0.85rem;">Registered before passphrases existed? Your old claim code IS your recovery code &mdash; log in with it once, then set a passphrase inside.</p>
+</details>
+__RESULT__
+<p style="margin-top:18px;">New here? <a href="/register">Register as a guest DJ &rarr;</a></p>
+<p style="color:#8aa4aa;font-size:0.85rem;">No code either? Ask the captain: tag <b>@noderunnersfm</b> or <b>@plebroyale</b> in <a href="https://t.me/noderunnersradio">the Telegram</a>.</p>
+<script>
+document.getElementById('loginForm').addEventListener('submit', function(e){
+  e.preventDefault();
+  var form = this;
+  var u = document.getElementById('loginName').value;
+  var p = document.getElementById('loginPass').value;
+  fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'username=' + encodeURIComponent(u) + '&password=' + encodeURIComponent(p)})
+    .then(function(r){ if (r.ok){ window.location = '/admin'; } else { form.submit(); } })
+    .catch(function(){ form.submit(); });
+});
+</script>
+</body></html>"""
+
+PORTAL_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DJ Portal -- Noderunners Radio</title>
+<style>
+body { background:#0a1a1f; color:#e6eff0; font-family: ui-monospace, monospace; max-width: 520px; margin: 50px auto; padding: 0 20px; }
+h1 { color: #f7931a; font-size: 1.3rem; }
+.card { background:#0f262d; border:1px solid #1d3a42; border-radius:8px; padding:18px 20px; margin:16px 0; }
+.muted { color:#8aa4aa; font-size:0.85rem; }
+.avatar { width:128px; height:128px; border-radius:50%; object-fit:cover; border:3px solid #d06b29; background:#081418; display:block; margin:10px 0; }
+button, .btn { padding:9px 16px; background:#f7931a; border:none; border-radius:4px; color:#0a1a1f; font-weight:bold; cursor:pointer; font-family:inherit; font-size:0.9rem; }
+input, textarea { width:100%; padding:9px; margin:6px 0; background:#081418; border:1px solid #1d3a42; color:#e6eff0; border-radius:4px; box-sizing:border-box; font-family:inherit; font-size:0.9rem; }
+textarea { resize:vertical; }
+input[type=file] { color:#8aa4aa; margin:10px 0; max-width:100%; }
+a { color:#f7931a; }
+#msg { font-size:0.85rem; margin-top:8px; }
+.mono { background:rgba(55,82,90,.3); border:1px solid #1d3a42; border-radius:4px; padding:1px 6px; word-break:break-all; }
+
+html{ background:var(--ether,#0a1a1f); }
+body{ background:transparent; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14;
+  -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent);
+          mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:radial-gradient(ellipse at 20% 0%, rgba(247,147,26,0.06), transparent 55%); }
+</style></head>
+<body>
+<nav style="display:flex;gap:2px;margin:0 0 20px;padding:6px 0;border-bottom:1px solid #1d3a42;font-size:0.7rem;letter-spacing:0.08em;text-transform:uppercase;flex-wrap:wrap;" aria-label="Site menu">
+  <a href="/" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Home</a>
+  <a href="/progress" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Progress</a>
+  <a href="/dj-handbook" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Guest DJ Guide</a>
+  <a href="/manifesto" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Manifesto</a>
+  <a href="/dj/portal/logout" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log out</a>
+</nav>
+<h1>Ahoy, __DJ_NAME__</h1>
+<div class="card">
+  <div class="muted"><b>Your payout address</b> &mdash; where session pay lands. __PAYOUT_STATE__</div>
+  <form method="POST" action="/dj/portal/payout">
+    <input name="payout" placeholder="you@walletofsatoshi.com &mdash; your OWN Lightning Address" value="__PAYOUT_VALUE__" maxlength="100">
+    <button type="submit">Save payout address</button>
+  </form>
+  <p class="muted" style="margin-bottom:0;">Got your own wallet? Paste its Lightning Address and session payouts fly straight to <b>you</b> &mdash; never parking on the station. One small Lightning routing fee per payout. Leave empty to use your station wallet instead.</p>
+</div>
+<div class="card">
+  <div class="muted">Sats parked on the station:</div>
+  <p style="font-size:1.5rem;margin:8px 0;"><b>__BALANCE__</b></p>
+  <p style="border:1px solid #f7931a;border-radius:6px;padding:10px 12px;line-height:1.55;margin:10px 0;">&#9888; <b>THE STATION IS NOT A BANK.</b> Sats that land here are yours &mdash; move them to a wallet only <b>you</b> control, after every session. Self-custody, always.</p>
+  <p><a class="btn" href="__WALLET_URL__" target="_blank" rel="noopener">Open my station wallet &#8599;</a></p>
+  <p class="muted">Inside the wallet: hit <b>Send</b>, paste an invoice or Lightning Address from your own wallet (Wallet of Satoshi, Phoenix, Breez, your own node...), send everything. That link is your full access &mdash; treat it like cash and don't share it.</p>
+  <div class="muted">Your Lightning Address (where session payouts land): <span class="mono">__LN_ADDRESS__</span></div>
+  <p class="muted" style="margin-bottom:0;">DJ name &amp; address are <b>set in stone</b> (one DJ = one name = one address). Need a change? Tag <b>@noderunnersfm</b> or <b>@plebroyale</b> in <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">t.me/noderunnersradio</a>.</p>
+</div>
+<div class="card">
+  <div class="muted">__PASS_HEAD__</div>
+  <form method="POST" action="/dj/portal/setpass">
+    <input type="password" name="pass" placeholder="New passphrase (min 12 characters)" required minlength="12" maxlength="128">
+    <input type="password" name="pass2" placeholder="Repeat it" required minlength="12" maxlength="128">
+    <button type="submit">Save passphrase</button>
+  </form>
+</div>
+<div class="card">
+  <div class="muted">Your blurb &amp; links &mdash; shown alongside your avatar once public DJ pages sail:</div>
+  <form method="POST" action="/dj/portal/profile">
+    <textarea name="blurb" rows="3" maxlength="280" placeholder="Short blurb, 280 characters max">__BLURB__</textarea>
+    <input name="link1" placeholder="Link (https://...)" value="__LINK1__" maxlength="200">
+    <input name="link2" placeholder="Link (https://...)" value="__LINK2__" maxlength="200">
+    <input name="link3" placeholder="Link (https://...)" value="__LINK3__" maxlength="200">
+    <button type="submit">Save profile</button>
+  </form>
+</div>
+<div class="card">
+  <div class="muted">Your avatar -- shows on the live stream and the site. Pick any image; it's resized in your browser to a lightweight 256px square before upload (max ~400 KB).</div>
+  <img id="av" class="avatar" src="__AVATAR_SRC__" onerror="this.style.opacity=.25">
+  <input type="file" id="file" accept="image/*">
+  <div id="cropBox" style="display:none;">
+    <canvas id="cropCanvas" width="256" height="256" style="width:220px;height:220px;border-radius:50%;border:2px solid #1d3a42;touch-action:none;cursor:grab;background:#081418;display:block;margin:8px 0;"></canvas>
+    <input type="range" id="zoom" min="100" max="300" value="100">
+    <div class="muted">Drag the picture to position it, use the slider to zoom.</div>
+    <button type="button" id="saveAvatar" style="margin-top:6px;">Save avatar</button>
+  </div>
+  <div id="msg" class="muted"></div>
+</div>
+<p><a href="/dj/request-slot?dj_name=__DJ_NAME_URL__">Request a DJ slot &rarr;</a> &middot; <a href="/dj/portal/logout">Log out</a></p>
+<script>
+(function(){
+  var input = document.getElementById('file');
+  var msg = document.getElementById('msg');
+  var av = document.getElementById('av');
+  var box = document.getElementById('cropBox');
+  var cv = document.getElementById('cropCanvas');
+  var ctx = cv.getContext('2d');
+  var zoomEl = document.getElementById('zoom');
+  var img = null, base = 1, z = 1, ox = 0, oy = 0;
+
+  function clamp(){
+    var dw = img.naturalWidth * base * z, dh = img.naturalHeight * base * z;
+    if (ox > 0) ox = 0;
+    if (oy > 0) oy = 0;
+    if (ox < 256 - dw) ox = 256 - dw;
+    if (oy < 256 - dh) oy = 256 - dh;
+  }
+  function draw(){
+    if (!img) return;
+    clamp();
+    ctx.clearRect(0, 0, 256, 256);
+    ctx.drawImage(img, ox, oy, img.naturalWidth * base * z, img.naturalHeight * base * z);
+  }
+  input.addEventListener('change', function(){
+    var f = input.files && input.files[0];
+    if (!f) return;
+    img = new Image();
+    img.onload = function(){
+      base = 256 / Math.min(img.naturalWidth, img.naturalHeight);
+      z = 1; zoomEl.value = 100;
+      ox = (256 - img.naturalWidth * base) / 2;
+      oy = (256 - img.naturalHeight * base) / 2;
+      box.style.display = 'block';
+      msg.textContent = 'Drag to position, slide to zoom, then hit Save.';
+      draw();
+    };
+    img.onerror = function(){ msg.textContent = 'That does not look like an image.'; };
+    img.src = URL.createObjectURL(f);
+  });
+  zoomEl.addEventListener('input', function(){
+    if (!img) return;
+    var nz = parseInt(zoomEl.value, 10) / 100;
+    ox = 128 - (128 - ox) * (nz / z);
+    oy = 128 - (128 - oy) * (nz / z);
+    z = nz;
+    draw();
+  });
+  var drag = null;
+  cv.addEventListener('pointerdown', function(e){
+    e.preventDefault();
+    drag = {x: e.clientX, y: e.clientY};
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', function(e){
+    if (!drag) return;
+    var r = cv.getBoundingClientRect();
+    var s = 256 / r.width;
+    ox += (e.clientX - drag.x) * s;
+    oy += (e.clientY - drag.y) * s;
+    drag = {x: e.clientX, y: e.clientY};
+    draw();
+  });
+  cv.addEventListener('pointerup', function(){ drag = null; });
+  cv.addEventListener('pointercancel', function(){ drag = null; });
+  document.getElementById('saveAvatar').addEventListener('click', function(){
+    if (!img) return;
+    function upload(blob){
+      if (!blob){ msg.textContent = 'Could not convert this image.'; return; }
+      if (blob.size > 400000){ msg.textContent = 'Still too big -- zoom in a bit or pick a simpler image.'; return; }
+      msg.textContent = 'Uploading (' + Math.round(blob.size / 1024) + ' KB)...';
+      fetch('/dj/portal/avatar', { method:'POST', headers:{'Content-Type': blob.type}, body: blob })
+        .then(function(r){ return r.json().then(function(d){ return {ok:r.ok, d:d}; }); })
+        .then(function(res){
+          if (!res.ok){ msg.textContent = res.d.error || 'Upload failed.'; return; }
+          msg.textContent = 'Avatar updated!';
+          av.style.opacity = 1;
+          av.src = res.d.url + '?t=' + Date.now();
+          box.style.display = 'none';
+        }).catch(function(){ msg.textContent = 'Upload failed -- try again.'; });
+    }
+    cv.toBlob(function(b){
+      if (b) upload(b);
+      else cv.toBlob(function(b2){ upload(b2); }, 'image/png');
+    }, 'image/webp', 0.85);
+  });
+})();
+</script>
+</body></html>"""
+
+
+PUBLIC_DJ_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__DJ_NAME__ -- Noderunners Radio DJ</title>
+<style>
+body { background:transparent; color:#e6eff0; font-family: ui-monospace, monospace; max-width: 520px; margin: 50px auto; padding: 0 20px; }
+html { background:#0a1a1f; }
+body::before{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:none; background:url("/assets/ship-bg.jpg") center 20% / cover no-repeat; opacity:0.14; -webkit-mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); mask-image:linear-gradient(to bottom, rgba(0,0,0,0.9), rgba(0,0,0,0.25) 55%, transparent); }
+h1 { color: #f7931a; font-size: 1.4rem; margin: 12px 0 6px; }
+.card { background:rgba(15,38,45,0.82); border:1px solid #1d3a42; border-radius:8px; padding:20px 22px; margin:16px 0; }
+.avatar { width:128px; height:128px; border-radius:50%; object-fit:cover; border:3px solid #d06b29; background:#081418; display:block; }
+.muted { color:#8aa4aa; font-size:0.85rem; }
+a { color:#f7931a; }
+.mono { background:rgba(55,82,90,.3); border:1px solid #1d3a42; border-radius:4px; padding:1px 6px; word-break:break-all; }
+</style></head>
+<body>
+<nav style="display:flex;gap:2px;margin:0 0 20px;padding:6px 0;border-bottom:1px solid #1d3a42;font-size:0.7rem;letter-spacing:0.08em;text-transform:uppercase;flex-wrap:wrap;" aria-label="Site menu">
+  <a href="/" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Home</a>
+  <a href="/progress" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Progress</a>
+  <a href="/dj-handbook" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Guest DJ Guide</a>
+  <a href="/manifesto" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;">Manifesto</a>
+  <a href="/login" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log in</a>
+</nav>
+<div class="card">
+  <img class="avatar" src="__AVATAR_SRC__" onerror="this.style.opacity=.25" alt="">
+  <h1>__DJ_NAME__</h1>
+  __BLURB__
+  __LINKS__
+  <p class="muted">Tip __DJ_NAME__ directly, listener-to-artist: <span class="mono">__LN_ADDRESS__</span></p>
+</div>
+<p class="muted">Guest DJ aboard <a href="/">Noderunners Radio</a> &mdash; <a href="/manifesto">the public is the DJ</a>.</p>
+<p class="muted">Are you __DJ_NAME__? <a href="/login">Log in to your quarters &rarr;</a></p>
 </body></html>"""
 
 
@@ -168,8 +560,36 @@ def _init_db():
             requested_at INTEGER
         )
     """)
+    # portal columns (safe to re-run; ALTER fails silently when present)
+    for ddl in ("ALTER TABLE dj_registrations ADD COLUMN claim_code TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN avatar TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN pass_hash TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN blurb TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN links TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN wallet_inkey TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN removed INTEGER DEFAULT 0",
+                "ALTER TABLE dj_registrations ADD COLUMN removed_at INTEGER",
+                "ALTER TABLE dj_registrations ADD COLUMN payout_address TEXT"):
+        try:
+            con.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+    # recovery codes: backfill missing ones AND upgrade short pre-2026-07-24 codes
+    # to the 21-character format. Old 8-char codes stop working here -- the console
+    # crew list always shows the CURRENT code, so SF always DMs the right one.
+    for (rid,) in con.execute(
+            "SELECT id FROM dj_registrations WHERE claim_code IS NULL OR length(claim_code) < 21").fetchall():
+        con.execute("UPDATE dj_registrations SET claim_code = ? WHERE id = ?",
+                    (_new_code(), rid))
     con.commit()
     con.close()
+    os.makedirs(AVATAR_DIR, exist_ok=True)
+
+
+def _esc_attr(s: str) -> str:
+    """Escape a value for safe embedding in an HTML attribute."""
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
 def _slugify(name: str) -> str:
@@ -177,14 +597,227 @@ def _slugify(name: str) -> str:
     return slug[:20] or "dj"
 
 
-def _record_registration(name, user_id, wallet_id, ln_address):
+def _record_registration(name, user_id, wallet_id, ln_address, claim_code, pass_hash=None, wallet_inkey=None):
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        "INSERT INTO dj_registrations (dj_name, lnbits_user_id, lnbits_wallet_id, lightning_address, registered_at) VALUES (?, ?, ?, ?, ?)",
-        (name, user_id, wallet_id, ln_address, int(time.time())),
+        "INSERT INTO dj_registrations (dj_name, lnbits_user_id, lnbits_wallet_id, lightning_address, registered_at, claim_code, pass_hash, wallet_inkey) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (name, user_id, wallet_id, ln_address, int(time.time()), claim_code, pass_hash, wallet_inkey),
     )
     con.commit()
     con.close()
+
+
+def _find_dj_by_login(name, code):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id FROM dj_registrations WHERE lower(dj_name) = lower(?) AND claim_code = ? AND COALESCE(removed, 0) = 0",
+        (name.strip(), code.strip()),
+    ).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+PASS_ITERATIONS = 200_000
+
+# LNbits' own sqlite -- read-only, ONLY to look up a wallet's invoice/read key
+# for DJs registered before we started storing it ourselves. Never written to.
+LNBITS_DB_PATH = os.environ.get("LNBITS_DB_PATH", "/opt/lightning-stack/lnbits_data/database.sqlite3")
+
+
+def _hash_pass(passphrase):
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), bytes.fromhex(salt), PASS_ITERATIONS)
+    return f"{PASS_ITERATIONS}${salt}${dk.hex()}"
+
+
+def _check_pass(passphrase, stored):
+    try:
+        iters, salt, want = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), bytes.fromhex(salt), int(iters))
+        return hmac.compare_digest(dk.hex(), want)
+    except (ValueError, AttributeError):
+        return False
+
+
+CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"  # no confusable characters
+
+
+def _new_code():
+    """21-character recovery code (~103 bits) -- SF picked the length, of course."""
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(21))
+
+
+def _name_taken(name):
+    # counts removed DJs too -- names are set in stone, even retired ones stay reserved
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT 1 FROM dj_registrations WHERE lower(dj_name) = lower(?)", (name.strip(),)).fetchone()
+    con.close()
+    return row is not None
+
+
+def _find_dj_by_pass(name, passphrase):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, pass_hash FROM dj_registrations WHERE lower(dj_name) = lower(?) AND COALESCE(removed, 0) = 0",
+        (name.strip(),),
+    ).fetchone()
+    con.close()
+    if row and row[1] and _check_pass(passphrase, row[1]):
+        return row[0]
+    return None
+
+
+def _set_pass(reg_id, passphrase):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE dj_registrations SET pass_hash = ? WHERE id = ?", (_hash_pass(passphrase), reg_id))
+    con.commit()
+    con.close()
+
+
+def _set_profile(reg_id, blurb, links):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE dj_registrations SET blurb = ?, links = ? WHERE id = ?", (blurb, links, reg_id))
+    con.commit()
+    con.close()
+
+
+def _dj_row_full(reg_id):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, dj_name, lightning_address, avatar, pass_hash, blurb, links, lnbits_user_id, lnbits_wallet_id, payout_address FROM dj_registrations WHERE id = ?",
+        (reg_id,),
+    ).fetchone()
+    con.close()
+    return row
+
+
+def _wallet_inkey(reg_id):
+    """Invoice/read key for the DJ's wallet: our own record first, else a one-time
+    read-only lookup in LNbits' db (pre-portal-v2 DJs), cached back into our row."""
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT wallet_inkey, lnbits_wallet_id FROM dj_registrations WHERE id = ?", (reg_id,)).fetchone()
+    con.close()
+    if not row:
+        return None
+    inkey, wallet_id = row
+    if inkey:
+        return inkey
+    if not wallet_id:
+        return None
+    try:
+        lcon = sqlite3.connect(f"file:{LNBITS_DB_PATH}?mode=ro", uri=True, timeout=2)
+        lrow = lcon.execute("SELECT inkey FROM wallets WHERE id = ?", (wallet_id,)).fetchone()
+        lcon.close()
+    except sqlite3.Error:
+        return None
+    if not lrow or not lrow[0]:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE dj_registrations SET wallet_inkey = ? WHERE id = ?", (lrow[0], reg_id))
+    con.commit()
+    con.close()
+    return lrow[0]
+
+
+def _set_payout(reg_id, address):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE dj_registrations SET payout_address = ? WHERE id = ?", (address, reg_id))
+    con.commit()
+    con.close()
+
+
+def _heal_wallet_ids(reg_id):
+    """True (user_id, wallet_id) for the DJ's LNbits wallet. Wallet ids stored
+    before 2026-07-24 could be wrong (caused LNbits' "Wallet not found" page);
+    verify read-only against LNbits' own db by USER id and cache the correction."""
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT lnbits_user_id, lnbits_wallet_id, wallet_inkey FROM dj_registrations WHERE id = ?", (reg_id,)).fetchone()
+    con.close()
+    if not row:
+        return (None, None)
+    user_id, wallet_id, inkey = row
+    if not user_id:
+        return (None, None)
+    try:
+        lcon = sqlite3.connect(f"file:{LNBITS_DB_PATH}?mode=ro", uri=True, timeout=2)
+        lrow = lcon.execute('SELECT id, inkey FROM wallets WHERE user = ? LIMIT 1', (user_id,)).fetchone()
+        lcon.close()
+    except sqlite3.Error:
+        return (user_id, wallet_id)
+    if lrow and lrow[0]:
+        real_id, real_inkey = lrow
+        if real_id != wallet_id or (real_inkey and real_inkey != inkey):
+            con = sqlite3.connect(DB_PATH)
+            con.execute("UPDATE dj_registrations SET lnbits_wallet_id = ?, wallet_inkey = ? WHERE id = ?",
+                        (real_id, real_inkey or inkey, reg_id))
+            con.commit()
+            con.close()
+        return (user_id, real_id)
+    return (user_id, wallet_id)
+
+
+def _wallet_balance_sats(reg_id):
+    inkey = _wallet_inkey(reg_id)
+    if not inkey:
+        return None
+    try:
+        r = requests.get(f"{LNBITS_BASE_URL}/api/v1/wallet", headers={"X-Api-Key": inkey}, timeout=8)
+        if r.status_code < 300:
+            return int(r.json().get("balance", 0)) // 1000
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def _dj_row(reg_id):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT id, dj_name, lightning_address, avatar FROM dj_registrations WHERE id = ?",
+        (reg_id,),
+    ).fetchone()
+    con.close()
+    return row
+
+
+def _set_avatar(reg_id, filename):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE dj_registrations SET avatar = ? WHERE id = ?", (filename, reg_id))
+    con.commit()
+    con.close()
+
+
+def _avatar_map():
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT dj_name, avatar FROM dj_registrations WHERE avatar IS NOT NULL AND avatar != '' AND COALESCE(removed, 0) = 0"
+    ).fetchall()
+    con.close()
+    return {name: "/assets/avatars/" + av for name, av in rows}
+
+
+def _mint_portal_cookie(reg_id):
+    exp = str(int(time.time()) + PORTAL_TTL_S)
+    sig = hmac.new(ADMIN_SESSION_SECRET.encode(), f"dj|{reg_id}|{exp}".encode(), hashlib.sha256).hexdigest()
+    return f"{reg_id}.{exp}.{sig}"
+
+
+def _portal_auth(cookie_header):
+    """Returns the DJ's registration id from a valid portal cookie, else None."""
+    if not ADMIN_SESSION_SECRET or not cookie_header:
+        return None
+    val = ""
+    for part in cookie_header.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == PORTAL_COOKIE:
+            val = v
+    try:
+        reg_id, exp, sig = val.split(".")
+        good = hmac.new(ADMIN_SESSION_SECRET.encode(), f"dj|{reg_id}|{exp}".encode(), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(sig, good) and int(exp) > time.time():
+            return int(reg_id)
+    except (ValueError, AttributeError):
+        pass
+    return None
 
 
 def _record_slot_request(dj_name, telegram_handle, nostr_npub, slot_date, hour_cet):
@@ -195,6 +828,24 @@ def _record_slot_request(dj_name, telegram_handle, nostr_npub, slot_date, hour_c
     )
     con.commit()
     con.close()
+
+
+def _list_registrations():
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT dj_name, lightning_address, lnbits_wallet_id, claim_code, avatar, payout_address FROM dj_registrations WHERE COALESCE(removed, 0) = 0 ORDER BY registered_at DESC"
+    ).fetchall()
+    con.close()
+    return rows
+
+
+def _list_removed():
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT dj_name, removed_at FROM dj_registrations WHERE COALESCE(removed, 0) = 1 ORDER BY removed_at DESC"
+    ).fetchall()
+    con.close()
+    return rows
 
 
 def _list_slot_requests():
@@ -217,34 +868,38 @@ def _admin_headers():
     return {"X-Api-Key": LNBITS_ADMIN_API_KEY, "Content-Type": "application/json"}
 
 
-def create_dj_wallet(dj_name: str) -> dict:
+def create_dj_wallet(dj_name: str, pass_hash=None) -> dict:
     """Creates an LNbits user + wallet + Lightning Address for a new DJ.
     Raises RuntimeError with a plain-language message on any failure -- one bad
     registration must not crash the server for the next DJ."""
     slug = _slugify(dj_name)
 
+    # LNbits v1.4's /users/ admin API wants a login Bearer token, not a wallet
+    # key (the old two-call flow here 401'd). This instance allows open account
+    # creation, so one unauthenticated call mints user + wallet in one go.
+    # NOTE: if "allow new accounts" is ever disabled in LNbits settings, this
+    # breaks and needs an ACL-token rework -- see project memory.
     resp = requests.post(
-        f"{LNBITS_BASE_URL}/users/api/v1/user",
-        headers=_admin_headers(),
-        json={"username": f"dj_{slug}_{int(time.time())}"},
+        f"{LNBITS_BASE_URL}/api/v1/account",
+        json={"name": f"{dj_name} -- DJ wallet"},
         timeout=15,
     )
     if resp.status_code >= 300:
-        raise RuntimeError(f"Could not create LNbits user: {resp.status_code} {resp.text}")
-    user = resp.json()
-    user_id = user.get("id") or user.get("user_id")
-
-    resp = requests.post(
-        f"{LNBITS_BASE_URL}/users/api/v1/user/{user_id}/wallet",
-        headers=_admin_headers(),
-        json={"wallet_name": f"{dj_name} -- split wallet"},
-        timeout=15,
-    )
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Could not create wallet: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"Could not create LNbits wallet: {resp.status_code} {resp.text}")
     wallet = resp.json()
+    user_id = wallet.get("user")
     wallet_id = wallet.get("id")
     wallet_api_key = wallet.get("adminkey") or wallet.get("inkey")
+
+    # a fresh user has no extensions enabled -- switch on lnurlp for them,
+    # otherwise the pay-link call below 403s ("Extension 'lnurlp' not enabled")
+    resp = requests.put(
+        f"{LNBITS_BASE_URL}/api/v1/extension/lnurlp/enable",
+        params={"usr": user_id},
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Could not enable lnurlp for the new wallet: {resp.status_code} {resp.text}")
 
     resp = requests.post(
         f"{LNBITS_BASE_URL}/lnurlp/api/v1/links",
@@ -261,10 +916,13 @@ def create_dj_wallet(dj_name: str) -> dict:
     if resp.status_code >= 300:
         raise RuntimeError(f"Could not create Lightning Address: {resp.status_code} {resp.text}")
     link = resp.json()
-    ln_address = f"{slug}@{LNBITS_BASE_URL.replace('http://', '').replace('https://', '')}"
+    ln_address = f"{slug}@{LN_ADDRESS_DOMAIN}"
 
-    _record_registration(dj_name, user_id, wallet_id, ln_address)
-    return {"dj_name": dj_name, "wallet_id": wallet_id, "lightning_address": ln_address}
+    claim_code = _new_code()
+    _record_registration(dj_name, user_id, wallet_id, ln_address, claim_code,
+                         pass_hash=pass_hash, wallet_inkey=wallet.get("inkey"))
+    return {"dj_name": dj_name, "wallet_id": wallet_id, "lightning_address": ln_address,
+            "claim_code": claim_code}
 
 
 def _telegram_send(chat_id, text):
@@ -308,20 +966,191 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _session_cookie(self):
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == SESSION_COOKIE:
+                return v
+        return ""
+
     def _check_admin(self, qs):
+        if _session_valid(self._session_cookie()):
+            return True
         token = (qs.get("token") or [""])[0]
         if not DJ_ADMIN_TOKEN or token != DJ_ADMIN_TOKEN:
             self._html(403, "forbidden")
             return False
         return True
 
+    def _serve_portal(self, reg_id):
+        row = _dj_row_full(reg_id)
+        if not row:
+            return self._html(200, PORTAL_LOGIN_HTML.replace("__RESULT__", '<p class="err">Unknown DJ -- log in again.</p>'))
+        _id, name, ln_addr, avatar, pass_hash, blurb, links, user_id, wallet_id, payout = row
+        src = ("/assets/avatars/" + avatar) if avatar else "/assets/avatar.webp"
+        bal = _wallet_balance_sats(reg_id)
+        bal_txt = (f"{bal:,} sats" if bal is not None
+                   else "could not read just now -- open the wallet to see it")
+        user_id, wallet_id = _heal_wallet_ids(reg_id)
+        if user_id and wallet_id:
+            wallet_url = f"https://{LN_ADDRESS_DOMAIN}/wallet?usr={user_id}&wal={wallet_id}"
+        elif user_id:
+            wallet_url = f"https://{LN_ADDRESS_DOMAIN}/wallet?usr={user_id}"
+        else:
+            wallet_url = "#"
+        pass_head = ("Set a passphrase -- from then on you log in with name + passphrase (your recovery code keeps working as backup):"
+                     if not pass_hash else "Change your passphrase:")
+        link_vals = (links or "").split("\n")
+        link_vals += [""] * (3 - len(link_vals))
+        payout_state = ("Payouts currently go to <b>your own wallet</b> &#9889;" if payout
+                        else "Payouts currently go to your station wallet.")
+        html = (PORTAL_HTML.replace("__DJ_NAME_URL__", quote(name))
+                .replace("__DJ_NAME__", _esc_attr(name))
+                .replace("__LN_ADDRESS__", _esc_attr(ln_addr or ""))
+                .replace("__AVATAR_SRC__", src)
+                .replace("__BALANCE__", _esc_attr(bal_txt))
+                .replace("__WALLET_URL__", _esc_attr(wallet_url))
+                .replace("__PASS_HEAD__", pass_head)
+                .replace("__BLURB__", _esc_attr(blurb or ""))
+                .replace("__LINK1__", _esc_attr(link_vals[0]))
+                .replace("__LINK2__", _esc_attr(link_vals[1]))
+                .replace("__LINK3__", _esc_attr(link_vals[2]))
+                .replace("__PAYOUT_VALUE__", _esc_attr(payout or ""))
+                .replace("__PAYOUT_STATE__", payout_state))
+        return self._html(200, html)
+
     def do_GET(self):
+        if not REGISTRATION_OPEN and not self.path.startswith(("/admin", "/portal", "/avatars", "/u/")):
+            return self._html(200, CLOSED_HTML)
         if self.path == "/" or self.path.startswith("/?"):
             return self._html(200, FORM_HTML.replace("__RESULT__", ""))
 
-        if self.path == "/request-slot":
-            html = SLOT_FORM_HTML.replace("__HOUR_OPTIONS__", _hour_options()).replace("__RESULT__", "")
+        if self.path == "/request-slot" or self.path.startswith("/request-slot?"):
+            # ?dj_name=... carries the name over from a fresh registration so
+            # the DJ doesn't have to type it twice
+            _, _, query = self.path.partition("?")
+            prefill = _esc_attr((parse_qs(query).get("dj_name") or [""])[0][:40])
+            html = (SLOT_FORM_HTML.replace("__HOUR_OPTIONS__", _hour_options())
+                    .replace("__RESULT__", "").replace("__DJ_NAME__", prefill))
             return self._html(200, html)
+
+        if self.path == "/portal" or self.path.startswith("/portal?"):
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(200, PORTAL_LOGIN_HTML.replace("__RESULT__", ""))
+            return self._serve_portal(reg_id)
+
+        if self.path == "/portal/logout":
+            self.send_response(303)
+            self.send_header("Set-Cookie", f"{PORTAL_COOKIE}=gone; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        if self.path == "/avatars" or self.path.startswith("/avatars?"):
+            # public name -> avatar-url map for the overlay and the site
+            data = json.dumps(_avatar_map()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if self.path.startswith("/u/"):
+            raw = unquote(self.path[3:].partition("?")[0])
+            slug = _slugify(raw)
+            con = sqlite3.connect(DB_PATH)
+            rows = con.execute("SELECT id, dj_name FROM dj_registrations WHERE COALESCE(removed, 0) = 0").fetchall()
+            con.close()
+            hit = next((r for r in rows if _slugify(r[1]) == slug), None)
+            if not hit:
+                return self._html(404, '<p style="font-family:monospace;color:#e6eff0;background:#0a1a1f;padding:30px;">No DJ by that name aboard. <a href="/" style="color:#f7931a;">Back to the radio</a></p>')
+            viewer = _portal_auth(self.headers.get("Cookie"))
+            if viewer == hit[0]:
+                return self._serve_portal(hit[0])
+            row = _dj_row_full(hit[0])
+            _id, name, ln_addr, avatar, _ph, blurb, links, _u, _w, _p = row
+            src = ("/assets/avatars/" + avatar) if avatar else "/assets/avatar.webp"
+            blurb_html = ("<p>" + _esc_attr(blurb) + "</p>") if blurb else ""
+            link_html = "".join(
+                '<p><a href="' + _esc_attr(u) + '" target="_blank" rel="noopener nofollow">' + _esc_attr(u) + "</a></p>"
+                for u in (links or "").split("\n") if u
+            )
+            html = (PUBLIC_DJ_HTML.replace("__DJ_NAME__", _esc_attr(name))
+                    .replace("__AVATAR_SRC__", src)
+                    .replace("__BLURB__", blurb_html)
+                    .replace("__LINKS__", link_html)
+                    .replace("__LN_ADDRESS__", _esc_attr(ln_addr or "")))
+            return self._html(200, html)
+
+        if self.path.startswith("/admin/lnbits-audit"):
+            path, _, query = self.path.partition("?")
+            qs = parse_qs(query)
+            if not self._check_admin(qs):
+                return
+            keep = {}
+            con = sqlite3.connect(DB_PATH)
+            for name, uid, removed in con.execute("SELECT dj_name, lnbits_user_id, COALESCE(removed, 0) FROM dj_registrations"):
+                if uid:
+                    keep[uid] = (name, removed)
+            con.close()
+            rows = []
+            try:
+                lcon = sqlite3.connect(f"file:{LNBITS_DB_PATH}?mode=ro", uri=True, timeout=3)
+                try:
+                    raw = lcon.execute('SELECT a.id, COUNT(w.id), GROUP_CONCAT(w.name, " | ") FROM accounts a LEFT JOIN wallets w ON w.user = a.id GROUP BY a.id').fetchall()
+                except sqlite3.Error:
+                    raw = lcon.execute('SELECT user, COUNT(id), GROUP_CONCAT(name, " | ") FROM wallets GROUP BY user').fetchall()
+                lcon.close()
+            except sqlite3.Error as e:
+                return self._json_resp(500, {"error": f"could not read LNbits db: {e}"})
+            order = {"DELETE": 0, "CHECK": 1, "KEEP-DJ": 2, "KEEP-MAIN": 3}
+            for uid, wc, wnames in raw:
+                if uid in keep:
+                    name, removed = keep[uid]
+                    verdict = "DELETE" if removed else "KEEP-DJ"
+                    label = f"registry: {name}" + (" (removed DJ)" if removed else " (active DJ)")
+                elif (wc or 0) > 1:
+                    verdict = "KEEP-MAIN"
+                    label = "owns multiple wallets — almost certainly the captain's own account"
+                else:
+                    verdict = "CHECK"
+                    label = "unknown to the DJ registry — delete only if you recognise it as junk"
+                rows.append({"verdict": verdict, "label": label, "user_id": uid,
+                             "wallets": wc or 0, "wallet_names": (wnames or "")[:120]})
+            rows.sort(key=lambda r: (order.get(r["verdict"], 9), r["label"]))
+            return self._json_resp(200, {"accounts": rows})
+
+        if self.path.startswith("/admin/api"):
+            # JSON twin of the /admin HTML page, consumed by the captain's
+            # console (admin.html on the main site). Same auth, same data.
+            path, _, query = self.path.partition("?")
+            qs = parse_qs(query)
+            if not self._check_admin(qs):
+                return
+            rows = _list_slot_requests()
+            reqs = [
+                {"id": rid, "dj_name": name, "telegram": tg or "", "npub": npub or "",
+                 "slot": f"{date} {hour:02d}:00 CET", "status": status}
+                for rid, name, tg, npub, date, hour, status, _req_at in rows
+            ]
+            djs = [
+                {"dj_name": n, "lightning_address": a or "", "wallet_id": w or "",
+                 "claim_code": c or "", "avatar": ("/assets/avatars/" + av) if av else "",
+                 "payout_address": pa or ""}
+                for n, a, w, c, av, pa in _list_registrations()
+            ]
+            removed = [{"dj_name": n, "removed_at": ra or 0} for n, ra in _list_removed()]
+            data = json.dumps({"requests": reqs, "djs": djs, "removed": removed}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
         if self.path.startswith("/admin"):
             path, _, query = self.path.partition("?")
@@ -360,23 +1189,144 @@ class Handler(BaseHTTPRequestHandler):
 
         self._html(404, "not found")
 
+    def _json_resp(self, code, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_portal_avatar(self):
+        reg_id = _portal_auth(self.headers.get("Cookie"))
+        if not reg_id:
+            return self._json_resp(403, {"error": "not logged in"})
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0 or length > AVATAR_MAX_BYTES:
+            return self._json_resp(400, {"error": "image must be under %d KB" % (AVATAR_MAX_BYTES // 1000)})
+        body = self.rfile.read(length)
+        if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+            ext = "webp"
+        elif body[:8] == b"\x89PNG\r\n\x1a\n":
+            ext = "png"
+        elif body[:3] == b"\xff\xd8\xff":
+            ext = "jpg"
+        else:
+            return self._json_resp(400, {"error": "only webp/png/jpeg accepted"})
+        row = _dj_row(reg_id)
+        if not row:
+            return self._json_resp(403, {"error": "unknown DJ"})
+        slug = _slugify(row[1])
+        fname = slug + "." + ext
+        for old_ext in ("webp", "png", "jpg"):
+            if old_ext != ext:
+                try:
+                    os.remove(os.path.join(AVATAR_DIR, slug + "." + old_ext))
+                except FileNotFoundError:
+                    pass
+        with open(os.path.join(AVATAR_DIR, fname), "wb") as f:
+            f.write(body)
+        _set_avatar(reg_id, fname)
+        self._json_resp(200, {"url": "/assets/avatars/" + fname})
+
     def do_POST(self):
+        # binary route first -- the avatar body is raw image bytes, not a form
+        if self.path == "/portal/avatar":
+            return self._handle_portal_avatar()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length).decode()
         qs = parse_qs(raw)
 
-        if self.path == "/register":
+        if self.path in ("/portal/login", "/portal"):
+            name = (qs.get("dj_name") or [""])[0]
+            code = (qs.get("code") or [""])[0]
+            pw = (qs.get("pass") or [""])[0]
+            if pw:
+                reg_id = _find_dj_by_pass(name, pw)
+            elif code:
+                reg_id = _find_dj_by_login(name, code)
+            else:
+                reg_id = None
+            if not reg_id:
+                time.sleep(0.6)  # cheap brute-force damper
+                return self._html(403, PORTAL_LOGIN_HTML.replace("__RESULT__", '<p class="err">No match -- check the name and passphrase/code.</p>'))
+            row = _dj_row(reg_id)
+            dest = ("/" + quote(row[1])) if row else "/login"
+            self.send_response(303)
+            self.send_header("Set-Cookie", f"{PORTAL_COOKIE}={_mint_portal_cookie(reg_id)}; Path=/; Max-Age={PORTAL_TTL_S}; HttpOnly; Secure; SameSite=Strict")
+            self.send_header("Location", dest)
+            self.end_headers()
+            return
+
+        if self.path == "/portal/setpass":
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(403, "not logged in")
+            pw = (qs.get("pass") or [""])[0]
+            pw2 = (qs.get("pass2") or [""])[0]
+            if len(pw) < 12 or pw != pw2:
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">Passphrases must match and be at least 12 characters. <a href="/login">Back to your portal</a></p>')
+            _set_pass(reg_id, pw)
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        if self.path == "/portal/profile":
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(403, "not logged in")
+            blurb = (qs.get("blurb") or [""])[0].strip()[:280]
+            links = []
+            for k in ("link1", "link2", "link3"):
+                u = (qs.get(k) or [""])[0].strip()[:200]
+                if u and not u.startswith(("http://", "https://")):
+                    u = "https://" + u
+                if u.startswith(("http://", "https://")) and "." in u[8:]:
+                    links.append(u)
+            _set_profile(reg_id, blurb, "\n".join(links))
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        if self.path == "/portal/payout":
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(403, "not logged in")
+            addr = (qs.get("payout") or [""])[0].strip().lower()[:100]
+            if addr and not re.match(r"^[a-z0-9._+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$", addr):
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">That does not look like a Lightning Address (name@domain). <a href="/login">Back to your portal</a></p>')
+            _set_payout(reg_id, addr)
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        if not REGISTRATION_OPEN and not self.path.startswith(("/admin", "/portal", "/avatars", "/u/")):
+            return self._html(200, CLOSED_HTML)
+
+        if self.path in ("/register", "/"):
             name = (qs.get("name") or [""])[0].strip()
+            pw = (qs.get("pass") or [""])[0]
+            pw2 = (qs.get("pass2") or [""])[0]
             if not name:
                 return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Enter a name.</p>'))
+            if _name_taken(name):
+                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">That DJ name is already taken -- one DJ, one name, set in stone.</p>'))
+            if len(pw) < 12 or pw != pw2:
+                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Passphrases must match and be at least 12 characters -- try 4 random words.</p>'))
+            if name.lower() in pw.lower():
+                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Do not put your DJ name inside your passphrase.</p>'))
             try:
-                result = create_dj_wallet(name)
+                result = create_dj_wallet(name, pass_hash=_hash_pass(pw))
                 result_html = f"""
                 <div class="result">
-                  <p>Registered, {result['dj_name']}!</p>
+                  <p>Welcome aboard, {result['dj_name']}!</p>
                   <p>Your Lightning Address:<br><b>{result['lightning_address']}</b></p>
-                  <p>Split percentages aren't set yet -- Noderunners Radio will configure your share once that's decided.</p>
-                  <p><a href="/dj/request-slot">Request a DJ slot &rarr;</a></p>
+                  <p>Your RECOVERY CODE (write it down somewhere safe -- it's your way back in if you ever lose your passphrase):<br><b>{result['claim_code']}</b></p>
+                  <p><a href="/login">Log in to your DJ portal</a> -- your sats, your avatar, your profile.</p>
+                  <p><a href="/dj/request-slot?dj_name={quote(result['dj_name'])}">Request a DJ slot &rarr;</a></p>
                 </div>"""
                 return self._html(200, FORM_HTML.replace("__RESULT__", result_html))
             except Exception as e:
@@ -391,13 +1341,69 @@ class Handler(BaseHTTPRequestHandler):
                 hour = int((qs.get("hour_cet") or ["20"])[0])
             except ValueError:
                 hour = 20
-            html = SLOT_FORM_HTML.replace("__HOUR_OPTIONS__", _hour_options(hour))
+            html = SLOT_FORM_HTML.replace("__HOUR_OPTIONS__", _hour_options(hour)).replace("__DJ_NAME__", _esc_attr(name))
             if not name or not date or not telegram_handle:
                 return self._html(400, html.replace("__RESULT__", '<p class="err">Fill in your DJ name, Telegram handle, and a date.</p>'))
             _record_slot_request(name, telegram_handle, nostr_npub, date, hour)
             _notify_new_slot_request(name, date, hour)
             result_html = f'<div class="result"><p>Request submitted for {date} {hour:02d}:00 (studio time). We\'ll reach out on Telegram once it\'s reviewed.</p></div>'
             return self._html(200, html.replace("__RESULT__", result_html))
+
+        if self.path == "/admin/remove":
+            if not self._check_admin(qs):
+                return
+            name = (qs.get("name") or [""])[0].strip()
+            if name:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE dj_registrations SET removed = 1, removed_at = ? WHERE lower(dj_name) = lower(?)", (int(time.time()), name))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"removed": name})
+
+        if self.path == "/admin/reinstate":
+            if not self._check_admin(qs):
+                return
+            name = (qs.get("name") or [""])[0].strip()
+            if name:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE dj_registrations SET removed = 0, removed_at = NULL WHERE lower(dj_name) = lower(?)", (name,))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"reinstated": name})
+
+        if self.path == "/admin/request-delete":
+            if not self._check_admin(qs):
+                return
+            try:
+                rid = int((qs.get("id") or ["0"])[0])
+            except ValueError:
+                rid = 0
+            if rid:
+                try:
+                    shutil.copy2(DB_PATH, DB_PATH + time.strftime(".bak-purge-%Y%m%d"))
+                except OSError:
+                    pass
+                con = sqlite3.connect(DB_PATH)
+                con.execute("DELETE FROM slot_requests WHERE id = ?", (rid,))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"deleted": rid})
+
+        if self.path == "/admin/purge":
+            if not self._check_admin(qs):
+                return
+            name = (qs.get("name") or [""])[0].strip()
+            if name:
+                # only already-removed rows can be purged; dated DB backup first
+                try:
+                    shutil.copy2(DB_PATH, DB_PATH + time.strftime(".bak-purge-%Y%m%d"))
+                except OSError:
+                    pass
+                con = sqlite3.connect(DB_PATH)
+                con.execute("DELETE FROM dj_registrations WHERE lower(dj_name) = lower(?) AND COALESCE(removed, 0) = 1", (name,))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"purged": name})
 
         if self.path == "/admin/approve" or self.path == "/admin/reject":
             if not self._check_admin(qs):
@@ -407,10 +1413,28 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 rid = 0
             status = "approved" if self.path == "/admin/approve" else "rejected"
+            note = (qs.get("note") or [""])[0].strip()[:280]
             if rid:
                 _set_slot_status(rid, status)
+                # public ping in the radio group: decision + captain's note, never secrets
+                try:
+                    con = sqlite3.connect(DB_PATH)
+                    row = con.execute("SELECT dj_name, telegram_handle, slot_date, hour_cet FROM slot_requests WHERE id = ?", (rid,)).fetchone()
+                    con.close()
+                    if row and TELEGRAM_CHAT_ID:
+                        name, tg, date, hour = row
+                        mark = "\u2705" if status == "approved" else "\u274c"
+                        msg = f"{mark} Slot request {status}: {name} \u2014 {date} {hour:02d}:00 CET"
+                        if tg:
+                            msg += f" ({tg})"
+                        if note:
+                            msg += f"\nCaptain's note: {note}"
+                        _telegram_send(TELEGRAM_CHAT_ID, msg)
+                except Exception:
+                    pass
             self.send_response(303)
-            self.send_header("Location", f"/dj/admin?token={DJ_ADMIN_TOKEN}")
+            # no token in the redirect -- the session cookie carries the auth
+            self.send_header("Location", "/dj/admin")
             self.end_headers()
             return
 

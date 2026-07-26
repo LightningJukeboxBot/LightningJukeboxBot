@@ -38,9 +38,31 @@ def _send(sock_path: str, command: str, timeout: float = 5.0) -> str:
         return b"".join(chunks).decode(errors="replace")
 
 
-def push_track(local_path: str, socket_path: str = DEFAULT_SOCKET) -> str:
-    """Queue a track for near-immediate playback. Returns the request ID Liquidsoap assigns."""
-    return _send(socket_path, f"jukebox.push {local_path}")
+def _annotate(meta: dict) -> str:
+    """Build a Liquidsoap annotate: prefix from metadata, or '' if none.
+
+    Values are double-quoted with quotes/backslashes escaped so a title with a
+    quote in it can't break out of the annotation. Keys are simple identifiers.
+    """
+    parts = []
+    for k, v in meta.items():
+        if v is None or v == "":
+            continue
+        safe = str(v).replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'{k}="{safe}"')
+    return f"annotate:{','.join(parts)}:" if parts else ""
+
+
+def push_track(local_path: str, rights_class: str = "", source: str = "",
+               socket_path: str = DEFAULT_SOCKET) -> str:
+    """Queue a track for near-immediate playback. Returns the request ID Liquidsoap assigns.
+
+    rights_class/source ride along as annotation metadata so the play-log hook
+    can attribute the play to the right royalty pool. Omit them and behaviour is
+    identical to before (a bare push) -- fully backward compatible.
+    """
+    uri = f"{_annotate({'rights_class': rights_class, 'source': source})}{local_path}"
+    return _send(socket_path, f"jukebox.push {uri}")
 
 
 def queue_status(socket_path: str = DEFAULT_SOCKET) -> str:
