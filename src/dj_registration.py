@@ -42,6 +42,7 @@ import requests
 LNBITS_BASE_URL = os.environ.get("LNBITS_BASE_URL", "http://127.0.0.1:5000")
 LNBITS_ADMIN_API_KEY = os.environ.get("LNBITS_ADMIN_API_KEY")
 DJ_ADMIN_TOKEN = os.environ.get("DJ_ADMIN_TOKEN")
+LIBRARY_API_URL = os.environ.get("LIBRARY_API_URL", "http://127.0.0.1:7100")
 PORT = int(os.environ.get("DJ_REGISTRATION_PORT", "5001"))
 DB_PATH = os.environ.get("DJ_REGISTRATION_DB", "/opt/lightning-stack/dj_registrations.sqlite3")
 
@@ -119,11 +120,11 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
   <a href="/login" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log in</a>
 </nav>
 <h1>Noderunners Radio -- Guest DJ Registration</h1>
-<p>Enter your DJ name to get your own Lightning Address for the split-sat stream. Split percentages aren't decided yet -- this just sets you up to receive once they are.</p>
+<p>Enter your DJ name to get your own wallet and Lightning Address. Live-session tips pool up and settle to the crew automatically -- the split ladder is on the <a href="/roadmap" style="color:#f5a623;">roadmap</a>.</p>
 <form method="POST" action="/register">
   <input name="name" placeholder="DJ name" required maxlength="40" pattern="[A-Za-z0-9_\-\. ]+">
-  <input type="password" name="pass" placeholder="Choose a strong passphrase (min 12 characters)" required minlength="12" maxlength="128">
-  <input type="password" name="pass2" placeholder="Repeat the passphrase" required minlength="12" maxlength="128">
+  <input type="password" name="pass" placeholder="Choose a strong password (min 12 characters)" required minlength="12" maxlength="128">
+  <input type="password" name="pass2" placeholder="Repeat the password" required minlength="12" maxlength="128">
   <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">Tip: 4+ random words beat l33t gibberish. Password managers welcome aboard.</p>
   <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">&#9888; Pick your DJ name carefully &mdash; <b>names are set in stone</b> (one DJ = one name = one Lightning Address). Need a change later? Tag <b>@noderunnersfm</b> or <b>@plebroyale</b> in <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">t.me/noderunnersradio</a>.</p>
   <button type="submit">Register</button>
@@ -160,7 +161,7 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 <form method="POST" action="/dj/request-slot">
   <input name="dj_name" placeholder="Your DJ name" value="__DJ_NAME__" required maxlength="40" pattern="[A-Za-z0-9_\-\. ]+">
   <input name="telegram_handle" placeholder="Telegram handle, e.g. @yourname" required maxlength="40">
-  <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">No Telegram yet? <a href="https://telegram.org/apps" target="_blank" rel="noopener">Get it here</a>, then set your @username so we can reach you:<br>
+  <p style="font-size:0.78rem;color:#8aa4aa;margin:-4px 0 8px;line-height:1.5;">No Telegram yet? <a href="https://telegram.org/apps" target="_blank" rel="noopener" style="color:#f5a623;font-weight:bold;text-decoration:underline;">Get it here &#8599;</a>, then set your @username so we can reach you:<br>
   &bull; iPhone: Settings &rarr; tap your profile &rarr; Username<br>
   &bull; Android: &#9776; menu &rarr; Settings &rarr; tap your name &rarr; Username</p>
   <input name="nostr_npub" placeholder="Nostr npub (optional)" maxlength="80">
@@ -230,6 +231,24 @@ __ROWS__
 </body></html>"""
 
 
+INVITE_THANKS_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>Word sent / Noderunners Radio</title>
+<style>
+body { background:#0a1a1f; color:#e6eff0; font-family: ui-monospace, monospace; max-width:560px; margin:70px auto; padding:0 22px; line-height:1.6; }
+.card { background:#0f262d; border:1px solid #1d3a42; border-radius:8px; padding:24px 26px; }
+h1 { color:#f7931a; font-size:1.3rem; margin:6px 0 14px; }
+a { color:#f7931a; font-weight:bold; text-decoration:none; }
+</style></head>
+<body><div class="card">
+  <div style="font-size:1.7rem;">&#9875;</div>
+  <h1>Your word reached the bridge</h1>
+  <p>The captain reads these by hand, so it can take a while. If we have a berth for you, we will reach out on the contact you left.</p>
+  <p><a href="/dj-handbook">&rarr; Read the Guest DJ Guide</a> &nbsp;&middot;&nbsp; <a href="https://t.me/noderunnersradio">&rarr; The Telegram</a></p>
+</div></body></html>
+"""
+
 CLOSED_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex,nofollow">
@@ -258,6 +277,18 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
   <h1>Guest DJ sign-up is closed for now</h1>
   <p>The Dread Node's DJ registration isn't open yet &mdash; we're still wiring her up. Nobody can create a wallet or book a slot just yet.</p>
   <p>Read the <a href="/dj-handbook">Guest DJ Guide</a> to see exactly how it'll work, and watch the Telegram for the all-aboard.</p>
+  <form method="POST" action="/invite-request" style="margin-top:20px;border-top:1px solid #1d3a42;padding-top:16px;">
+    <p style="margin:0 0 10px;"><b>Want aboard?</b> Leave word for the captain. The crew grows slowly and on purpose.</p>
+    <input name="name" placeholder="Your name or DJ name" maxlength="40" required
+      style="width:100%;padding:9px;margin:4px 0;border-radius:4px;border:1px solid #1d3a42;background:#0a1a1f;color:#e6eff0;font-family:inherit;">
+    <input name="contact" placeholder="Where to reach you (Telegram @handle, nostr npub, ...)" maxlength="80"
+      style="width:100%;padding:9px;margin:4px 0;border-radius:4px;border:1px solid #1d3a42;background:#0a1a1f;color:#e6eff0;font-family:inherit;">
+    <textarea name="message" placeholder="What do you play? Where did you hear about us?" maxlength="500" rows="3"
+      style="width:100%;padding:9px;margin:4px 0;border-radius:4px;border:1px solid #1d3a42;background:#0a1a1f;color:#e6eff0;font-family:inherit;"></textarea>
+    <input name="website" style="display:none;" tabindex="-1" autocomplete="off">
+    <button type="submit" style="margin-top:6px;padding:9px 16px;border:none;border-radius:5px;background:#f7931a;color:#111;font-weight:bold;font-family:inherit;cursor:pointer;">Send word to the captain</button>
+    <p style="font-size:0.8rem;color:#8aa4aa;margin:8px 0 0;">No account is created. Nothing is published. The captain reads these by hand.</p>
+  </form>
   <div class="links">
     <a href="/dj-handbook">&rarr; Guest DJ Guide</a>
     <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">&rarr; Telegram</a>
@@ -299,16 +330,16 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
 <p style="color:#8aa4aa;font-size:0.85rem;">One door for the whole crew — DJs and the captain both log in here.</p>
 <form method="POST" action="/login" id="loginForm">
   <input name="dj_name" id="loginName" placeholder="DJ name" required maxlength="64" autocomplete="username">
-  <input type="password" name="pass" id="loginPass" placeholder="Passphrase" required maxlength="128" autocomplete="current-password">
+  <input type="password" name="pass" id="loginPass" placeholder="Password" required maxlength="128" autocomplete="current-password">
   <button type="submit">Log in</button>
 </form>
-<details style="margin-top:16px;"><summary style="cursor:pointer;color:#8aa4aa;">No passphrase yet, or lost it? Use your recovery code</summary>
+<details style="margin-top:16px;"><summary style="cursor:pointer;color:#8aa4aa;">No password yet, or lost it? Use your recovery code</summary>
   <form method="POST" action="/login">
     <input name="dj_name" placeholder="DJ name" required maxlength="40">
     <input name="code" placeholder="Recovery code (21 characters)" required maxlength="32">
     <button type="submit">Log in with code</button>
   </form>
-  <p style="color:#8aa4aa;font-size:0.85rem;">Registered before passphrases existed? Your old claim code IS your recovery code &mdash; log in with it once, then set a passphrase inside.</p>
+  <p style="color:#8aa4aa;font-size:0.85rem;">Registered before passwords existed? Your old claim code IS your recovery code &mdash; log in with it once, then set a password inside.</p>
 </details>
 __RESULT__
 <p style="margin-top:18px;">New here? <a href="/register">Register as a guest DJ &rarr;</a></p>
@@ -343,6 +374,16 @@ input[type=file] { color:#8aa4aa; margin:10px 0; max-width:100%; }
 a { color:#f7931a; }
 #msg { font-size:0.85rem; margin-top:8px; }
 .mono { background:rgba(55,82,90,.3); border:1px solid #1d3a42; border-radius:4px; padding:1px 6px; word-break:break-all; }
+/* portal drawers (SF 2026-08-26): the open tab is BOLD + marked + thick-underlined --
+   three signals, none of them colour (captain and crew include colourblind eyes) */
+.ptabs { display:flex; gap:2px; border-bottom:2px solid #1d3a42; margin:14px 0 6px; flex-wrap:wrap; }
+.ptabs button { background:none; border:none; color:#8aa4aa; font-family:inherit; font-size:0.8rem;
+  letter-spacing:0.06em; text-transform:uppercase; padding:8px 11px; cursor:pointer;
+  border-bottom:3px solid transparent; border-radius:0; font-weight:normal; }
+.ptabs button.on { color:#e6eff0; font-weight:700; border-bottom:3px solid #f7931a; }
+.ptabs button.on::before { content:"\u25b8 "; }
+.pane { display:none; }
+.pane.on { display:block; }
 
 html{ background:var(--ether,#0a1a1f); }
 body{ background:transparent; }
@@ -362,6 +403,20 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
   <a href="/dj/portal/logout" style="color:#8aa4aa;text-decoration:none;padding:2px 10px;margin-left:auto;">Log out</a>
 </nav>
 <h1>Ahoy, __DJ_NAME__</h1>
+<div class="ptabs" id="ptabs" role="tablist">
+  <button type="button" data-pane="sats" class="on">Sats</button>
+  <button type="button" data-pane="page">My page</button>
+  <button type="button" data-pane="hosting">Hosting</button>
+  __LIVE_TAB__
+  <button type="button" data-pane="account">Account</button>
+</div>
+<div class="pane" data-pane="hosting">
+__HOST_CARD__
+</div>
+<div class="pane" data-pane="live">
+__LIVE_CARDS__
+</div>
+<div class="pane on" data-pane="sats">
 <div class="card">
   <div class="muted"><b>Your payout address</b> &mdash; where session pay lands. __PAYOUT_STATE__</div>
   <form method="POST" action="/dj/portal/payout">
@@ -376,24 +431,29 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
   <p style="border:1px solid #f7931a;border-radius:6px;padding:10px 12px;line-height:1.55;margin:10px 0;">&#9888; <b>THE STATION IS NOT A BANK.</b> Sats that land here are yours &mdash; move them to a wallet only <b>you</b> control, after every session. Self-custody, always.</p>
   <p><a class="btn" href="__WALLET_URL__" target="_blank" rel="noopener">Open my station wallet &#8599;</a></p>
   <p class="muted">Inside the wallet: hit <b>Send</b>, paste an invoice or Lightning Address from your own wallet (Wallet of Satoshi, Phoenix, Breez, your own node...), send everything. That link is your full access &mdash; treat it like cash and don't share it.</p>
-  <div class="muted">Your Lightning Address (where session payouts land): <span class="mono">__LN_ADDRESS__</span></div>
+  <div class="muted">Your Lightning Address (where session payouts land): <span class="mono"><!--email_off-->__LN_ADDRESS__<!--/email_off--></span></div>
   <p class="muted" style="margin-bottom:0;">DJ name &amp; address are <b>set in stone</b> (one DJ = one name = one address). Need a change? Tag <b>@noderunnersfm</b> or <b>@plebroyale</b> in <a href="https://t.me/noderunnersradio" target="_blank" rel="noopener">t.me/noderunnersradio</a>.</p>
 </div>
+</div>
+<div class="pane" data-pane="account">
 <div class="card">
   <div class="muted">__PASS_HEAD__</div>
   <form method="POST" action="/dj/portal/setpass">
-    <input type="password" name="pass" placeholder="New passphrase (min 12 characters)" required minlength="12" maxlength="128">
+    <input type="password" name="pass" placeholder="New password (min 12 characters)" required minlength="12" maxlength="128">
     <input type="password" name="pass2" placeholder="Repeat it" required minlength="12" maxlength="128">
-    <button type="submit">Save passphrase</button>
+    <button type="submit">Save password</button>
   </form>
 </div>
+</div>
+<div class="pane" data-pane="page">
 <div class="card">
-  <div class="muted">Your blurb &amp; links &mdash; shown alongside your avatar once public DJ pages sail:</div>
+  <div class="muted">Your bio &amp; links &mdash; shown with your avatar on your public DJ page (noderunnersradio.com/YourName):</div>
   <form method="POST" action="/dj/portal/profile">
     <textarea name="blurb" rows="3" maxlength="280" placeholder="Short blurb, 280 characters max">__BLURB__</textarea>
     <input name="link1" placeholder="Link (https://...)" value="__LINK1__" maxlength="200">
     <input name="link2" placeholder="Link (https://...)" value="__LINK2__" maxlength="200">
     <input name="link3" placeholder="Link (https://...)" value="__LINK3__" maxlength="200">
+    <input name="telegram" placeholder="Telegram @handle (optional -- shown on your public page)" value="__TG__" maxlength="33">
     <button type="submit">Save profile</button>
   </form>
 </div>
@@ -408,6 +468,7 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
     <button type="button" id="saveAvatar" style="margin-top:6px;">Save avatar</button>
   </div>
   <div id="msg" class="muted"></div>
+</div>
 </div>
 <p><a href="/dj/request-slot?dj_name=__DJ_NAME_URL__">Request a DJ slot &rarr;</a> &middot; <a href="/dj/portal/logout">Log out</a></p>
 <script>
@@ -498,6 +559,40 @@ body::after{ content:""; position:fixed; inset:0; z-index:-1; pointer-events:non
   });
 })();
 </script>
+<script>
+(function(){
+  var bs = document.querySelectorAll('#ptabs button');
+  var ps = document.querySelectorAll('.pane');
+  function openPane(name){
+    var found = false;
+    Array.prototype.forEach.call(ps, function(p){
+      var on = p.getAttribute('data-pane') === name;
+      p.classList.toggle('on', on);
+      if (on) found = true;
+    });
+    Array.prototype.forEach.call(bs, function(b){
+      b.classList.toggle('on', b.getAttribute('data-pane') === name);
+    });
+    return found;
+  }
+  Array.prototype.forEach.call(bs, function(b){
+    b.addEventListener('click', function(){
+      openPane(b.getAttribute('data-pane'));
+      try { localStorage.setItem('nrPortalTab', b.getAttribute('data-pane')); } catch(err){}
+    });
+  });
+  var hasLive = document.querySelector('#ptabs button[data-pane="live"]') !== null;
+  var last = null;
+  try { last = localStorage.getItem('nrPortalTab'); } catch(err){}
+  if (last && document.querySelector('#ptabs button[data-pane="' + last + '"]')) openPane(last);
+  if (hasLive){
+    // a host with a session OPEN lands straight on the Live drawer -- the
+    // mid-set tools must never be buried (SF 2026-08-26)
+    fetch('/api/livesplit', {cache:'no-store'}).then(function(r){ return r.json(); })
+      .then(function(d){ if (d && d.live) openPane('live'); }).catch(function(){});
+  }
+})();
+</script>
 </body></html>"""
 
 
@@ -528,7 +623,8 @@ a { color:#f7931a; }
   <h1>__DJ_NAME__</h1>
   __BLURB__
   __LINKS__
-  <p class="muted">Tip __DJ_NAME__ directly, listener-to-artist: <span class="mono">__LN_ADDRESS__</span></p>
+  <p class="muted">Tip __DJ_NAME__ directly, listener-to-artist: <span class="mono"><!--email_off-->__LN_ADDRESS__<!--/email_off--></span></p>
+__TG_LINE__
 </div>
 <p class="muted">Guest DJ aboard <a href="/">Noderunners Radio</a> &mdash; <a href="/manifesto">the public is the DJ</a>.</p>
 <p class="muted">Are you __DJ_NAME__? <a href="/login">Log in to your quarters &rarr;</a></p>
@@ -560,8 +656,41 @@ def _init_db():
             requested_at INTEGER
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS invite_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            contact TEXT,
+            message TEXT,
+            created_at INTEGER,
+            handled INTEGER DEFAULT 0
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS host_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_name TEXT NOT NULL,
+            session_date TEXT NOT NULL,
+            venue_label TEXT NOT NULL,
+            slots INTEGER NOT NULL DEFAULT 3,
+            status TEXT NOT NULL DEFAULT 'pending',
+            note TEXT,
+            created_at INTEGER,
+            decided_at INTEGER
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS session_slots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            length_min INTEGER NOT NULL DEFAULT 60,
+            dj_name TEXT
+        )
+    """)
     # portal columns (safe to re-run; ALTER fails silently when present)
     for ddl in ("ALTER TABLE dj_registrations ADD COLUMN claim_code TEXT",
+                "ALTER TABLE host_sessions ADD COLUMN start_time TEXT",
                 "ALTER TABLE dj_registrations ADD COLUMN avatar TEXT",
                 "ALTER TABLE dj_registrations ADD COLUMN pass_hash TEXT",
                 "ALTER TABLE dj_registrations ADD COLUMN blurb TEXT",
@@ -569,7 +698,10 @@ def _init_db():
                 "ALTER TABLE dj_registrations ADD COLUMN wallet_inkey TEXT",
                 "ALTER TABLE dj_registrations ADD COLUMN removed INTEGER DEFAULT 0",
                 "ALTER TABLE dj_registrations ADD COLUMN removed_at INTEGER",
-                "ALTER TABLE dj_registrations ADD COLUMN payout_address TEXT"):
+                "ALTER TABLE dj_registrations ADD COLUMN payout_address TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN is_host INTEGER DEFAULT 0",
+                "ALTER TABLE dj_registrations ADD COLUMN venue_label TEXT",
+                "ALTER TABLE dj_registrations ADD COLUMN telegram_handle TEXT"):
         try:
             con.execute(ddl)
         except sqlite3.OperationalError:
@@ -674,17 +806,25 @@ def _set_pass(reg_id, passphrase):
     con.close()
 
 
-def _set_profile(reg_id, blurb, links):
+def _set_profile(reg_id, blurb, links, telegram=""):
     con = sqlite3.connect(DB_PATH)
-    con.execute("UPDATE dj_registrations SET blurb = ?, links = ? WHERE id = ?", (blurb, links, reg_id))
+    con.execute("UPDATE dj_registrations SET blurb = ?, links = ?, telegram_handle = ? WHERE id = ?",
+                (blurb, links, telegram, reg_id))
     con.commit()
     con.close()
+
+
+def _portal_dest(reg_id):
+    """After any portal action, land the DJ on their own pretty page, not
+    /login (SF 2026-07-30: the ugly URL kept surfacing after every save)."""
+    row = _dj_row(reg_id)
+    return ("/" + quote(row[1])) if row else "/login"
 
 
 def _dj_row_full(reg_id):
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
-        "SELECT id, dj_name, lightning_address, avatar, pass_hash, blurb, links, lnbits_user_id, lnbits_wallet_id, payout_address FROM dj_registrations WHERE id = ?",
+        "SELECT id, dj_name, lightning_address, avatar, pass_hash, blurb, links, lnbits_user_id, lnbits_wallet_id, payout_address, COALESCE(is_host, 0), COALESCE(venue_label, ''), COALESCE(telegram_handle, '') FROM dj_registrations WHERE id = ?",
         (reg_id,),
     ).fetchone()
     con.close()
@@ -717,6 +857,188 @@ def _wallet_inkey(reg_id):
     con.commit()
     con.close()
     return lrow[0]
+
+
+def _list_host_sheets(name):
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT id, session_date, venue_label, slots, status, COALESCE(note,'') FROM host_sessions "
+        "WHERE lower(host_name) = lower(?) ORDER BY session_date ASC, id ASC LIMIT 12", (name,)).fetchall()
+    con.close()
+    return rows
+
+
+def _add_host_sheet(name, date, venue, start_time, lengths, slot_djs=None):
+    # lengths = ordered slot lengths in minutes; slot_djs = optional parallel
+    # DJ names (the host sets the lineup -- SF's ruling 2026-07-30)
+    slot_djs = slot_djs or []
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO host_sessions (host_name, session_date, venue_label, slots, start_time, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+        (name, date, venue, len(lengths), start_time, int(time.time())))
+    sid = cur.lastrowid
+    for pos, mins in enumerate(lengths):
+        dj = (slot_djs[pos].strip()[:40] if pos < len(slot_djs) else "") or None
+        con.execute("INSERT INTO session_slots (session_id, position, length_min, dj_name) VALUES (?, ?, ?, ?)",
+                    (sid, pos, mins, dj))
+    con.commit()
+    con.close()
+
+
+def _slot_times(start_time, lengths):
+    """['20:00', '21:00', ...] — each slot's start, from the sheet's start time."""
+    try:
+        h, m = (int(x) for x in (start_time or "20:00").split(":"))
+    except ValueError:
+        h, m = 20, 0
+    out, mins = [], h * 60 + m
+    for ln in lengths:
+        out.append(f"{(mins // 60) % 24:02d}:{mins % 60:02d}")
+        mins += ln
+    return out
+
+
+def _sheet_start(session_id):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT COALESCE(start_time, '20:00') FROM host_sessions WHERE id = ?", (session_id,)).fetchone()
+    con.close()
+    return row[0] if row else "20:00"
+
+
+def _sheet_slots(session_id):
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT position, length_min, COALESCE(dj_name,'') FROM session_slots "
+        "WHERE session_id = ? ORDER BY position", (session_id,)).fetchall()
+    con.close()
+    return rows
+
+
+def _hosting_toggle_html(is_host, venue):
+    """Self-service hosting (SF's ruling 2026-07-30, bench v3): every DJ flips
+    this on their own page. The captain still approves every sheet, so the
+    safety net does not move. State = words + knob position, never color."""
+    if is_host:
+        word, action, btn = "I can HOST at my place", "0", "Switch OFF &mdash; I stop hosting"
+        venue_row = f"""
+  <form method="POST" action="/dj/portal/hostmode" style="margin-top:8px;">
+    <input type="hidden" name="on" value="1">
+    <input name="venue" value="{_esc_attr(venue)}" placeholder="Your venue label, e.g. SOL's place" maxlength="60" required>
+    <button type="submit">Save venue</button>
+  </form>
+  <div class="muted" style="font-size:0.8rem;">Your sessions happen at YOUR place &mdash; a different venue is a different host. Sheets you publish carry this label.</div>"""
+    else:
+        word, action, btn = "I do NOT host", "1", "Switch ON &mdash; I can host at my place"
+        venue_row = ""
+    return f"""
+<div class="card">
+  <b>&#9875; Hosting</b> &mdash; <b>{word}</b>
+  <form method="POST" action="/dj/portal/hostmode" style="margin-top:6px;">
+    <input type="hidden" name="on" value="{action}">
+    {'' if is_host else '<input name="venue" placeholder="Your venue label, e.g. SOL' + chr(39) + 's place" maxlength="60" required>'}
+    <button type="submit">{btn}</button>
+  </form>{venue_row}
+  <div class="muted" style="font-size:0.8rem;margin-top:4px;">Flip this if you have gear and a place and want to run sessions. The captain approves every session sheet before it goes public.</div>
+</div>"""
+
+
+def _host_card_html(name, venue=""):
+    # state carried by symbol + words, never color alone
+    stat_words = {"pending": "&#8987; waiting for the captain",
+                  "published": "&#10004; PUBLIC -- on the calendar",
+                  "rejected": "&#10008; rejected",
+                  "removed": "&#10008; removed from the calendar by the captain"}
+    rows = _list_host_sheets(name)
+    sheets = ""
+    if rows:
+        parts = []
+        for sid, d, v, s, st, n in rows:
+            slots = _sheet_slots(sid)
+            if slots:
+                times = _slot_times(_sheet_start(sid), [ln for _p, ln, _dj in slots])
+                slot_txt = " &middot; ".join(
+                    f"{t}&nbsp;({ln}&prime;{' · ' + _esc_attr(dj) if dj else ''})"
+                    for t, (_p, ln, dj) in zip(times, slots))
+            else:
+                slot_txt = f"{int(s)} slots"
+            parts.append(
+                f'<div style="padding:4px 0;border-top:1px dashed rgba(138,164,170,0.35);">'
+                f'{_esc_attr(d)} &middot; {_esc_attr(v)} &mdash; {stat_words.get(st, _esc_attr(st))}'
+                f'<br><span class="muted" style="font-size:0.8rem;">{slot_txt}</span>'
+                + (f'<br><span class="muted" style="font-size:0.8rem;">captain\'s note: {_esc_attr(n)}</span>' if n else "")
+                + "</div>")
+        sheets = '<div style="margin-top:10px;"><b>Your session sheets</b>' + "".join(parts) + "</div>"
+    return f"""
+<div class="card">
+  <div class="muted"><b>&#9875; HOST MODE is ON for your account</b> &mdash; you have the gear and the venue: publish dates, DJs sign up.</div>
+  <form method="POST" action="/dj/portal/hostsheet" id="sheetForm">
+    <input type="date" name="date" required min="{time.strftime('%Y-%m-%d')}" title="Pick the session date -- today or later">
+    <input name="venue" value="{_esc_attr(venue)}" readonly title="Your registered venue from the Hosting card -- sessions happen at YOUR place." style="opacity:0.65;border-style:dashed;">
+    <input type="time" name="start" required title="First slot start time" style="max-width:280px;">
+    <div id="slotRows" style="margin:10px 0 4px;"></div>
+    <button type="button" id="addSlot" style="margin-left:0;background:transparent;color:#e6eff0;border:1px dashed #8aa4aa;">+ add a slot</button>
+    <div style="margin-top:10px;">
+      <button type="submit">Send session sheet to the captain</button>
+    </div>
+  </form>
+  <p class="muted" style="margin-bottom:0;">You set the running order and each slot's length &mdash; the times compute themselves. Nothing goes public until the captain approves.</p>
+  {sheets}
+</div>
+<script>
+(function(){{
+  var box = document.getElementById('slotRows'), form = document.getElementById('sheetForm');
+  var lens = [60, 60, 60];
+  var djs = ['', '', ''];   /* per-slot DJ name, optional (SF's ruling: hosts set the lineup) */
+  function eA(s){{ return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;'); }}
+  function startMins(){{
+    var m = /^([0-9]{{1,2}}):([0-9]{{2}})$/.exec(form.start.value.trim());
+    return m ? (parseInt(m[1],10)*60 + parseInt(m[2],10)) : null;
+  }}
+  function fmt(mins){{ mins = ((mins % 1440) + 1440) % 1440;
+    return ('0'+Math.floor(mins/60)).slice(-2) + ':' + ('0'+(mins%60)).slice(-2); }}
+  function draw(){{
+    var s = startMins(), t = s, html = '';
+    lens.forEach(function(ln, i){{
+      var when = (s === null) ? '--:--' : fmt(t); if (s !== null) t += ln;
+      html += '<div style="display:flex;align-items:center;gap:8px;padding:3px 0;flex-wrap:wrap;">' +
+        '<b style="min-width:56px;color:#f5a623;">' + when + '</b>' +
+        '<span>slot ' + (i+1) + ':</span>' +
+        '<input type="number" name="slotlen" value="' + ln + '" min="10" max="240" step="5" data-i="' + i + '" style="width:80px;"> min' +
+        '<input name="slotdj" value="' + eA(djs[i]) + '" placeholder="DJ (optional)" maxlength="40" data-i="' + i + '" style="width:150px;">' +
+        '<span style="white-space:nowrap;display:inline-flex;gap:6px;">' +
+        '<button type="button" class="mv" data-i="' + i + '" data-d="-1" ' + (i===0?'disabled':'') + ' style="padding:2px 8px;background:transparent;color:#e6eff0;border:1px solid #8aa4aa;">&#9650;</button>' +
+        '<button type="button" class="mv" data-i="' + i + '" data-d="1" ' + (i===lens.length-1?'disabled':'') + ' style="padding:2px 8px;background:transparent;color:#e6eff0;border:1px solid #8aa4aa;">&#9660;</button>' +
+        '<button type="button" class="rm" data-i="' + i + '" ' + (lens.length<2?'disabled':'') + ' style="padding:2px 8px;background:transparent;color:#ff6b6b;border:1px solid #ff6b6b;">&#10005;</button>' +
+        '</span></div>';
+    }});
+    box.innerHTML = html;
+  }}
+  box.addEventListener('input', function(e){{
+    var t = e.target;
+    if (t.name === 'slotdj'){{ djs[t.getAttribute('data-i')] = t.value; return; }}
+    if (t.name !== 'slotlen') return;
+    lens[t.getAttribute('data-i')] = Math.max(10, Math.min(240, parseInt(t.value,10) || 60));
+    var keep = document.activeElement === t;  /* live-update times without stealing focus */
+    draw();
+    if (keep){{ var again = box.querySelector('input[name="slotlen"][data-i="' + t.getAttribute('data-i') + '"]'); if (again){{ again.focus(); }} }}
+  }});
+  box.addEventListener('click', function(e){{
+    var mv = e.target.closest('.mv');
+    if (mv){{ var i = +mv.getAttribute('data-i'), d = +mv.getAttribute('data-d');
+      var x = lens[i]; lens[i] = lens[i+d]; lens[i+d] = x;
+      var y = djs[i]; djs[i] = djs[i+d]; djs[i+d] = y; draw(); return; }}
+    var rm = e.target.closest('.rm');
+    if (rm && lens.length > 1){{ var ri = +rm.getAttribute('data-i');
+      lens.splice(ri, 1); djs.splice(ri, 1); draw(); }}
+  }});
+  document.getElementById('addSlot').addEventListener('click', function(){{
+    if (lens.length < 12){{ lens.push(60); djs.push(''); }} draw();
+  }});
+  form.start.addEventListener('input', draw);
+  draw();
+}})();
+</script>"""
 
 
 def _set_payout(reg_id, address):
@@ -820,6 +1142,86 @@ def _portal_auth(cookie_header):
     return None
 
 
+
+
+def _mint_console_session():
+    """Same shape as library_api's _make_session -- the two services share
+    ADMIN_SESSION_SECRET by design (see the portal-cookie note above). 60 s
+    life: it exists only for the localhost hop in the host-door relays."""
+    exp = str(int(time.time()) + 60)
+    sig = hmac.new(ADMIN_SESSION_SECRET.encode(), exp.encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _host_of(reg_id):
+    """(dj_name, venue_label) when the registration is an active host, else None."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        row = con.execute(
+            "SELECT dj_name, COALESCE(is_host,0), COALESCE(venue_label,'') "
+            "FROM dj_registrations WHERE id = ? AND COALESCE(removed,0) = 0",
+            (reg_id,)).fetchone()
+    finally:
+        con.close()
+    return (row[0], row[2]) if row and row[1] else None
+
+
+def _venue_slug(label):
+    """Mirror of library_api's venue key rule -- keep the two in step."""
+    return "".join(c for c in (label or "").lower() if c.isalnum() or c in "_-")[:24] or "default"
+
+
+# Plain string on purpose -- no f-string, so the JS braces stay sane.
+# B&W-first (SF): the ON state is solid border + filled + arrow prefix + bold;
+# OFF is a dashed outline. Shape carries the meaning, color is a bonus.
+ONDECK_CARD = """
+<div class="card">
+  <div class="muted"><b>&#127911; ON DECK &mdash; highlight who is playing</b> &mdash; tap a name when the DJ changes, tap again to unmark. The overlay follows in ~10&nbsp;s. Highlight only &mdash; it never moves sats.</div>
+  <div id="ondeckRow" class="muted" style="margin-top:8px;">checking for an open session&hellip;</div>
+</div>
+<div class="card">
+  <div class="muted"><b>&#128204; YOUR OVERLAY</b> &mdash; every venue has its own overlay URL. Yours:</div>
+  <div style="font-size:0.85rem;word-break:break-all;margin-top:6px;">
+    OBS browser source: <b>https://noderunnersradio.com/overlay?venue=__VENUE__</b><br>
+    Things shifted at your place? <a href="/overlay?venue=__VENUE__&amp;edit=1" target="_blank">Open the drag editor</a> &mdash; drag the pieces, press SAVE. Your host login is enough; OBS picks it up in ~10&nbsp;s without touching the source.
+  </div>
+</div>
+<script>
+(function(){
+  var row = document.getElementById('ondeckRow');
+  function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+  function draw(d){
+    if (!d.live){ row.textContent = 'No session open right now -- this card wakes up during a live sesh.'; return; }
+    var now = d.now_djs || [];
+    row.innerHTML = (d.djs || []).map(function(n){
+      var on = now.indexOf(n) >= 0;
+      return '<button type="button" class="odbtn" data-dj="' + esc(n) + '" style="margin:3px 6px 3px 0;padding:6px 12px;border:2px ' +
+        (on ? 'solid' : 'dashed') + ' #f5a623;background:' + (on ? '#f5a623' : 'transparent') +
+        ';color:' + (on ? '#10151a' : '#e6eff0') + ';font-weight:' + (on ? '700' : '400') + ';">' +
+        (on ? '&#9654; ' : '') + esc(n) + '</button>';
+    }).join('') || 'Session open, but the pool is empty.';
+  }
+  function poll(){ fetch('/api/livesplit', {cache:'no-store'}).then(function(r){ return r.json(); }).then(draw).catch(function(){}); }
+  document.addEventListener('click', function(e){
+    var b = e.target.closest('.odbtn'); if (!b) return;
+    b.disabled = true;
+    fetch('/dj/portal/ondeck', { method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'dj=' + encodeURIComponent(b.getAttribute('data-dj')) })
+      .then(function(r){ return r.json(); })
+      .then(function(d){ if (d.error){ row.textContent = d.error; setTimeout(poll, 1500); } else { poll(); } })
+      .catch(function(){ b.disabled = false; });
+  });
+  poll(); setInterval(poll, 10000);
+})();
+</script>"""
+
+
+def _ondeck_card_html(venue):
+    """Host-door cards: ON DECK highlight + the venue's own overlay links."""
+    return ONDECK_CARD.replace("__VENUE__", _venue_slug(venue))
+
+
 def _record_slot_request(dj_name, telegram_handle, nostr_npub, slot_date, hour_cet):
     con = sqlite3.connect(DB_PATH)
     con.execute(
@@ -833,7 +1235,7 @@ def _record_slot_request(dj_name, telegram_handle, nostr_npub, slot_date, hour_c
 def _list_registrations():
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT dj_name, lightning_address, lnbits_wallet_id, claim_code, avatar, payout_address FROM dj_registrations WHERE COALESCE(removed, 0) = 0 ORDER BY registered_at DESC"
+        "SELECT dj_name, lightning_address, lnbits_wallet_id, claim_code, avatar, payout_address, COALESCE(is_host, 0) FROM dj_registrations WHERE COALESCE(removed, 0) = 0 ORDER BY registered_at DESC"
     ).fetchall()
     con.close()
     return rows
@@ -949,6 +1351,36 @@ def _notify_new_slot_request(dj_name, date, hour):
     )
 
 
+def _tg_tag(dj_name):
+    """'@handle ' for a DJ who saved one on their portal, else ''. Used in GROUP
+    pings only -- a tag notifies without DM permission (Silly Goose, 2026-08-27).
+    Telegram handles are [A-Za-z0-9_], and ours are sanitised on save; strip
+    anything else so a stray value can never break a broadcast message."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT COALESCE(telegram_handle, '') FROM dj_registrations "
+            "WHERE dj_name = ? AND COALESCE(removed, 0) = 0", (dj_name,)).fetchone()
+        con.close()
+        h = "".join(c for c in ((row[0] if row else "") or "") if c.isalnum() or c == "_")[:32]
+        return ("@" + h + " ") if h else ""
+    except Exception:
+        return ""
+
+
+def _notify_new_host_sheet(host_name, date, venue, slots, start="20:00"):
+    # public doorbell (no captain-only detail) + the captain's own DM with the link
+    _telegram_send(
+        TELEGRAM_CHAT_ID,
+        f"{_tg_tag(host_name)}{host_name} offered to host a session: {date} from {start} at {venue}, "
+        f"{slots} DJ slot(s) -- awaiting the captain's approval. @noderunnersfm @plebroyale",
+    )
+    _telegram_send(
+        TELEGRAM_ADMIN_CHAT_ID,
+        f"New session sheet: {host_name}, {date} {start}, {venue}, {slots} slot(s). Approve: {ADMIN_URL}",
+    )
+
+
 def _hour_options(selected=20):
     opts = []
     for h in range(24):
@@ -987,7 +1419,7 @@ class Handler(BaseHTTPRequestHandler):
         row = _dj_row_full(reg_id)
         if not row:
             return self._html(200, PORTAL_LOGIN_HTML.replace("__RESULT__", '<p class="err">Unknown DJ -- log in again.</p>'))
-        _id, name, ln_addr, avatar, pass_hash, blurb, links, user_id, wallet_id, payout = row
+        _id, name, ln_addr, avatar, pass_hash, blurb, links, user_id, wallet_id, payout, is_host, venue_label, tg_handle = row
         src = ("/assets/avatars/" + avatar) if avatar else "/assets/avatar.webp"
         bal = _wallet_balance_sats(reg_id)
         bal_txt = (f"{bal:,} sats" if bal is not None
@@ -999,8 +1431,8 @@ class Handler(BaseHTTPRequestHandler):
             wallet_url = f"https://{LN_ADDRESS_DOMAIN}/wallet?usr={user_id}"
         else:
             wallet_url = "#"
-        pass_head = ("Set a passphrase -- from then on you log in with name + passphrase (your recovery code keeps working as backup):"
-                     if not pass_hash else "Change your passphrase:")
+        pass_head = ("Set a password -- from then on you log in with name + password (your recovery code keeps working as backup):"
+                     if not pass_hash else "Change your password:")
         link_vals = (links or "").split("\n")
         link_vals += [""] * (3 - len(link_vals))
         payout_state = ("Payouts currently go to <b>your own wallet</b> &#9889;" if payout
@@ -1016,8 +1448,13 @@ class Handler(BaseHTTPRequestHandler):
                 .replace("__LINK1__", _esc_attr(link_vals[0]))
                 .replace("__LINK2__", _esc_attr(link_vals[1]))
                 .replace("__LINK3__", _esc_attr(link_vals[2]))
+                .replace("__TG__", _esc_attr(tg_handle or ""))
                 .replace("__PAYOUT_VALUE__", _esc_attr(payout or ""))
-                .replace("__PAYOUT_STATE__", payout_state))
+                .replace("__PAYOUT_STATE__", payout_state)
+                .replace("__HOST_CARD__", _hosting_toggle_html(is_host, venue_label)
+                         + (_host_card_html(name, venue_label) if is_host else ""))
+                .replace("__LIVE_TAB__", ('<button type="button" data-pane="live">Live</button>' if is_host else ""))
+                .replace("__LIVE_CARDS__", (_ondeck_card_html(venue_label) if is_host else "")))
         return self._html(200, html)
 
     def do_GET(self):
@@ -1072,18 +1509,23 @@ class Handler(BaseHTTPRequestHandler):
             if viewer == hit[0]:
                 return self._serve_portal(hit[0])
             row = _dj_row_full(hit[0])
-            _id, name, ln_addr, avatar, _ph, blurb, links, _u, _w, _p = row
+            _id, name, ln_addr, avatar, _ph, blurb, links, _u, _w, _p, _ih, _venue, tg_handle = row
             src = ("/assets/avatars/" + avatar) if avatar else "/assets/avatar.webp"
             blurb_html = ("<p>" + _esc_attr(blurb) + "</p>") if blurb else ""
             link_html = "".join(
                 '<p><a href="' + _esc_attr(u) + '" target="_blank" rel="noopener nofollow">' + _esc_attr(u) + "</a></p>"
                 for u in (links or "").split("\n") if u
             )
+            tg = re.sub(r"[^A-Za-z0-9_]", "", (tg_handle or ""))
+            tg_line = (('<p class="muted">Find ' + _esc_attr(name) + ' on Telegram: '
+                        '<a href="https://t.me/' + tg + '" target="_blank" rel="noopener nofollow">@' + tg + '</a></p>')
+                       if tg else "")
             html = (PUBLIC_DJ_HTML.replace("__DJ_NAME__", _esc_attr(name))
                     .replace("__AVATAR_SRC__", src)
                     .replace("__BLURB__", blurb_html)
                     .replace("__LINKS__", link_html)
-                    .replace("__LN_ADDRESS__", _esc_attr(ln_addr or "")))
+                    .replace("__LN_ADDRESS__", _esc_attr(_p or ln_addr or ""))
+                    .replace("__TG_LINE__", tg_line))
             return self._html(200, html)
 
         if self.path.startswith("/admin/lnbits-audit"):
@@ -1140,11 +1582,36 @@ class Handler(BaseHTTPRequestHandler):
             djs = [
                 {"dj_name": n, "lightning_address": a or "", "wallet_id": w or "",
                  "claim_code": c or "", "avatar": ("/assets/avatars/" + av) if av else "",
-                 "payout_address": pa or ""}
-                for n, a, w, c, av, pa in _list_registrations()
+                 "payout_address": pa or "", "is_host": int(ih or 0)}
+                for n, a, w, c, av, pa, ih in _list_registrations()
             ]
             removed = [{"dj_name": n, "removed_at": ra or 0} for n, ra in _list_removed()]
-            data = json.dumps({"requests": reqs, "djs": djs, "removed": removed}).encode()
+            con = sqlite3.connect(DB_PATH)
+            srows = con.execute(
+                "SELECT id, host_name, session_date, venue_label, slots, status, COALESCE(note,''), COALESCE(start_time,'20:00') "
+                "FROM host_sessions ORDER BY session_date DESC, id DESC LIMIT 60").fetchall()
+            slotmap = {}
+            for ssid, pos, ln, dj in con.execute(
+                    "SELECT session_id, position, length_min, COALESCE(dj_name,'') FROM session_slots ORDER BY session_id, position"):
+                slotmap.setdefault(ssid, []).append({"position": pos, "length": ln, "dj": dj})
+            con.close()
+            sheets = []
+            for sid, h, d, v, s, st, n, stt in srows:
+                sl = slotmap.get(sid, [])
+                times = _slot_times(stt, [x["length"] for x in sl]) if sl else []
+                for t, x in zip(times, sl):
+                    x["at"] = t
+                sheets.append({"id": sid, "host": h, "date": d, "venue": v, "slots": s,
+                               "status": st, "note": n, "start": stt, "slotlist": sl})
+            con = sqlite3.connect(DB_PATH)
+            invites = [{"id": i, "name": nm, "contact": ct, "message": ms,
+                        "created_at": ca or 0, "handled": int(hd or 0)}
+                       for i, nm, ct, ms, ca, hd in con.execute(
+                           "SELECT id, name, COALESCE(contact,''), COALESCE(message,''), created_at, "
+                           "COALESCE(handled,0) FROM invite_requests ORDER BY id DESC LIMIT 100")]
+            con.close()
+            data = json.dumps({"requests": reqs, "djs": djs, "removed": removed,
+                               "sheets": sheets, "invites": invites}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -1249,7 +1716,7 @@ class Handler(BaseHTTPRequestHandler):
                 reg_id = None
             if not reg_id:
                 time.sleep(0.6)  # cheap brute-force damper
-                return self._html(403, PORTAL_LOGIN_HTML.replace("__RESULT__", '<p class="err">No match -- check the name and passphrase/code.</p>'))
+                return self._html(403, PORTAL_LOGIN_HTML.replace("__RESULT__", '<p class="err">No match -- check the name and password/code.</p>'))
             row = _dj_row(reg_id)
             dest = ("/" + quote(row[1])) if row else "/login"
             self.send_response(303)
@@ -1265,10 +1732,10 @@ class Handler(BaseHTTPRequestHandler):
             pw = (qs.get("pass") or [""])[0]
             pw2 = (qs.get("pass2") or [""])[0]
             if len(pw) < 12 or pw != pw2:
-                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">Passphrases must match and be at least 12 characters. <a href="/login">Back to your portal</a></p>')
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">Passwords must match and be at least 12 characters. <a href="/login">Back to your portal</a></p>')
             _set_pass(reg_id, pw)
             self.send_response(303)
-            self.send_header("Location", "/login")
+            self.send_header("Location", _portal_dest(reg_id))
             self.end_headers()
             return
 
@@ -1284,9 +1751,12 @@ class Handler(BaseHTTPRequestHandler):
                     u = "https://" + u
                 if u.startswith(("http://", "https://")) and "." in u[8:]:
                     links.append(u)
-            _set_profile(reg_id, blurb, "\n".join(links))
+            tg = (qs.get("telegram") or [""])[0].strip()
+            tg = tg.split("t.me/")[-1].lstrip("@")
+            tg = re.sub(r"[^A-Za-z0-9_]", "", tg)[:32]
+            _set_profile(reg_id, blurb, "\n".join(links), tg)
             self.send_response(303)
-            self.send_header("Location", "/login")
+            self.send_header("Location", _portal_dest(reg_id))
             self.end_headers()
             return
 
@@ -1299,9 +1769,157 @@ class Handler(BaseHTTPRequestHandler):
                 return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">That does not look like a Lightning Address (name@domain). <a href="/login">Back to your portal</a></p>')
             _set_payout(reg_id, addr)
             self.send_response(303)
-            self.send_header("Location", "/login")
+            self.send_header("Location", _portal_dest(reg_id))
             self.end_headers()
             return
+
+        if self.path == "/portal/hostmode":
+            # self-service hosting (SF's ruling 2026-07-30): the DJ flips it on
+            # their own page. The captain still approves every sheet.
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(403, "not logged in")
+            on = (qs.get("on") or ["0"])[0] == "1"
+            venue = (qs.get("venue") or [""])[0].strip()[:60]
+            con = sqlite3.connect(DB_PATH)
+            if on and venue:
+                con.execute("UPDATE dj_registrations SET is_host = 1, venue_label = ? WHERE id = ?", (venue, reg_id))
+            elif on:
+                con.execute("UPDATE dj_registrations SET is_host = 1 WHERE id = ?", (reg_id,))
+            else:
+                # switching off keeps the stored venue -- flipping back on is cheap
+                con.execute("UPDATE dj_registrations SET is_host = 0 WHERE id = ?", (reg_id,))
+            con.commit()
+            con.close()
+            self.send_response(303)
+            self.send_header("Location", _portal_dest(reg_id))
+            self.end_headers()
+            return
+
+        if self.path == "/portal/ondeck":
+            # HOST DOOR (SF 2026-08-13): the host marks who is on deck without
+            # the captain and without ever seeing an admin token. We verify the
+            # host here, then relay over localhost with a short-lived console
+            # session minted from the shared secret. Cosmetic only -- it drives
+            # the overlay highlight; settlement math is untouched.
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            host = _host_of(reg_id) if reg_id else None
+            if not host:
+                return self._json_resp(403, {"error": "host login required -- flip HOST MODE on in your portal first"})
+            dj = (qs.get("dj") or [""])[0].strip()[:80]
+            try:
+                r = requests.post(LIBRARY_API_URL + "/api/admin/livesplit/nowplaying",
+                                  data={"dj": dj},
+                                  headers={"Cookie": "nr_admin_session=" + _mint_console_session()},
+                                  timeout=10)
+                logging.info("host door: %s set on-deck %r -> %s", host[0], dj, r.status_code)
+                return self._json_resp(r.status_code, r.json())
+            except Exception as exc:
+                logging.warning("ondeck relay failed: %s", exc)
+                return self._json_resp(502, {"error": "station API unreachable -- tell the captain"})
+
+        if self.path == "/portal/overlaysave":
+            # HOST DOOR for the overlay drag editor. 2026-08-25 ruling (SF):
+            # personalised -- each host saves ONLY their own venue's overlay. The
+            # slug comes from their REGISTERED label, never from the form (the same
+            # rule the sheet endpoint always had). An empty label refuses instead
+            # of falling to "default", which is the captain's own overlay.
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            host = _host_of(reg_id) if reg_id else None
+            if not host:
+                return self._json_resp(403, {"error": "host login required -- flip HOST MODE on in your portal first"})
+            if not (host[1] or "").strip():
+                return self._json_resp(400, {"error": "Set your venue label on the Hosting card first -- your overlay carries it."})
+            venue = _venue_slug(host[1])   # the SAME slug the portal's overlay URL shows
+            layout = (qs.get("layout") or ["{}"])[0]
+            if len(layout) >= 4000:
+                return self._json_resp(400, {"error": "layout too big"})
+            try:
+                r = requests.post(LIBRARY_API_URL + "/api/admin/overlay/layout",
+                                  data={"venue": venue, "layout": layout},
+                                  headers={"Cookie": "nr_admin_session=" + _mint_console_session()},
+                                  timeout=10)
+                logging.info("host door: %s saved overlay %r -> %s", host[0], venue, r.status_code)
+                return self._json_resp(r.status_code, r.json())
+            except Exception as exc:
+                logging.warning("overlaysave relay failed: %s", exc)
+                return self._json_resp(502, {"error": "station API unreachable -- tell the captain"})
+
+        if self.path == "/portal/hostsheet":
+            reg_id = _portal_auth(self.headers.get("Cookie"))
+            if not reg_id:
+                return self._html(403, "not logged in")
+            con = sqlite3.connect(DB_PATH)
+            hrow = con.execute("SELECT dj_name, COALESCE(is_host, 0), COALESCE(venue_label, '') FROM dj_registrations WHERE id = ?", (reg_id,)).fetchone()
+            con.close()
+            if not hrow or not hrow[1]:
+                return self._html(403, '<p style="font-family:monospace;">Host mode is not switched on for your account -- flip it on your portal. <a href="/login">Back to your portal</a></p>')
+            date = (qs.get("date") or [""])[0].strip()
+            # the venue comes from the host's OWN registered label, never from
+            # the form -- a host plans sessions at their own place (SF's ruling)
+            venue = hrow[2].strip()[:60]
+            start = (qs.get("start") or [""])[0].strip()
+            lengths = []
+            for raw in (qs.get("slotlen") or []):
+                try:
+                    lengths.append(max(10, min(240, int(raw))))
+                except ValueError:
+                    pass
+            lengths = lengths[:12] or [60, 60, 60]
+            slot_djs = [(d or "").strip() for d in (qs.get("slotdj") or [])][:12]
+            if not venue:
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">Set your venue label on the Hosting card first -- your sheets carry it. <a href="/login">Back to your portal</a></p>')
+            if date < time.strftime("%Y-%m-%d"):
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">That date is in the past -- pick today or later. <a href="/login">Back to your portal</a></p>')
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date) or not re.match(r"^\d{1,2}:\d{2}$", start):
+                return self._html(400, '<p style="font-family:monospace;color:#ff6b6b;">The date or the start time did not come through whole -- use the pickers and send again. Nothing was lost on our side. <a href="/login">Back to your portal</a></p>')
+            _add_host_sheet(hrow[0], date, venue, start, lengths, slot_djs)
+            try:
+                _notify_new_host_sheet(hrow[0], date, venue, len(lengths), start)
+            except Exception:
+                pass          # a silent chat is never a reason to lose the sheet
+            # 2026-08-25: the silent 303 back to the portal looked like "the page
+            # reset" and the host resent the sheet. Say plainly that it worked.
+            return self._html(200, (
+                '<div style="font-family:ui-monospace,monospace;max-width:520px;margin:70px auto;'
+                'padding:0 20px;color:#e6eff0;">'
+                '<div style="background:#0f262d;border:2px solid #f7931a;border-radius:8px;padding:22px 24px;">'
+                '<p style="font-size:1.1rem;"><b>&#10004; Sheet sent &mdash; the captain has it.</b></p>'
+                '<p>' + _esc_attr(date) + ' at ' + _esc_attr(venue) + ' &middot; ' + str(len(lengths))
+                + ' slot(s), from ' + _esc_attr(start) + '.</p>'
+                '<p>It appears on the public calendar after the captain approves it. Its status shows '
+                'under <b>Your session sheets</b> on your page.</p>'
+                '<p><a href="' + _portal_dest(reg_id) + '" style="color:#f7931a;">&larr; Back to your page</a></p>'
+                '</div></div>'))
+
+        if self.path == "/invite-request":
+            # the beg box on the closed page (SF 2026-08-02): a stranger may
+            # leave word. No account is created, nothing is published. This is
+            # free text from the open internet, so: capped lengths, a honeypot
+            # field, a station-wide hourly brake, and escaping on display.
+            name = (qs.get("name") or [""])[0].strip()[:40]
+            contact = (qs.get("contact") or [""])[0].strip()[:80]
+            message = (qs.get("message") or [""])[0].strip()[:500]
+            if (qs.get("website") or [""])[0].strip():
+                return self._html(200, INVITE_THANKS_HTML)   # a bot filled the hidden field
+            if not name:
+                return self._html(400, CLOSED_HTML)
+            con = sqlite3.connect(DB_PATH)
+            recent = con.execute(
+                "SELECT COUNT(*) FROM invite_requests WHERE created_at > ?",
+                (int(time.time()) - 3600,)).fetchone()[0]
+            if recent < 30:
+                con.execute(
+                    "INSERT INTO invite_requests (name, contact, message, created_at) VALUES (?, ?, ?, ?)",
+                    (name, contact, message, int(time.time())))
+                con.commit()
+            con.close()
+            try:
+                _telegram_send(TELEGRAM_ADMIN_CHAT_ID,
+                               "Invite request from " + name + " (" + (contact or "no contact given") + "): " + message[:200])
+            except Exception:
+                pass
+            return self._html(200, INVITE_THANKS_HTML)
 
         if not REGISTRATION_OPEN and not self.path.startswith(("/admin", "/portal", "/avatars", "/u/")):
             return self._html(200, CLOSED_HTML)
@@ -1315,16 +1933,21 @@ class Handler(BaseHTTPRequestHandler):
             if _name_taken(name):
                 return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">That DJ name is already taken -- one DJ, one name, set in stone.</p>'))
             if len(pw) < 12 or pw != pw2:
-                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Passphrases must match and be at least 12 characters -- try 4 random words.</p>'))
+                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Passwords must match and be at least 12 characters -- try 4 random words.</p>'))
             if name.lower() in pw.lower():
-                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Do not put your DJ name inside your passphrase.</p>'))
+                return self._html(400, FORM_HTML.replace("__RESULT__", '<p class="err">Do not put your DJ name inside your password.</p>'))
             try:
                 result = create_dj_wallet(name, pass_hash=_hash_pass(pw))
+                try:
+                    _telegram_send(TELEGRAM_ADMIN_CHAT_ID,
+                                   f"New DJ registered themselves: {result['dj_name']} (the gate is OPEN)")
+                except Exception:
+                    pass
                 result_html = f"""
                 <div class="result">
                   <p>Welcome aboard, {result['dj_name']}!</p>
                   <p>Your Lightning Address:<br><b>{result['lightning_address']}</b></p>
-                  <p>Your RECOVERY CODE (write it down somewhere safe -- it's your way back in if you ever lose your passphrase):<br><b>{result['claim_code']}</b></p>
+                  <p>Your RECOVERY CODE (write it down somewhere safe -- it's your way back in if you ever lose your password):<br><b>{result['claim_code']}</b></p>
                   <p><a href="/login">Log in to your DJ portal</a> -- your sats, your avatar, your profile.</p>
                   <p><a href="/dj/request-slot?dj_name={quote(result['dj_name'])}">Request a DJ slot &rarr;</a></p>
                 </div>"""
@@ -1371,6 +1994,96 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
             return self._json_resp(200, {"reinstated": name})
 
+        if self.path == "/admin/regencode":
+            # Recovery codes are the way back in when a passphrase is lost. If one is
+            # ever seen by anyone but its owner (a screenshot, a shared screen), it is
+            # burnt -- this replaces it. Passphrases are untouched, so a DJ who still
+            # knows theirs never notices.
+            if not self._check_admin(qs):
+                return
+            name = (qs.get("name") or [""])[0].strip()
+            everyone = (qs.get("all") or [""])[0] == "1"
+            con = sqlite3.connect(DB_PATH)
+            if everyone:
+                rows = con.execute("SELECT id FROM dj_registrations WHERE COALESCE(removed, 0) = 0").fetchall()
+            elif name:
+                rows = con.execute("SELECT id FROM dj_registrations WHERE lower(dj_name) = lower(?)", (name,)).fetchall()
+            else:
+                con.close()
+                return self._json_resp(400, {"error": "need a name, or all=1"})
+            for (rid,) in rows:
+                con.execute("UPDATE dj_registrations SET claim_code = ? WHERE id = ?", (_new_code(), rid))
+            con.commit()
+            con.close()
+            # the new codes are never returned here -- SF reads them in the crew list
+            return self._json_resp(200, {"regenerated": len(rows)})
+
+        if self.path == "/admin/hostgrant":
+            if not self._check_admin(qs):
+                return
+            name = (qs.get("name") or [""])[0].strip()
+            grant = 1 if (qs.get("grant") or ["1"])[0] == "1" else 0
+            if name:
+                con = sqlite3.connect(DB_PATH)
+                con.execute("UPDATE dj_registrations SET is_host = ? WHERE lower(dj_name) = lower(?)", (grant, name))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"dj_name": name, "is_host": grant})
+
+        if self.path == "/admin/sheetdecide":
+            if not self._check_admin(qs):
+                return
+            try:
+                sid = int((qs.get("id") or ["0"])[0])
+            except ValueError:
+                sid = 0
+            action = (qs.get("action") or [""])[0]
+            note = (qs.get("note") or [""])[0].strip()[:200]
+            if action not in ("approve", "reject", "remove") or not sid:
+                return self._json_resp(400, {"error": "need id and action approve/reject/remove"})
+            status = {"approve": "published", "reject": "rejected", "remove": "removed"}[action]
+            was = "published" if action == "remove" else "pending"
+            con = sqlite3.connect(DB_PATH)
+            cur = con.execute(
+                "UPDATE host_sessions SET status = ?, note = ?, decided_at = ? WHERE id = ? AND status = ?",
+                (status, note or None, int(time.time()), sid, was))
+            con.commit()
+            changed = cur.rowcount
+            row = con.execute("SELECT host_name, session_date, venue_label, COALESCE(start_time,'') FROM host_sessions WHERE id = ?", (sid,)).fetchone()
+            con.close()
+            if not changed:
+                return self._json_resp(409, {"error": "sheet already decided or unknown id"})
+            # decision pings (SF 2026-07-30): approve + remove ring the GROUP,
+            # a reject stays between captain and host (admin channel + note)
+            try:
+                hn, dt, vn, st_t = row
+                if action == "approve":
+                    _telegram_send(TELEGRAM_CHAT_ID, f"SESSION CONFIRMED: {dt} from {st_t} at {vn}, hosted by {_tg_tag(hn)}{hn} -- the calendar is live. @noderunnersfm")
+                elif action == "remove":
+                    _telegram_send(TELEGRAM_CHAT_ID, f"SESSION CANCELLED: {dt} at {vn} (hosted by {_tg_tag(hn)}{hn}) is off the calendar." + (f" Reason: {note}" if note else ""))
+                _telegram_send(TELEGRAM_ADMIN_CHAT_ID, f"Sheet {sid} {status}: {hn}, {dt}, {vn}." + (f" Note: {note}" if note else ""))
+            except Exception:
+                pass
+            return self._json_resp(200, {"id": sid, "status": status})
+
+        if self.path == "/admin/invite-handled":
+            if not self._check_admin(qs):
+                return
+            try:
+                iid = int((qs.get("id") or ["0"])[0])
+            except ValueError:
+                iid = 0
+            act = (qs.get("action") or ["handled"])[0]
+            if iid:
+                con = sqlite3.connect(DB_PATH)
+                if act == "delete":
+                    con.execute("DELETE FROM invite_requests WHERE id = ?", (iid,))
+                else:
+                    con.execute("UPDATE invite_requests SET handled = 1 WHERE id = ?", (iid,))
+                con.commit()
+                con.close()
+            return self._json_resp(200, {"id": iid, "action": act})
+
         if self.path == "/admin/request-delete":
             if not self._check_admin(qs):
                 return
@@ -1380,7 +2093,9 @@ class Handler(BaseHTTPRequestHandler):
                 rid = 0
             if rid:
                 try:
-                    shutil.copy2(DB_PATH, DB_PATH + time.strftime(".bak-purge-%Y%m%d"))
+                    bak = DB_PATH + time.strftime(".bak-purge-%Y%m%d")
+                    shutil.copy2(DB_PATH, bak)
+                    os.chmod(bak, 0o600)   # DB holds codes + wallet keys; never world-readable
                 except OSError:
                     pass
                 con = sqlite3.connect(DB_PATH)
@@ -1396,7 +2111,9 @@ class Handler(BaseHTTPRequestHandler):
             if name:
                 # only already-removed rows can be purged; dated DB backup first
                 try:
-                    shutil.copy2(DB_PATH, DB_PATH + time.strftime(".bak-purge-%Y%m%d"))
+                    bak = DB_PATH + time.strftime(".bak-purge-%Y%m%d")
+                    shutil.copy2(DB_PATH, bak)
+                    os.chmod(bak, 0o600)   # DB holds codes + wallet keys; never world-readable
                 except OSError:
                     pass
                 con = sqlite3.connect(DB_PATH)

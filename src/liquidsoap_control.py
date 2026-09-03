@@ -48,12 +48,18 @@ def _annotate(meta: dict) -> str:
     for k, v in meta.items():
         if v is None or v == "":
             continue
+        # newlines are COMMAND SEPARATORS on the liquidsoap control socket:
+        # a title containing one could smuggle a second command through.
+        # Nothing user-facing reaches here today (pushes use DB values), but
+        # this is the boundary, so it defends itself. (2026-07-29 audit)
         safe = str(v).replace("\\", "\\\\").replace('"', '\\"')
+        safe = "".join(ch for ch in safe if ord(ch) >= 32 and ord(ch) != 127)[:200]
         parts.append(f'{k}="{safe}"')
     return f"annotate:{','.join(parts)}:" if parts else ""
 
 
 def push_track(local_path: str, rights_class: str = "", source: str = "",
+               artist: str = "", title: str = "",
                socket_path: str = DEFAULT_SOCKET) -> str:
     """Queue a track for near-immediate playback. Returns the request ID Liquidsoap assigns.
 
@@ -61,7 +67,10 @@ def push_track(local_path: str, rights_class: str = "", source: str = "",
     can attribute the play to the right royalty pool. Omit them and behaviour is
     identical to before (a bare push) -- fully backward compatible.
     """
-    uri = f"{_annotate({'rights_class': rights_class, 'source': source})}{local_path}"
+    # artist/title matter for URL plays (Wavlake): a remote URI carries no tags,
+    # so without these the overlay, queue and history all show "? - ?"
+    # (first V4V test, 2026-07-29).
+    uri = f"{_annotate({'rights_class': rights_class, 'source': source, 'artist': artist, 'title': title})}{local_path}"
     return _send(socket_path, f"jukebox.push {uri}")
 
 

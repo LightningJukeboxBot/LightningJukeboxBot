@@ -66,6 +66,11 @@ class TelegramChatRelay:
         self._history = deque(maxlen=MAX_HISTORY)  # fallback only, when rds is None
         self._lock = threading.Lock()
         self._offset = 0
+        if rds is not None:
+            try:
+                self._offset = int(rds.get(REDIS_KEY + ":offset") or 0)
+            except Exception:
+                pass
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
@@ -88,6 +93,12 @@ class TelegramChatRelay:
                 data = self._api("getUpdates", offset=self._offset, timeout=LONG_POLL_TIMEOUT_S)
                 for update in data.get("result", []):
                     self._offset = update["update_id"] + 1
+                    if self.rds is not None:
+                        try:
+                            self.rds.set(REDIS_KEY + ":offset", self._offset)
+                        except Exception:
+                            pass
+                    is_edit = "message" not in update
                     msg = update.get("message") or update.get("edited_message")
                     if not msg or "from" not in msg:
                         continue
@@ -103,17 +114,40 @@ class TelegramChatRelay:
                         "date": msg["date"],
                         "media": _extract_media(msg),
                     }
-                    self._store(entry)
+                    self._store(entry, replace=is_edit)
             except Exception as e:
                 logging.warning("telegram_chat_relay poll failed: %s", e)
                 time.sleep(5)  # back off before retrying; never let a network hiccup kill the thread
 
-    def _store(self, entry: dict):
+    def _store(self, entry: dict, replace: bool = False):
+        # One Telegram message = ONE row, forever (2026-08-26: edits and restart
+        # re-deliveries were double-writing GIFs -- proven by identical file_id +
+        # identical timestamp pairs in the history). Same message_id already
+        # stored: an EDIT rewrites that row in place; anything else is dropped.
         if self.rds is not None:
+            try:
+                tail = self.rds.lrange(REDIS_KEY, -200, -1)
+                llen = self.rds.llen(REDIS_KEY)
+                for i, raw in enumerate(tail):
+                    try:
+                        old = json.loads(raw)
+                    except Exception:
+                        continue
+                    if old.get("id") == entry["id"] and old.get("date") == entry["date"]:
+                        if replace:
+                            self.rds.lset(REDIS_KEY, llen - len(tail) + i, json.dumps(entry))
+                        return
+            except Exception:
+                pass          # dedupe is best-effort; storing twice beats losing chat
             self.rds.rpush(REDIS_KEY, json.dumps(entry))
             self.rds.ltrim(REDIS_KEY, -MAX_HISTORY, -1)
             return
         with self._lock:
+            for i, old in enumerate(self._history):
+                if old.get("id") == entry["id"] and old.get("date") == entry["date"]:
+                    if replace:
+                        self._history[i] = entry
+                    return
             self._history.append(entry)
 
     def recent(self, n: int = 50) -> list:

@@ -20,6 +20,7 @@ second pass over 7 TB takes minutes, not hours.
 
 import argparse
 import hashlib
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -64,7 +65,11 @@ def tags(p: Path) -> dict:
         m = MutagenFile(p, easy=True)
         if m is None:
             return {}
-        g = lambda k: (m.get(k) or [None])[0]
+        # strip(): real tags carry trailing whitespace ("The Flashbulb    ")
+        # and that dirt flowed into the playlog verbatim (seen 2026-07-29)
+        def g(k):
+            v = (m.get(k) or [None])[0]
+            return v.strip() if isinstance(v, str) else v
         isrc = g("isrc")
         if not isrc:                      # easy mode misses ISRC on some formats
             raw = MutagenFile(p)
@@ -87,18 +92,29 @@ def tags(p: Path) -> dict:
         return {}
 
 
+# Track numbers come in many dialects: "02. ", "02 - ", "02_", "02 ",
+# and vinyl-style "A2. ". One strip, never more.
+_TRACKNO = re.compile(r"^(?:\d{1,3}|[A-Da-d]\d{1,2})[.)]?[ _-]+")
+
+
 def from_filename(p: Path) -> tuple:
     """
     Untagged files are the norm in a big messy collection.
     'Daft Punk - Around The World.flac' -> ('Daft Punk', 'Around The World')
-    Strips a leading track number if present: '03 - Artist - Title'
+
+    Same rules as the liquidsoap playlog fallback (proven in /tmp/liqtest2.liq,
+    2026-07-29). The scanner and the player MUST agree on what a filename
+    means -- they disagreeing is how artist="02. S.E.B" reached site search:
+      1. underscores read as spaces
+      2. strip ONE leading track number ('02. ', '04 - ', '03_', vinyl 'A2. ')
+      3. split on the FIRST spaced ' - ' only
+      4. fill the artist ONLY on that spaced separator -- a wrong artist is a
+         wrong royalty attribution, so ambiguous names stay whole in the title
     """
-    stem = p.stem
-    parts = [s.strip() for s in stem.split(" - ") if s.strip()]
-    if parts and parts[0].isdigit():          # drop leading track number
-        parts = parts[1:]
-    if len(parts) >= 2:
-        return parts[0], " - ".join(parts[1:])
+    stem = _TRACKNO.sub("", p.stem.replace("_", " "), count=1).strip()
+    if " - " in stem:
+        artist, title = stem.split(" - ", 1)
+        return artist.strip(), title.strip()
     return None, stem
 
 
