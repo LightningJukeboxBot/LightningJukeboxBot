@@ -7,7 +7,6 @@ import logging
 from spotipy import CacheHandler
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from time import time
 
 class SpotifySettings:
     def __init__(self, tguserid):
@@ -134,22 +133,7 @@ def get_track_title_from_uri(sp, uri):
 
     return get_track_title_from_item(item)
 
-async def get_price(chat_id):
-    """
-    Gets the price for tracks in this group. Defaults to the initial price of 21 sats
-    """
-    rediskey = f"group:{chat_id}"
-    price = settings.rds.hget(rediskey,"price")
-    if price is None:
-        price = settings.price
-    return int(price)
 
-async def set_price(chat_id, price):
-    """
-    Set the price in a group
-    """
-    rediskey = f"group:{chat_id}"
-    price = settings.rds.hset(rediskey,"price",price)
 
 async def create_auth_manager(chat_id, client_id, client_secret):
     logging.debug("create auth manager")
@@ -230,50 +214,7 @@ async def get_spotify_settings(userid):
         logging.info(data)
     return sps
 
-async def delete_chat(chat_id):
-    rediskey = f"group:{chat_id}"
-    settings.rds.delete(rediskey)
-    
-async def get_history(chat_id, maxlen):
-    rediskey = f"history:{chat_id}"
-    titles = []
-    for i in range(0, min(maxlen,settings.rds.llen(rediskey))):
-        titles.append(settings.rds.lindex(rediskey, i).decode('utf-8'))
-    return titles
 
-async def update_history(chat_id: int, title: str) -> None:
-    rediskey = f"history:{chat_id}"
-    currenttitle = settings.rds.lindex(rediskey,0)
 
-    if currenttitle is None:
-        settings.rds.lpush(rediskey,title)
-    else:
-        currenttitle = currenttitle.decode('utf-8')
-        if currenttitle != title:
-            settings.rds.lpush(rediskey,title)
-            
-        if settings.rds.llen(rediskey) > 100:
-            settings.rds.rpop(rediskey)
-                    
-    # update last played entry
-    settings.rds.hset(f"lastplayed:{chat_id}",title,int(time()))
-        
-async def get_donation_fee(chat_id: int) -> int:
-    """
-    Gets the donation fee
-    """
-    rediskey = f"group:{chat_id}"
-    fee = settings.rds.hget(rediskey,"donation_fee")    
-    if fee is None:
-        fee = settings.donation_fee
-    fee = int(fee)
-    if fee < 0:
-        fee = settings.donation_fee
-    return int(fee)
 
-async def set_donation_fee(chat_id: int, fee: int) -> None:
-    """
-    Sets the donation fee
-    """
-    rediskey = f"group:{chat_id}"
-    settings.rds.hset(rediskey,"donation_fee",fee)    
+

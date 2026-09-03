@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+venv/
+
+# Never publish backups, archives or deploy scripts.
+# 2026-07-27: 148 rollback files + patch scripts were moved out of the public
+# web root into site-archive/ -- which lives INSIDE this repo's working tree on
+# the server. Without these lines, one `git add .` would push the lot to a
+# PUBLIC repo. They hold no credentials, but they don't belong here either.
+site-archive/
+site-backups/
+site/
+*.bak
+*.bak-*
+patch_*.py
+
+# Anything that could ever hold a credential or personal data.
+*.env
+.env
+*.sqlite3
+*.sqlite3-journal
+*.db
+
+# Local analysis output, not code.
+music_duplicates.csv
+music_index_scan.csv
+music_dedup_safe_delete_preview.txt
+*.log

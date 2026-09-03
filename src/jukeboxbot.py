@@ -69,6 +69,7 @@ from lnbits import LNbits
 import userhelper
 from userhelper import User
 import spotifyhelper
+import jukeboxstate
 from spotifyhelper import SpotifySettings, CacheJukeboxHandler
 import settings
 import jukeboxtexts
@@ -228,8 +229,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 @adminonly
 @group_chat_only
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    price = await spotifyhelper.get_price(update.effective_chat.id)
-    donation = await spotifyhelper.get_donation_fee(update.effective_chat.id)
+    price = await jukeboxstate.get_price(update.effective_chat.id)
+    donation = await jukeboxstate.get_donation_fee(update.effective_chat.id)
     
     if update.message.text == '/price':
         await send_telegram_message(
@@ -260,8 +261,8 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         newdonation = newprice
 
     # update 
-    await spotifyhelper.set_price(update.effective_chat.id, newprice)
-    await spotifyhelper.set_donation_fee(update.effective_chat.id, newdonation)
+    await jukeboxstate.set_price(update.effective_chat.id, newprice)
+    await jukeboxstate.set_donation_fee(update.effective_chat.id, newdonation)
         
     await send_telegram_message(
         context=context,
@@ -536,7 +537,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
         
     text = "Track history:\n"
-    history = await spotifyhelper.get_history(update.effective_chat.id,20)
+    history = await jukeboxstate.get_history(update.effective_chat.id,20)
     for title in history:
         text += f"{title}\n"
         
@@ -624,7 +625,7 @@ async def search_track(update: Update, context: ContextTypes.DEFAULT_TYPE, searc
             chat_id=chat_id,
             text=f"@{update.effective_user.username} suggests to play tracks from the '{result['name']}' playlist.",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"Pay {await spotifyhelper.get_price(update.effective_chat.id)} sats for a random track", callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.playrandom,playlistid)))
+                InlineKeyboardButton(f"Pay {await jukeboxstate.get_price(update.effective_chat.id)} sats for a random track", callback_data = telegramhelper.add_command(TelegramCommand(0,telegramhelper.playrandom,playlistid)))
             ]]),
             delete_timeout=settings.delete_message_timeout_long)
 
@@ -723,12 +724,12 @@ async def dj(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message.reply_to_message is None:
         message = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text=f"The /dj command only works as a reply to another user. If no amount is specified, the price for a track, {await spotifyhelper.get_price(update.effective_chat.id)} is sent.")
+            text=f"The /dj command only works as a reply to another user. If no amount is specified, the price for a track, {await jukeboxstate.get_price(update.effective_chat.id)} is sent.")
         context.job_queue.run_once(delete_message, settings.delete_message_timeout_short, data={'message':message})        
         return
 
     # parse the amount to be paid
-    amount = await spotifyhelper.get_price(update.effective_chat.id)
+    amount = await jukeboxstate.get_price(update.effective_chat.id)
     result = re.search("/[a-z]+(\s+([0-9]+))?\s*$",update.message.text)
     if result is not None:
         amount = result.groups()[1]
@@ -853,7 +854,7 @@ async def callback_paid_invoice(invoice: Invoice):
      # make donation to the bot
     jukeboxbot = await userhelper.get_or_create_user(settings.bot_id)
     donator = await userhelper.get_or_create_user(invoice.recipient.userid)
-    donation_amount : int = await spotifyhelper.get_donation_fee(invoice.chat_id)
+    donation_amount : int = await jukeboxstate.get_donation_fee(invoice.chat_id)
     donation_amount = min(donation_amount,invoice.amount_to_pay)
     if donation_amount > 0:
         donation_invoice = await invoicehelper.create_invoice(jukeboxbot, donation_amount, "donation to the bot")
@@ -1042,7 +1043,7 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
             application.bot_data[chat_id]['now_playing_title'] = title
                         
             # update history
-            await spotifyhelper.update_history(chat_id, title)                
+            await jukeboxstate.update_history(chat_id, title)                
 
             # update interval when to update now playing message
             interval  = ( currenttrack['item']['duration_ms'] - currenttrack['progress_ms'] ) / 1000
@@ -1074,14 +1075,14 @@ async def callback_now_playing(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.pin_chat_message(chat_id=chat_id, message_id=message.id)
             except ChatMigrated as err:
                 logging.info(f"{chat_id}:Chat migrated from to {err.new_chat_id}. Deleting old settings")
-                await spotifyhelper.delete_chat(chat_id)
+                await jukeboxstate.delete_chat(chat_id)
             except BadRequest as err:
                 if err.message == "Chat not found":
                     logging.info(f"{chat_id}:Chat not found, deleting")
-                    await spotifyhelper.delete_chat(chat_id)
+                    await jukeboxstate.delete_chat(chat_id)
                 elif err.message == "Not enough rights to send text messages to the chat":
                     logging.info(f"{chat_id}:Bot has insufficient privileges")
-                    await spotifyhelper.delete_chat(chat_id)
+                    await jukeboxstate.delete_chat(chat_id)
                 else:
                     logging.error(f"{chat_id}:BadRequest with unknown error message: {err.message}")                                       
             except Exception as e:
@@ -1285,7 +1286,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # get the track price
-    track_price = int(await spotifyhelper.get_price(update.effective_chat.id))
+    track_price = int(await jukeboxstate.get_price(update.effective_chat.id))
 
     # the commands from here on modify a list of tracks to be queue
     # and we have to check hat we have spotify available
@@ -1440,7 +1441,7 @@ async def callback_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
         # make donation to the bot
         jukeboxbot = await userhelper.get_or_create_user(settings.bot_id)
-        donation_amount : int = await spotifyhelper.get_donation_fee(invoice.chat_id)
+        donation_amount : int = await jukeboxstate.get_donation_fee(invoice.chat_id)
         donation_amount = min(donation_amount,invoice.amount_to_pay)
         if donation_amount > 0:
             donation_invoice = await invoicehelper.create_invoice(jukeboxbot, donation_amount, "donation to the bot")
@@ -1707,7 +1708,7 @@ async function sendPayment() {{
         if not sp:
             return JSONResponse({"status":400,"message":"Incomplete request, sp is None"})
         
-        amount_to_pay = get_amount_to_pay(sp, int(await spotifyhelper.get_price(chat_id)), [track_id])
+        amount_to_pay = get_amount_to_pay(sp, int(await jukeboxstate.get_price(chat_id)), [track_id])
 
         recipient = await userhelper.get_group_owner(chat_id)
         invoice_title = f"'{spotifyhelper.get_track_title_from_item(track)}'"
@@ -1823,8 +1824,8 @@ async function sendPayment() {{
 
         message = {
             'now':{},
-            'price': await spotifyhelper.get_price(chat_id),
-            'donation': await spotifyhelper.get_donation_fee(chat_id)
+            'price': await jukeboxstate.get_price(chat_id),
+            'donation': await jukeboxstate.get_donation_fee(chat_id)
         }
 
                
@@ -2186,7 +2187,7 @@ async function sendPayment() {{
         track = sp.track(track_id)        
         track_len = track['duration_ms'] / 1000
         
-        amount_to_pay = int(await spotifyhelper.get_price(chat_id))
+        amount_to_pay = int(await jukeboxstate.get_price(chat_id))
         if ( track_len > 600 ):
             amount_to_pay = 10 * amount_to_pay
 #        if ( track_len > 1800 ):

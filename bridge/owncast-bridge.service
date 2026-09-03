@@ -1,0 +1,29 @@
+# Owncast bridge -- the station's own licensed audio (liquidsoap -> Icecast)
+# plus the ship image and a live "Artist - Title" strip, fed to Owncast as the
+# video stream. Built 2026-07-27, gained now-playing text 2026-07-28.
+#
+# The ffmpeg command lives in bridge-run.sh so systemd never has to parse a
+# filter string full of colons and commas.
+#
+# LIVE SESSIONS: this holds Owncast's single ingest slot. Stop it before a real
+# DJ streams, start it after -- the captain's console does this automatically
+# via the lever; by hand it is:
+#   sudo systemctl stop owncast-bridge
+#   sudo systemctl start owncast-bridge
+
+[Unit]
+Description=Owncast bridge - station audio + ship image + now playing
+After=network-online.target icecast2.service owncast.service
+Wants=icecast2.service owncast.service
+
+[Service]
+User=sf
+Group=sf
+EnvironmentFile=/etc/owncast-bridge.env
+ExecStart=/bin/bash /home/sf/LightningJukeboxBot/bridge/bridge-run.sh
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

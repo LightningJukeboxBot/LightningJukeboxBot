@@ -1,0 +1,18 @@
+[Unit]
+Description=Noderunners reverse bridge - live DJ audio from Owncast into Icecast /live
+After=network-online.target icecast2.service
+Wants=network-online.target
+# never give up between lever-on and the DJ pressing go -- a sesh can sit
+# DJ-less for many minutes and the reverse must still catch them (2026-07-30)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=sf
+EnvironmentFile=/etc/owncast-reverse.env
+ExecStart=/bin/bash /home/sf/LightningJukeboxBot/bridge/reverse-run.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
