@@ -2058,7 +2058,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 hn, dt, vn, st_t = row
                 if action == "approve":
-                    _telegram_send(TELEGRAM_CHAT_ID, f"SESSION CONFIRMED: {dt} from {st_t} at {vn}, hosted by {_tg_tag(hn)}{hn} -- the calendar is live. @noderunnersfm")
+                    _telegram_send(TELEGRAM_CHAT_ID, f"SESSION CONFIRMED: {dt} from {st_t} at {vn}, hosted by {_tg_tag(hn)}{hn} -- the calendar is live. @noderunnersfm @plebroyale")
                 elif action == "remove":
                     _telegram_send(TELEGRAM_CHAT_ID, f"SESSION CANCELLED: {dt} at {vn} (hosted by {_tg_tag(hn)}{hn}) is off the calendar." + (f" Reason: {note}" if note else ""))
                 _telegram_send(TELEGRAM_ADMIN_CHAT_ID, f"Sheet {sid} {status}: {hn}, {dt}, {vn}." + (f" Note: {note}" if note else ""))
