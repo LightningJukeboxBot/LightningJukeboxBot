@@ -1,0 +1,28 @@
+[Unit]
+Description=Noderunners Radio - Nostr jukebox (Jukebox Lightning Bot): mention -> results -> number -> invoice -> queued
+Documentation=file:/usr/local/bin/nr-nostr-jukebox
+After=network-online.target library-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sf
+Group=sf
+# NOSTR_NSEC, written by nr-nostr-keys.py (600, owner sf); the program also reads the file itself when run from a shell
+EnvironmentFile=-/home/sf/.config/nr-nostr/nostr.env
+Environment=NR_NOSTR_HOME=/home/sf/.config/nr-nostr
+Environment=NR_NOSTR_PATH=/usr/local/bin/nr-nostr
+Environment=NR_ANNOUNCER_HOME=/home/sf/.config/nr-announcer
+Environment=NR_ANNOUNCER_PATH=/usr/local/bin/nr-announcer
+ExecStart=/usr/bin/python3 /usr/local/bin/nr-nostr-jukebox
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

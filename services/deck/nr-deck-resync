@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# nr-deck-resync -- put the rotation back on the right card after a liquidsoap restart.
+#
+# THE FAULT (2026-09-04)
+#   liquidsoap reads /var/lib/jukebox/rotation.m3u from LINE 1 every time it starts.
+#   The deal (nr-shuffle, every 6 h) is the only thing that moves the deck cursor and
+#   cuts a fresh window, so after a restart the air replays the window from the top
+#   until the next deal -- and that deal then counts the replays as aired and skips
+#   the same number of never-aired cards. Unattended package upgrades restarted
+#   liquidsoap on 2026-09-02 06:29 (29 cards replayed) and 2026-09-04 06:05 (39).
+#
+# WHAT THIS DOES
+#   Runs every 5 minutes from its own timer, as user sf. It deals ONLY when it can
+#   prove the air sits on a stale window:
+#     1. no captain's-playlist override is on air (rotation.override absent)
+#     2. liquidsoap is active
+#     3. liquidsoap started AFTER the window file was written  <- the fault signature
+#        (or: an earlier try for this same start did not finish with a confirmed
+#        reload -- then the window on disk is fresh but the air still plays the old one)
+#     4. at least one rotation row was logged since the last deal (else line 1 IS right)
+#     5. it has not already resynced this liquidsoap start (stamp), and not in the
+#        last 15 minutes; at most 3 tries per start
+#   Then it waits for the control socket (the poke needs it), writes the stamp, and
+#   runs the existing deal under `timeout`. The deal moves the cursor by what aired,
+#   installs the next window and pokes `rotation.reload`, so the next track is the
+#   right card. After a confirmed reload this script is idle again -- self-clearing.
+#   Cost of a restart with this in place: one or two tracks replayed AND one or two
+#   never-aired cards skipped (the deal counts the replays), instead of 30-40 of each.
+#
+# WHAT IT NEVER DOES
+#   It never edits liquidsoap.service, never restarts liquidsoap, never writes the
+#   play-log, never deals when the socket is absent (a window nobody reads is worse
+#   than no window), and never touches the deck when a captain's playlist is on air.
+#
+# USAGE
+#   nr-deck-resync            act if needed (the timer's call)
+#   nr-deck-resync --check    print the verdict, change nothing (writes no stamp, no log)
+#
+# EXIT CODES  0 nothing to do / resynced fine   1 could not resync (see the journal)
+
+set -u
+
+LIVE="${NR_ROTATION:-/var/lib/jukebox/rotation.m3u}"
+SEEN="${NR_SEEN:-/var/lib/jukebox/deck.playcount}"
+OVERRIDE="${NR_ROTATION_OVERRIDE:-/var/lib/jukebox/rotation.override}"
+PLAYLOG="${NR_PLAYLOG:-/var/log/liquidsoap/playlog.tsv}"
+SOCK="${NR_LIQ_SOCK:-/var/run/liquidsoap/noderunners.sock}"
+STAMP="${NR_RESYNC_STAMP:-/var/lib/jukebox/.deck-resync.stamp}"
+LOGF="${NR_RESYNC_LOG:-/var/lib/jukebox/deck-resync.log}"
+DEAL="${NR_DEAL:-/usr/local/bin/nr-shuffle}"
+DECKLOCK="${NR_DECK_LOCK:-/var/lib/jukebox/.deck.lock}"
+MIN_GAP_S=900          # never act twice within 15 minutes
+MAX_TRIES=3            # per liquidsoap start, when the deal or its poke failed
+DEAL_TIMEOUT_S=300     # bounds nr-shuffle's unbounded flock from the outside
+
+CHECK=0
+case "${1:-}" in
+  "") ;;
+  --check) CHECK=1 ;;
+  *) echo "usage: nr-deck-resync [--check]" >&2; exit 64 ;;
+esac
+
+log() {
+  line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') nr-deck-resync: $*"
+  echo "$line"
+  [ "$CHECK" = 1 ] || echo "$line" >> "$LOGF" 2>/dev/null || true
+}
+stamp() {   # $1 = status, $2 = tries; never in --check mode
+  [ "$CHECK" = 1 ] && return 0
+  if ! echo "$s_epoch $now $1 $2" > "$STAMP" 2>/dev/null; then
+    log "WARNING: could not write the stamp $STAMP -- the 15-minute gap cannot be enforced"
+  fi
+}
+
+# ---- 1  a captain's playlist on air? then the deck is not ours to touch ----------
+if [ -e "$OVERRIDE" ]; then
+  [ "$CHECK" = 1 ] && log "override file present ($OVERRIDE): a captain's playlist is on air -- not touching the deck"
+  exit 0
+fi
+
+# ---- 2  liquidsoap running? ------------------------------------------------------
+if ! systemctl is-active --quiet liquidsoap; then
+  [ "$CHECK" = 1 ] && log "liquidsoap is not active -- nothing to resync"
+  exit 0
+fi
+
+# ---- 3  when did liquidsoap start, when was the window written, what does the stamp say?
+ts="$(systemctl show liquidsoap -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+if [ -z "$ts" ]; then
+  log "cannot read liquidsoap's start time -- doing nothing"
+  exit 0
+fi
+s_epoch="$(date -d "$ts" +%s 2>/dev/null || true)"
+case "$s_epoch" in ''|*[!0-9]*) log "cannot parse start time '$ts' -- doing nothing"; exit 0 ;; esac
+w_epoch="$(stat -c %Y "$LIVE" 2>/dev/null || true)"
+case "$w_epoch" in ''|*[!0-9]*) log "no window file at $LIVE -- doing nothing"; exit 0 ;; esac
+now="$(date +%s)"
+st_start=""; st_last=0; st_status=""; st_tries=0
+if [ -r "$STAMP" ]; then
+  read -r st_start st_last st_status st_tries < "$STAMP" || true
+  case "$st_last" in ''|*[!0-9]*) st_last=0 ;; esac
+  case "$st_tries" in ''|*[!0-9]*) st_tries=0 ;; esac
+fi
+# an unfinished earlier try for THIS start: the window on disk is fresh, but the air still plays the old one
+unfinished=0
+if [ "$st_start" = "$s_epoch" ] && [ "$st_status" != "ok" ] && [ "$st_status" != "gaveup" ]; then unfinished=1; fi
+# same-second tie counts as "after": a needless re-deal is idempotent, a missed one costs hours
+if [ "$s_epoch" -lt "$w_epoch" ] && [ "$unfinished" = 0 ]; then
+  [ "$CHECK" = 1 ] && log "ok: the window was dealt after liquidsoap started ($ts) -- the air is on the dealt position"
+  exit 0
+fi
+
+# ---- 4  has anything aired from this window since the last deal? ----------------
+if [ ! -r "$PLAYLOG" ]; then
+  log "WARNING: play-log $PLAYLOG is not readable -- refusing to act blind"
+  exit 1
+fi
+# the SAME match string as nr-shuffle line 99: a play row whose source starts with "rotation"
+now_count="$(grep -c "$(printf '\t')play$(printf '\t')rotation" "$PLAYLOG" 2>/dev/null)"
+now_count="${now_count:-0}"
+case "$now_count" in ''|*[!0-9]*) now_count=0 ;; esac
+seen="$(cat "$SEEN" 2>/dev/null || echo "")"
+case "$seen" in ''|*[!0-9]*) log "WARNING: $SEEN unreadable or not a number ('$seen') -- refusing to act blind"; exit 1 ;; esac
+aired=$(( now_count - seen ))
+if [ "$aired" -le 0 ] && [ "$unfinished" = 0 ]; then
+  [ "$CHECK" = 1 ] && log "ok: liquidsoap restarted ($ts) but nothing has aired since the last deal ($now_count rows = $seen) -- line 1 is the right card"
+  exit 0
+fi
+
+# ---- 5  already handled this start?  gave up?  too soon? -------------------------
+if [ "$st_start" = "$s_epoch" ]; then
+  if [ "$st_status" = "ok" ]; then
+    [ "$CHECK" = 1 ] && log "ok: this liquidsoap start ($ts) was already resynced"
+    exit 0
+  fi
+  if [ "$st_status" = "gaveup" ]; then
+    [ "$CHECK" = 1 ] && log "gave up on this liquidsoap start ($ts) after $st_tries tries -- run one deal by hand:  sudo systemctl start nr-shuffle.service"
+    exit 0
+  fi
+  if [ "$st_tries" -ge "$MAX_TRIES" ]; then
+    log "WARNING: gave up on this liquidsoap start ($ts) after $st_tries failed tries -- the air may be on a stale window; run one deal by hand:  sudo systemctl start nr-shuffle.service   (NEVER sudo nr-shuffle itself: root-owned deck files freeze the cursor)"
+    stamp gaveup "$st_tries"
+    exit 1
+  fi
+fi
+if [ $(( now - st_last )) -lt "$MIN_GAP_S" ]; then
+  [ "$CHECK" = 1 ] && log "would resync, but acted $(( now - st_last )) s ago -- waiting for the 15-minute gap"
+  exit 0
+fi
+
+tries=1
+[ "$st_start" = "$s_epoch" ] && tries=$(( st_tries + 1 ))
+why="liquidsoap started $ts, after the window was written; $aired rotation row(s) aired since the last deal"
+[ "$unfinished" = 1 ] && why="an earlier try for the liquidsoap start at $ts ended '$st_status' -- the air may still play the old window"
+if [ "$CHECK" = 1 ]; then
+  log "WOULD RESYNC (try $tries): $why"
+  exit 0
+fi
+
+# ---- 6  the poke needs the socket; without it a deal helps nobody ---------------
+i=0
+while [ ! -S "$SOCK" ] && [ "$i" -lt 30 ]; do sleep 2; i=$(( i + 1 )); done
+if [ ! -S "$SOCK" ]; then
+  log "WARNING: control socket $SOCK never appeared within 60 s -- NOT dealing (a window nobody reads is worse than no window)"
+  stamp nosock "$tries"
+  exit 1
+fi
+
+# ---- 7  is the deck lock free? (the console or the timer deal may hold it; do not spend a try on a wait)
+if ! flock -n "$DECKLOCK" true 2>/dev/null; then
+  log "deck lock $DECKLOCK is busy (console edit or timer deal in progress) -- trying again next tick"
+  exit 0
+fi
+
+# ---- 8  stamp first (a hung deal must not be retried every 5 minutes), then deal --
+stamp running "$tries"
+log "RESYNC (try $tries): $why -- dealing from the true cursor"
+
+out="$(timeout -k 10 "$DEAL_TIMEOUT_S" "$DEAL" 2>&1)"; rc=$?
+printf '%s\n' "$out" | sed 's/^/    deal: /'
+if [ "$rc" -ne 0 ]; then
+  log "WARNING: the deal exited $rc -- the air may still be on the stale window; will retry after 15 min (try $tries of $MAX_TRIES)"
+  stamp failed "$tries"
+  exit 1
+fi
+if printf '%s' "$out" | grep -q -e "reloaded the new window" -e "reload deferred"; then
+  log "ok: dealt and reloaded -- the next track is the right card"
+  stamp ok "$tries"
+  exit 0
+fi
+log "WARNING: the deal ran but liquidsoap did NOT confirm the reload -- window installed, air possibly stale; will retry after 15 min (try $tries of $MAX_TRIES)"
+stamp nopoke "$tries"
+exit 1

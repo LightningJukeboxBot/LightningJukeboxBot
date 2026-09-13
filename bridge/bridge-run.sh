@@ -27,7 +27,10 @@ ICECAST=http://127.0.0.1:8000/stream
 # RADIO mode: this bridge is stopped for a live DJ session, and during a session
 # the OBS overlay carries that session's own QR instead.
 # The card holds an LNURL-pay for the station jar -- public by design, pay-only.
-QR=/home/sf/noderunners-site/assets/donate-qr-card.png
+# nr_jukeqr (2026-09-08): the arcade cabinet shows this picture; the card now sends people to
+# the phone-sized jukebox page (?jukebox) instead of the donation address. The donate card
+# stays on disk for a switch-back: QR=/home/sf/noderunners-site/assets/donate-qr-card.png
+QR=/home/sf/noderunners-site/assets/jukebox-qr-card.png
 # The station's own mark, bottom right -- the broadcaster's "bug". Radio mode
 # only, same as everything else this script draws.
 LOGO=/home/sf/noderunners-site/assets/nr-logo-feed.png

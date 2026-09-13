@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# nr-shuffle.sh -- deal the library like a deck of cards.
+#
+# WHAT SF ASKED FOR, 2026-08-04:
+#   "I don't want songs to repeat too often... I'd like the entire background
+#    playlist to rotate once before a song repeats."
+#
+# So: no repeats until every track has had its turn. That is a shuffled DECK
+# dealt from top to bottom, not a random draw each time. A random draw repeats
+# by definition -- a track can land in two windows running while another never
+# comes up at all.
+#
+# HOW IT WORKS
+#   DECK    a one-time shuffle of the whole library. The play order for this
+#           cycle. Never changes until the deck runs out.
+#   CURSOR  how far through the deck the station has actually got.
+#   WINDOW  the next slice of the deck, written where liquidsoap reads. Small,
+#           because liquidsoap SEGFAULTS on a big playlist -- see below.
+#
+#   Each run: count what genuinely aired since last time, advance the cursor by
+#   exactly that, and deal the next window. When the deck runs out, every track
+#   has played exactly once. Only then is it reshuffled into a new deck.
+#
+# WHY THE WINDOW IS SMALL -- DO NOT UNDO THIS
+#   On 2026-08-04 the full 665,944-track playlist (92 MB) made liquidsoap
+#   SEGFAULT: Result=core-dump, 15 restarts, six minutes off air. Not memory --
+#   the box had 55 GB free. Liquidsoap cannot parse a playlist that size.
+#   The window keeps it small. Raising it toward the full library brings the
+#   crash back.
+#
+# THREE THINGS MUST BE TRUE IN noderunners.liq OR THIS DOES NOT WORK:
+#   mode        = "normal"   -- play the deck IN ORDER. "randomize" would
+#                              re-shuffle inside the window and repeat tracks.
+#   reload_mode = "watch"    -- reload only when the file CHANGES. On a timer it
+#                              would jump back to the top of the window and
+#                              replay it every hour.
+#   the path    = the window file this script writes.
+
+set -uo pipefail
+
+FULL="${NR_ROTATION_FULL:-/var/lib/jukebox/rotation-full.m3u}"
+DECK="${NR_DECK:-/var/lib/jukebox/deck.m3u}"
+CURSOR="${NR_CURSOR:-/var/lib/jukebox/deck.cursor}"
+LIVE="${NR_ROTATION:-/var/lib/jukebox/rotation.m3u}"
+PLAYLOG="${NR_PLAYLOG:-/var/log/liquidsoap/playlog.tsv}"
+SEEN="${NR_SEEN:-/var/lib/jukebox/deck.playcount}"
+
+WINDOW="${WINDOW_SIZE:-800}"     # ~2 days of audio. Proven-safe size.
+
+# nr_harden (2026-09-05): four findings from the deck-resync review, none of them new
+# behaviour on the happy path:
+#   1. log() is defined BEFORE the lock block (it was called before it existed: a
+#      failed lock printed "log: command not found" and the deal went on unlocked).
+#   2. the deck lock waits at most 30 s (flock -w). The console holds it for
+#      milliseconds; a hung holder must not stall a deal -- or the guard -- forever.
+#   3. the counters commit AFTER the window is installed: mv, then playcount, then
+#      cursor. A deal killed half-way can no longer eat the aired count (replays) or
+#      double-count it (lost cards). Playcount before cursor on purpose: if the kill
+#      lands between them the next deal replays (audible, harmless); the other order
+#      would skip cards forever.
+#   4. an unreadable play-log, or one with FEWER rotation rows than at the last deal,
+#      refuses to deal and leaves every counter untouched. Before, that wrote a zero
+#      counter and the NEXT deal skipped a whole window (800 cards).
+#   + a gain annotator that eats its input and dies no longer yields an empty draw and
+#     a full RESHUFFLE of the deck: the draw is redone bare, and a reshuffle happens
+#     only when the deck really is nearly out of cards.
+#   v3 (2026-09-08): the reload poke is deferred while the rotation is idle and its
+#     in-memory window is already current (see the poke block at the end).
+log(){ echo "$(date '+%F %T') nr-shuffle: $*"; }
+RELOADED="${NR_RELOADED:-/var/lib/jukebox/deck.reloaded}"   # mtime = last CONFIRMED reload (nr_harden v3)
+LIQSOCK="${NR_LIQ_SOCK:-/var/run/liquidsoap/noderunners.sock}"
+
+# One hand on the deck at a time (2026-08-23): the console edits the deck too, and
+# both sides take this flock, so a click never lands mid-reshuffle and vice versa.
+DECKLOCK="${NR_DECK_LOCK:-/var/lib/jukebox/.deck.lock}"
+LOCKED=0
+if command -v flock >/dev/null 2>&1; then
+  if exec 9>>"$DECKLOCK" && flock -w 30 9; then
+    LOCKED=1
+  else
+    log "WARNING: could not take the deck lock within 30 s -- dealing a window without it (a console edit landing in this second can shift one card); a RESHUFFLE would be refused"
+  fi
+fi
+MIN_OK=50
+put(){ printf '%s\n' "$2" > "$1.tmp" && chmod 644 "$1.tmp" && mv -f "$1.tmp" "$1"; }   # a counter is never left empty
+
+# nr_gain (2026-08-31): stamp each dealt line with its measured volume note so
+# liquidsoap levels the loudness (attenuate-only; notes written by
+# /usr/local/bin/nr-gain-annotate from gains.db). The DECK stays bare -- the
+# console edits it. If the annotator is missing or broken the lines pass BARE,
+# exactly as before: the deal must never fail over loudness. Bounded at 60 s.
+nr_annotate(){
+  if [ -x /usr/local/bin/nr-gain-annotate ]; then
+    timeout 60 /usr/local/bin/nr-gain-annotate || cat
+  else
+    cat
+  fi
+}
+
+[ -r "$FULL" ] || { log "no library at $FULL"; exit 1; }
+total=$(wc -l < "$FULL")
+[ "$total" -lt "$MIN_OK" ] && { log "library has only $total tracks -- refusing"; exit 1; }
+
+# ------------------------------------- how much actually aired since last run?
+# The cursor must follow REALITY, not the clock. If the station was off, or a
+# live sesh took over, nothing aired and the cursor must not move -- otherwise
+# tracks get skipped and never played, which is exactly the bug we are fixing.
+# rotation rows ONLY (2026-08-20; label widened 2026-08-21): paid/gift plays are not
+# deck cards. THE TRAP: v5 of noderunners.liq gave the playlist id="rotation", so the
+# play-log source column changed from rotation_m3u to rotation. Matching only the old
+# label made aired=0 forever: the cursor froze and the air looped ~90 tracks every 6 h
+# (SF heard it, 2026-08-21). Prefix-match BOTH labels.
+# Counted FIRST, committed LAST (see nr_harden 3 and 4 above).
+if [ ! -e "$PLAYLOG" ] && [ ! -e "$SEEN" ]; then
+  log "no play-log and no counter yet -- a fresh box; starting the count at 0"
+  played_now=0
+else
+  [ -r "$PLAYLOG" ] || { log "play-log $PLAYLOG is not readable -- NOT dealing, counters untouched"; exit 1; }
+  played_now=$(grep -c "	play	rotation" "$PLAYLOG" 2>/dev/null)
+  case "$played_now" in ''|*[!0-9]*) log "play-log count came back as '$played_now' (grep error?) -- NOT dealing, counters untouched"; exit 1 ;; esac
+fi
+played_before=$(cat "$SEEN" 2>/dev/null || echo "$played_now")
+case "$played_before" in ''|*[!0-9]*) played_before="$played_now" ;; esac
+if [ "$played_now" -lt "$played_before" ]; then
+  if [ -e "$SEEN.shrunk" ]; then
+    log "WARNING: the play-log STILL has fewer rotation rows ($played_now) than the counter ($played_before) -- accepting $played_now as the new baseline so the air does not loop; the royalty record must never shrink: FIND OUT WHY"
+    played_before="$played_now"
+    rm -f "$SEEN.shrunk"
+  else
+    log "WARNING: the play-log has FEWER rotation rows ($played_now) than at the last deal ($played_before) -- rotated or truncated? The royalty record must never shrink. NOT dealing this time, counters untouched; if it is still so at the next deal, that deal accepts the new baseline (loudly)."
+    : > "$SEEN.shrunk"
+    exit 1
+  fi
+else
+  rm -f "$SEEN.shrunk"
+fi
+aired=$(( played_now - played_before ))
+# A counter that jumps by more than one window means the COUNTING is wrong, not the
+# listening. Never skip a chunk of the deck on that evidence.
+if [ "$aired" -gt "$WINDOW" ]; then
+  log "WARNING: counter jumped by $aired (more than one window of $WINDOW) -- clamping"
+  aired="$WINDOW"
+fi
+
+# ---------------------------------------------------------------- the deck
+new_deck(){
+  [ "$LOCKED" = 1 ] || { log "no deck lock -- refusing to RESHUFFLE (a console edit could clobber the new deck); dealing again next time"; exit 1; }
+  log "shuffling a new deck from $total tracks -- every track gets one turn"
+  shuf "$FULL" > "$DECK.tmp" && mv -f "$DECK.tmp" "$DECK" || { log "could not shuffle a new deck -- NOT dealing"; rm -f "$DECK.tmp"; exit 1; }
+  chmod 644 "$DECK"
+  # the counters are NOT written here: cursor 0 and the count baseline commit at the
+  # end, after the window is installed, like every other path. A kill before that
+  # leaves the old cursor (>= deck size) on disk, which just reshuffles again next
+  # time and skips nothing.
+  cursor=0; aired=0; fresh=1
+}
+
+fresh=0
+[ -s "$DECK" ] || new_deck
+deck_n=$(wc -l < "$DECK")
+if [ "$fresh" = 0 ]; then
+  if [ -e "$CURSOR" ]; then
+    cursor=$(cat "$CURSOR" 2>/dev/null)
+    case "$cursor" in ''|*[!0-9]*) log "WARNING: $CURSOR holds '$cursor', not a number -- NOT dealing (a zero here would replay the whole deck); fix it by hand"; exit 1 ;; esac
+  else
+    cursor=0
+  fi
+  cursor=$(( cursor + aired ))
+fi
+log "$aired track(s) aired since last run -- cursor now $cursor of $deck_n"
+
+# ------------------------------------------------------- deck exhausted?
+if [ "$cursor" -ge "$deck_n" ]; then
+  log "DECK FINISHED -- all $deck_n tracks have had their turn. Reshuffling."
+  new_deck
+  deck_n=$(wc -l < "$DECK")
+fi
+
+# ------------------------------------------------------------- deal a window
+TMP="$(mktemp "${LIVE}.new.XXXXXX")" || exit 1
+BARE="$(mktemp "${LIVE}.bare.XXXXXX")" || { rm -f "$TMP"; exit 1; }
+trap 'rm -f "$TMP" "$BARE"' EXIT
+
+# Draw the cards BARE into a file first, then annotate from that file, and accept the
+# annotated result only if it is line for line complete (nr_harden): an annotator that
+# eats, drops or gets killed mid-stream can no longer tear a hole in the window or make
+# an empty draw look like an empty deck.
+draw(){ sed -n "$(( cursor + 1 )),$(( cursor + WINDOW ))p;$(( cursor + WINDOW ))q" "$DECK"; }   # one process, stops at the last card: no broken-pipe noise
+annotate_or_bare(){
+  draw > "$BARE"; want=$(wc -l < "$BARE")
+  nr_annotate < "$BARE" > "$TMP"; got=$(wc -l < "$TMP")
+  if [ "$got" -ne "$want" ]; then
+    log "WARNING: the annotator returned $got of $want lines -- dealing this window BARE (no volume notes)"
+    cp -f "$BARE" "$TMP"; got=$want
+  fi
+}
+annotate_or_bare
+
+# Near the end of the deck the window runs short. Top it up from the NEXT deck
+# so the stream never runs dry, and let the next run notice the wrap.
+if [ "$got" -lt "$MIN_OK" ]; then
+  log "only $got left in the deck -- reshuffling now and dealing fresh"
+  new_deck
+  deck_n=$(wc -l < "$DECK")
+  annotate_or_bare
+fi
+
+[ "$got" -lt "$MIN_OK" ] && { log "only drew $got tracks -- refusing to install"; exit 1; }
+
+# Atomic. Liquidsoap sees the old file or the new one, never a half-written one.
+chmod 644 "$TMP"
+mv -f "$TMP" "$LIVE" || { log "could not install the window"; exit 1; }
+rm -f "$BARE"; trap - EXIT
+
+# Counters commit only now, playcount first (nr_harden 3).
+put "$SEEN" "$played_now"
+put "$CURSOR" "$cursor"
+
+# Tell liquidsoap to pick up the new window NOW (2026-08-20): since reload_mode="never"
+# (2026-09-05) this poke is the ONLY reload. Best-effort: a failed poke is logged loudly
+# but never blocks the deal. (nr-deck-resync greps "reloaded the new window" and
+# "reload deferred" -- keep both phrases.)
+#
+# nr_harden v3 (2026-09-08): do NOT reload while the rotation is idle (a mood or paid
+# track on air) IF the in-memory window is already current, i.e. a confirmed reload
+# happened after liquidsoap started. Why: an idle rotation source already holds its
+# next card PREPARED (liquidsoap prepares it when the fallback checks readiness); the
+# deal cuts the new window at exactly that card, and a reload queues it a second time
+# behind the prepared copy -> the card plays twice when the rotation resumes
+# (2026-09-06 10:40/10:44 'Niger'). The window on disk is installed either way; the
+# next deal with the rotation on air reloads it. Never deferred: after a restart (the
+# marker is older than the process, the guard relies on the poke), on a RESHUFFLE deal
+# (memory would hold the old deck), with NR_FORCE_POKE=1, and whenever the on-air
+# check is not POSITIVELY "only mood/paid lanes on air" (any doubt -> poke).
+rotation_idle=0
+if [ "${NR_FORCE_POKE:-0}" != 1 ] && [ "$fresh" = 0 ] && [ -e "$RELOADED" ] && [ -S "$LIQSOCK" ]; then
+  liq_ts=$(systemctl show liquidsoap -p ExecMainStartTimestamp --value 2>/dev/null)
+  liq_start=""; [ -n "$liq_ts" ] && liq_start=$(date -d "$liq_ts" +%s 2>/dev/null)
+  case "$liq_start" in ''|*[!0-9]*) liq_start="" ;; esac
+  mark=$(stat -c %Y "$RELOADED" 2>/dev/null); case "$mark" in ''|*[!0-9]*) mark="" ;; esac
+  if [ -n "$liq_start" ] && [ -n "$mark" ] && [ "$mark" -gt "$liq_start" ]; then
+    onair_src=$(LIQSOCK="$LIQSOCK" python3 - <<'PYONAIR' 2>/dev/null
+import socket, re, os
+SOCK = os.environ.get("LIQSOCK", "/var/run/liquidsoap/noderunners.sock")
+LANES = ("mood", "jukebox", "wavlake", "local", "gift")
+def ask(cmd):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5)
+    s.connect(SOCK); s.sendall(cmd.encode() + b"\nquit\n")
+    out = b""
+    try:
+        while True:
+            c = s.recv(4096)
+            if not c: break
+            out += c
+    except socket.timeout: pass
+    lines = [l.strip() for l in out.decode("utf-8", "replace").splitlines()]
+    if "END" not in lines: raise SystemExit(2)
+    body = [l for l in lines if l and l not in ("END", "Bye!")]
+    if body and body[0].startswith("ERROR"): raise SystemExit(2)
+    return body
+rids = " ".join(ask("request.on_air")).split()
+if any(not r.isdigit() for r in rids): raise SystemExit(2)
+srcs = []
+for rid in rids:
+    m = dict(re.findall(r'^(\w+)="(.*)"$', "\n".join(ask("request.metadata " + rid)), re.M))
+    srcs.append(m.get("source", ""))
+if any(s.startswith("rotation") for s in srcs): print("rotation")
+elif rids and all(s in LANES for s in srcs): print("idle")
+else: print("unknown")
+PYONAIR
+)
+    [ "$onair_src" = "idle" ] && rotation_idle=1
+  fi
+fi
+if [ "$rotation_idle" = 1 ]; then
+  log "reload deferred: the rotation is idle (a mood or paid track is on air) and its in-memory window is current -- the new window is installed; the next deal with the rotation on air reloads it"
+else
+  if LIQSOCK="$LIQSOCK" python3 - <<'PYPOKE' >>/dev/null 2>&1
+import socket, os
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5)
+s.connect(os.environ.get("LIQSOCK", "/var/run/liquidsoap/noderunners.sock"))
+s.sendall(b"rotation.reload\nquit\n")
+r = s.recv(4096).decode("utf-8", "replace")
+head = r.upper().split("END")[0]
+raise SystemExit(1 if "ERROR" in head else 0)
+PYPOKE
+  then
+    log "liquidsoap reloaded the new window"
+    touch "$RELOADED" 2>/dev/null || log "WARNING: could not touch $RELOADED -- reload deferral stays off until sf can write it"
+  else
+    log "WARNING: could not poke liquidsoap -- window installed but NOT reloaded (stale until restart)"
+  fi
+fi
+
+pct=$(( cursor * 100 / (deck_n > 0 ? deck_n : 1) ))
+log "dealt $got tracks. Through $pct% of the deck ($cursor/$deck_n). No repeats until it finishes."

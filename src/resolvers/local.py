@@ -107,8 +107,15 @@ def _dedupe(rows, limit: int):
 def _overfetch(limit: int) -> int:
     """Ask SQL for more rows than we show, so deduping still fills the page.
     Wider since 2026-08-19: with versions kept apart, one popular song can now
-    hold several rows of the page by itself."""
-    return min(max(limit * 8, 40), 120)
+    hold several rows of the page by itself.
+
+    nr_offset (2026-09-10, SF: "I want to be able to next and previous scroll through them all"):
+    the ceiling was 120, which is what actually made the deep rows unreachable. It costs almost
+    nothing to lift: measured on the live 683,530-row catalogue, the same query takes 0.45 s at 120
+    rows, 0.48 s at 400 and 0.37 s for all 482 matches. The leading-wildcard LIKE scans the whole
+    table whatever the limit, so the scan is the entire bill and it is already being paid. The floor
+    and the x8 shape are untouched, so an ordinary page takes exactly the path it always did."""
+    return min(max(limit * 8, 40), 1200)
 
 
 def _fts_ready(con: sqlite3.Connection) -> bool:
@@ -154,7 +161,14 @@ class LocalResolver(Resolver):
             sha256=r["sha256"],
         )
 
-    def _search_sync(self, query: str, limit: int) -> list[Track]:
+    def _search_sync(self, query: str, limit: int, offset: int = 0) -> list[Track]:
+        # nr_offset: the skip is applied AFTER the dedupe, on the deduped list -- so a page boundary
+        # can never land inside a collapsed cluster, and page 5 is the same page 5 every time. "want"
+        # is what we must produce BEFORE skipping; offset 0 leaves every number exactly as it was.
+        # The SQL LIMIT saturates at _overfetch's 1200, so a very deep offset simply runs dry and
+        # the caller is told "no more" -- short, never wrong.
+        offset = max(0, int(offset or 0))
+        want = limit + offset
         con = self._connect()
         if con is None:
             return []          # no index yet -> a miss, not a crash
@@ -172,19 +186,42 @@ class LocalResolver(Resolver):
 
             # 1. FAST: every word must appear (any order), on the raw blob.
             where = " AND ".join([blob + " LIKE ?"] * len(toks))
+            # nr_rank (2026-09-10, SF: "jukebox won't serve it"): the blob above matches the
+            # ALBUM as well as the artist and the title, and the only relevance rule used to be
+            # an exact "artist - title" equality against the whole typed string -- which never
+            # fires for anything a person actually types. So every real search came back
+            # ALPHABETICALLY, and a twelve-track compilation whose ALBUM carried the words buried
+            # the song itself below all twelve. Tiers now, strongest signal first:
+            #   0  the whole query IS "artist - title"   (the old rule, kept)
+            #   1  the query is BOTH the artist and the title (an eponymous song)
+            #   2  the query is the ARTIST -- so "queen" gives you Queen, not three cover bands
+            #      who happen to have a song called Queen. Artist BEFORE title: an artist name is
+            #      the commonest thing anyone types, and ranking a title above it was a
+            #      regression this fix introduced and a review caught (2026-09-10).
+            #   3  the query is the TITLE
+            #   4  every word is in artist+title -- the NAME, not merely the album
+            # then alphabetical as before, so ties break exactly as they always did.
+            nameblob = "lower(coalesce(artist,'') || ' ' || coalesce(title,''))"
+            in_name = " AND ".join([nameblob + " LIKE ?"] * len(toks))
             sql = (
                 "SELECT * FROM tracks WHERE " + where +
                 " ORDER BY"
                 " CASE WHEN lower(coalesce(artist,'') || ' - ' ||"
                 " coalesce(title,'')) = ? THEN 0 ELSE 1 END,"
+                " CASE WHEN lower(coalesce(artist,'')) = ? AND"
+                " lower(coalesce(title,'')) = ? THEN 0"
+                " WHEN lower(coalesce(artist,'')) = ? THEN 1"
+                " WHEN lower(coalesce(title,'')) = ? THEN 2 ELSE 3 END,"
+                " CASE WHEN " + in_name + " THEN 0 ELSE 1 END,"
                 " artist, title"
                 " LIMIT ?"
             )
+            like = ["%" + t + "%" for t in toks]
             rows = con.execute(
-                sql, ["%" + t + "%" for t in toks] + [raw, _overfetch(limit)]
+                sql, like + [raw] * 5 + like + [_overfetch(want)]
             ).fetchall()
             if rows:
-                return [self._row_to_track(r) for r in _dedupe(rows, limit)]
+                return [self._row_to_track(r) for r in _dedupe(rows, want)[offset:]]
 
             # 2. LOOSE fallback -- only on a total miss. Space/punct-insensitive.
             ntoks = [_loose(t) for t in toks if _loose(t)]
@@ -197,10 +234,10 @@ class LocalResolver(Resolver):
                 " ORDER BY artist, title LIMIT ?"
             )
             rows = con.execute(
-                sql, ["%" + t + "%" for t in ntoks] + [_overfetch(limit)]
+                sql, ["%" + t + "%" for t in ntoks] + [_overfetch(want)]
             ).fetchall()
             if rows:
-                return [self._row_to_track(r) for r in _dedupe(rows, limit)]
+                return [self._row_to_track(r) for r in _dedupe(rows, want)[offset:]]
 
             # 3. FUZZY fallback -- typo tolerance via the trigram FTS index, if
             # present. Reached only on a total miss, so a near-match beats an
@@ -217,18 +254,18 @@ class LocalResolver(Resolver):
                             " JOIN tracks t ON t.rowid = f.rowid"
                             " WHERE f.tracks_fts MATCH ?"
                             " ORDER BY bm25(tracks_fts) LIMIT ?",
-                            (match, _overfetch(limit)),
+                            (match, _overfetch(want)),
                         ).fetchall()
-                        return [self._row_to_track(r) for r in _dedupe(rows, limit)]
+                        return [self._row_to_track(r) for r in _dedupe(rows, want)[offset:]]
                     except sqlite3.OperationalError:
                         pass
             return []
         finally:
             con.close()
 
-    async def search(self, query: str, limit: int = 5) -> list[Track]:
+    async def search(self, query: str, limit: int = 5, offset: int = 0) -> list[Track]:
         # SQLite is sync; keep the event loop free
-        return await asyncio.to_thread(self._search_sync, query, limit)
+        return await asyncio.to_thread(self._search_sync, query, limit, offset)
 
     async def resolve(self, track: Track) -> Optional[Track]:
         """Confirm the file is still actually on disk before we promise to air it."""
