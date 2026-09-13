@@ -1,0 +1,28 @@
+[Unit]
+Description=Noderunners Radio - X jukebox (@JukeboxLNDbot): "play <song>" on X -> one reply with the station's pay link
+Documentation=file:/usr/local/bin/nr-xjukebox
+After=network-online.target library-api.service nr-announcer.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sf
+Group=sf
+# the SAME four X keys the announcer uses (600, owner sf); they are never copied anywhere else
+EnvironmentFile=-/home/sf/.config/nr-announcer/x.env
+Environment=NR_XJUKEBOX_HOME=/home/sf/.config/nr-xjukebox
+Environment=NR_ANNOUNCER_PATH=/usr/local/bin/nr-announcer
+Environment=NR_ANNOUNCER_HOME=/home/sf/.config/nr-announcer
+ExecStart=/usr/bin/python3 /usr/local/bin/nr-xjukebox
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target

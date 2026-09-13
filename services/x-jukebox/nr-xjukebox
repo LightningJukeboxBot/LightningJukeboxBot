@@ -1,0 +1,2241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-xjukebox (2026-09-12) -- the X lane's bot for Noderunners Radio, speaking as @JukeboxLNDbot.
+A listener posts "@JukeboxLNDbot play <song> | <message>". The bot asks the station for a one-time pay code and
+answers ONCE with the link to the station's own pay page. The page does the rest (every match listed, invoice, queued).
+When the song goes ON AIR this bot quote-posts the listener's own request (SF 2026-09-13); the announcer skips
+X-lane songs. Charter: plan/x-jukebox/CHARTER-v4.html (every rule binds).
+
+HOW IT WORKS
+  1  Every 30 s it reads the bot's mentions on X (max 5 posts, since the last one; on the very first start "since now",
+     so no backlog is ever read or billed). Every read is written in the book BEFORE the call, at 5 x the read price,
+     and corrected to what really came back. Empty polls cost nothing.
+  2  Every post passes the charter's checks in order: opt-out ("stop") first; is it for the bot (starts with "play" after
+     the leading @names; no retweets, quotes or long posts; at most ONE friend tagged); younger than 3 minutes (by X's
+     own clock); never answered before (edits are skipped); this person under 3 a day, no code still open, 20 s since the
+     last one; 20 replies an hour lane-wide; the purse and the daily limit; the announcer's word list over the query and
+     the message (a hit = silence).
+  3  The station mints a code for the search at the price of the day. The bot writes "being answered" to disk, books the
+     reply in the ledger, THEN posts the reply, THEN marks it sent. A crash in between never gives anyone two replies.
+  4  A live sesh (the station says 409) gets one answer per person per sesh. A search the station refuses as empty gets
+     the friendly "nothing aboard" answer with the jukebox link. Anything else: silence. Never a second reply.
+  5  Every open code is watched (station, every 60 s). When its song shows up on /api/nowplaying as a paid X request,
+     the sats go in the book: the on-air post is booked as the lane's cost, the sats become dollars by the rate rule
+     (two sources, fresh, agreeing, the lower one, minus 10 %), or wait in the book as sats until a rate passes.
+  6  The purse is the sum of the book. It is recounted from the file at every start and after every line. Below the
+     price of the next action: the lane goes quiet and SF hears it once on Telegram.
+
+THE PURSE (files in /home/sf/.config/nr-xjukebox/; NR_XJUKEBOX_HOME overrides the folder)
+  ledger.tsv           append-only: ts_utc  kind  usd  sats  ref. Kinds: seed topup read read_adjust reply onair income
+                       unconverted rate. Spend is negative, income positive. The float = the sum of the usd column.
+  seed-usd             SF's hand: the dollars loaded at X. Missing = 0 = quiet. Every change is booked once (seed/topup).
+  budget-usd-per-day   the daily limit (the installer writes 0.50). Reached: no polling, no replies until 00:00 UTC.
+  console-cap-usd      the monthly cap set at X (default 60): the lane pauses at 70 % of it, the announcer's posts counted.
+  prices.json          X's prices as booked; floors are hard-coded (read 0.005, reply 0.010, post 0.015, user 0.010):
+                       the file may raise them, never lower them. read_owned (0.001) and margin (1.5) feed the song price.
+  price-sats           the song's price today, set once a day from the formula in the charter (100..500). SF may
+                       overwrite it by hand: a hand-edited file wins and the bot stops writing it; delete it to resume.
+  codes.json           open / minted / paid codes with their sats and times.       state.json   everything else.
+  optout.txt           people who said "stop" (never answered again).   ignore.txt   people with 3 trips in a day, a week.
+  balance-check        exists -> once a day, around the first live reply, GET /2/usage/credits is tried and logged.
+
+SWITCHES (no restart needed)
+  OFF     exists -> nothing runs, zero spend.
+  LIVE    absent -> PRACTICE MODE: reads (they cost cents), runs every check, logs "[practice] would reply" and posts
+          NOTHING, mints NOTHING.   Present -> the real thing.
+
+TELEGRAM (through the station's admin-notes channel; the same event at most once per 6 h)
+  purse empty, daily limit hit, credits out (402), keys refused (401), a run of refusals, a code minted but no reply
+  sent, a rate rejected, the station down for 6 h, and one line a day at 20:00 UTC with the day's numbers.
+  TODO (not in v1): a short ping to the group tagging @noderunnersfm/@plebroyale when money stops (needs the Telegram
+  bot; config key group_ping in state is a placeholder).
+
+RUN  (systemd: nr-xjukebox.service, User=sf)     nr-xjukebox
+     nr-xjukebox --check      state and settings, no network, spends nothing
+     nr-xjukebox --once       one cycle under the same lock as the service
+     nr-xjukebox --selftest   the built-in cases; nothing leaves the box
+"""
+import os, sys, re, json, time, math, uuid, hmac, base64, hashlib, signal, calendar, html, email.utils
+import importlib.machinery, importlib.util, urllib.parse, urllib.request, urllib.error
+
+HOME = os.environ.get("NR_XJUKEBOX_HOME", os.path.expanduser("~/.config/nr-xjukebox"))
+API = os.environ.get("NR_API_BASE", "http://127.0.0.1:7100").rstrip("/")
+X_API = os.environ.get("NR_X_API_BASE", "https://api.x.com").rstrip("/")
+ANN_PATH = os.environ.get("NR_ANNOUNCER_PATH", "/usr/local/bin/nr-announcer")
+ANN_HOME = os.environ.get("NR_ANNOUNCER_HOME", os.path.expanduser("~/.config/nr-announcer"))
+RATE_A = os.environ.get("NR_XJUKEBOX_RATE_COINBASE", "https://api.coinbase.com/v2/prices/BTC-USD/spot")
+RATE_B = os.environ.get("NR_XJUKEBOX_RATE_KRAKEN", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD")
+POLL_S = int(os.environ.get("NR_XJUKEBOX_POLL_S", "30"))
+WATCH_S = 60
+BOT_HANDLE = "JukeboxLNDbot"
+SITE = "https://noderunnersradio.com"
+MAX_RESULTS = 5
+MAX_AGE_S = 300
+MAX_FUTURE_S = 300
+PER_AUTHOR_DAY = 3
+AUTHOR_COOLDOWN_S = 20
+MAX_PER_HOUR = 20
+NOTE_MAX = 80
+QUERY_MAX = 120
+CODE_LIFE_S = 900
+PAID_WINDOW_S = CODE_LIFE_S + 86400
+TRIPS_TO_IGNORE = 3
+IGNORE_S = 7 * 86400
+ALERT_GAP_S = 6 * 3600
+DAILY_LINE_H = 20
+CONSOLE_WALL = 0.70
+DEFAULT_CONSOLE_CAP = 60.0
+DEFAULT_PRICE = 100
+PRICE_MIN, PRICE_MAX = 100, 500
+UNPAID_DEFAULT = 2.0
+UNPAID_MIN_PAID = 10
+RATE_FRESH_S = 86400
+RATE_AGREE = 0.10
+RATE_HAIRCUT = 0.10
+RATE_OUTLIER = 0.15
+RATE_OUTLIER_REF_S = 72 * 3600
+RATE_EVERY_S = 3600
+STATION_DOWN_ALERT_S = 6 * 3600
+FLOORS = {"read": 0.005, "reply": 0.010, "post": 0.015, "user": 0.010, "read_owned": 0.001, "margin": 1.5}
+SPEND_KINDS = ("read", "read_adjust", "reply", "onair")
+REPLY = "Pick your song and zap: {url}\n{sats} sats · a Wavlake song {wl} sats · good for 15 minutes · cheaper on the site itself"
+NOMATCH = "Nothing aboard by that name. Browse the library and pick from there: {url}"
+SESH = "A live sesh is on — {name} has the deck. The jukebox reopens when the sesh ends. noderunnersradio.com"
+CLOCK = time.time          # the tests move this
+SLEEP = time.sleep
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " nr-xjukebox: " + str(msg), flush=True)
+
+
+def P(name):
+    return os.path.join(HOME, name)
+
+
+def day_of(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def month_of(ts):
+    return time.strftime("%Y-%m", time.gmtime(ts))
+
+
+def day_start(ts):
+    return calendar.timegm(time.strptime(day_of(ts), "%Y-%m-%d"))
+
+
+def month_start(ts):
+    return calendar.timegm(time.strptime(month_of(ts) + "-01", "%Y-%m-%d"))
+
+
+def snowflake(ts):
+    """The X id a post made at this moment would have: since_id for the first start."""
+    return (int(ts * 1000) - 1288834974657) << 22
+
+
+# ---------------------------------------------------------------- OAuth 1.0a (stdlib) -- the announcer's signer, FIXED:
+# every query (and form) parameter is part of the signature base string (RFC 5849 section 3.4.1.3), not only oauth_*.
+def _pct(s):
+    return urllib.parse.quote(str(s), safe="-._~")
+
+
+def oauth_base(method, url, params):
+    pairs = sorted((_pct(k), _pct(v)) for k, v in params.items())
+    norm = "&".join("%s=%s" % kv for kv in pairs)
+    return "&".join([method.upper(), _pct(url), _pct(norm)])
+
+
+def oauth_header(method, url, ck, cs, at, ats, params=None, nonce=None, ts=None):
+    """url WITHOUT the query string; params = the query (and, for a form body, the form) parameters."""
+    o = {"oauth_consumer_key": ck, "oauth_nonce": nonce or uuid.uuid4().hex, "oauth_signature_method": "HMAC-SHA1",
+         "oauth_timestamp": str(ts or int(time.time())), "oauth_token": at, "oauth_version": "1.0"}
+    allp = dict(params or {})
+    allp.update(o)
+    base = oauth_base(method, url, allp)
+    key = ("%s&%s" % (_pct(cs), _pct(ats))).encode()
+    o["oauth_signature"] = base64.b64encode(hmac.new(key, base.encode(), hashlib.sha1).digest()).decode()
+    return "OAuth " + ", ".join('%s="%s"' % (_pct(k), _pct(o[k])) for k in sorted(o))
+
+
+def keys():
+    """The announcer's four X keys: from the service's EnvironmentFile, else (a shell) from the announcer's x.env."""
+    names = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET")
+    k = tuple(os.environ.get(n, "") for n in names)
+    if not all(k):
+        env = {}
+        try:
+            with open(os.path.join(ANN_HOME, "x.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        n, v = line.split("=", 1)
+                        env[n.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+        k = tuple(env.get(n, "") for n in names)
+    return k if all(k) else None
+
+
+# ---------------------------------------------------------------- text
+_URL = re.compile(r"https?://\S+|(?<![\w/@.])[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|net|org|io|co|nl|be|de|me|uk|xyz|fm)(?:/\S*)?", re.I)
+
+
+def xlen(t):
+    """X's weighted length: 1 for most Latin/Cyrillic/Greek and common punctuation, 2 for everything else (emoji, CJK, ellipsis)."""
+    return sum(1 if (o <= 0x10FF or 0x2000 <= o <= 0x200D or 0x2010 <= o <= 0x201F or 0x2032 <= o <= 0x2037) else 2
+               for o in map(ord, t))
+
+
+def weighted(t):
+    """xlen with every link counted as 23 (X wraps links in t.co)."""
+    n, pos = 0, 0
+    for m in _URL.finditer(t):
+        n += xlen(t[pos:m.start()]) + 23
+        pos = m.end()
+    return n + xlen(t[pos:])
+
+
+ann = None
+
+
+def load_announcer():
+    """The announcer's text rules (clean, blocklist), imported from the installed program; on the PC from the plan folder."""
+    global ann
+    sys.dont_write_bytecode = True
+    path = ANN_PATH
+    if not os.path.exists(path):
+        pc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "announcer", "nr-announcer")
+        if os.path.exists(pc):
+            path = pc
+    loader = importlib.machinery.SourceFileLoader("nr_announcer", path)
+    spec = importlib.util.spec_from_loader("nr_announcer", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    for name in ("clean", "load_blocklist", "blocked", "xlen"):
+        if not callable(getattr(mod, name, None)):
+            raise RuntimeError("%s lacks %s()" % (path, name))
+    mod.HOME = ANN_HOME
+    ann = mod
+    return mod
+
+
+_LEAD = re.compile(r"^(?:\s*@[A-Za-z0-9_]{1,15})+\s*")
+_PLAY = re.compile(r"(?is)^play(?:\b|(?=\s))[\s:,-]*(.*)$")
+
+
+def strip_lead(text):
+    return _LEAD.sub("", html.unescape(str(text or ""))).strip()
+
+
+def is_optout(text):
+    """'stop' as a whole word, case-insensitive -- unless the text is a request (starts with play)."""
+    t = strip_lead(text)
+    if re.match(r"(?i)play\b", t):
+        return False
+    return re.search(r"(?i)\bstop\b", t) is not None
+
+
+def parse_play(text):
+    """('play', query, message) for a request, or None. The message is what follows the first |."""
+    t = strip_lead(text)
+    m = _PLAY.match(t)
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if "|" in rest:
+        q, msg = rest.split("|", 1)
+    else:
+        q, msg = rest, ""
+    return "play", q.strip(), msg.strip()
+
+
+def parse_created(s):
+    try:
+        return calendar.timegm(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return None
+
+
+def compose_reply(url, sats, wl):
+    return REPLY.format(url=url, sats=int(sats), wl=int(wl))
+
+
+def compose_nomatch(q):
+    return NOMATCH.format(url=SITE + "/?jukebox&q=" + urllib.parse.quote(q or "", safe=""))
+
+
+def compose_sesh(name):
+    return SESH.format(name=name or "the crew")
+
+
+# ---------------------------------------------------------------- files
+def read_text(name):
+    try:
+        with open(P(name), encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def read_float_file(name, default=None):
+    t = read_text(name)
+    if t is None:
+        return default
+    try:
+        return float(t.strip().replace(",", "."))
+    except ValueError:
+        return default
+
+
+def write_text(name, body):
+    tmp = P(name) + ".new"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(body)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, P(name))
+
+
+def load_json(name, default):
+    try:
+        with open(P(name), encoding="utf-8") as fh:
+            v = json.load(fh)
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
+
+
+def save_json(name, obj):
+    write_text(name, json.dumps(obj, sort_keys=True))
+
+
+def prices():
+    """The price table as booked: the file may raise a price, never lower it below its floor."""
+    p = dict(FLOORS)
+    f = load_json("prices.json", {})
+    for k, floor in FLOORS.items():
+        try:
+            v = float(f.get(k, floor))
+        except (TypeError, ValueError):
+            v = floor
+        p[k] = max(floor, v)
+    p["read_owned"] = min(p["read_owned"], p["read"])
+    return p
+
+
+def take_lock(path):
+    """One instance only: flock on Linux, a byte lock on Windows (the PC harness). Raises OSError when held."""
+    fh = open(path, "a+")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        fh.close()
+        raise
+    return fh
+
+
+# ---------------------------------------------------------------- the ledger (the book): append-only, fsync'd, replayed
+class Ledger:
+    def __init__(self, path):
+        self.path = path
+        self.rows = []
+        self.bad = 0
+        self.load()
+
+    def load(self):
+        self.rows, self.bad = [], 0
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line or line.startswith("#"):
+                        continue
+                    f = line.split("\t")
+                    try:
+                        ts = calendar.timegm(time.strptime(f[0], "%Y-%m-%dT%H:%M:%SZ"))
+                        self.rows.append((ts, f[1], float(f[2]), int(f[3]), f[4] if len(f) > 4 else ""))
+                    except Exception:
+                        self.bad += 1
+        except OSError:
+            pass
+
+    def append(self, kind, usd, sats, ref):
+        """Written and fsync'd BEFORE the call it books. Raises when it cannot be written: then the call is not made."""
+        ts = CLOCK()
+        ref = str(ref).replace("\t", " ").replace("\n", " ")
+        line = "%s\t%s\t%.6f\t%d\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)), kind, usd, int(sats), ref)
+        with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        self.rows.append((int(ts), kind, round(float(usd), 6), int(sats), ref))
+
+    def float(self):
+        return round(sum(r[2] for r in self.rows), 6)
+
+    def spend(self, since):
+        return round(-sum(r[2] for r in self.rows if r[0] >= since and r[1] in SPEND_KINDS), 6)
+
+    def count(self, kinds, since, ref_prefix=""):
+        return sum(1 for r in self.rows if r[0] >= since and r[1] in kinds and r[4].startswith(ref_prefix))
+
+    def last(self, kinds):
+        for r in reversed(self.rows):
+            if r[1] in kinds:
+                return r
+        return None
+
+
+# ---------------------------------------------------------------- station + X transport (urllib only)
+def api_get(path, timeout=8, **params):
+    url = API + path + (("?" + urllib.parse.urlencode(params)) if params else "")
+    return _api(urllib.request.Request(url, headers={"User-Agent": "nr-xjukebox/1"}), timeout)
+
+
+def api_post(path, form, timeout=15):
+    req = urllib.request.Request(API + path, data=urllib.parse.urlencode(form).encode(),
+                                 headers={"User-Agent": "nr-xjukebox/1", "Content-Type": "application/x-www-form-urlencoded"})
+    return _api(req, timeout)
+
+
+def _api(req, timeout):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+            return r.status, body if isinstance(body, dict) else {}
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            body = {}
+        return e.code, body if isinstance(body, dict) else {}
+    except Exception as e:
+        return 0, {"error": str(e)[:100]}
+
+
+def notify(text, group=False):
+    """One line to SF's Telegram through the station API's localhost admin-notes channel (the bot relays, max 3/min)."""
+    try:
+        data = json.dumps({"src": "x-jukebox", "text": text[:600], "group": bool(group)}).encode()
+        req = urllib.request.Request(API + "/api/admin/note", data=data, headers={"Content-Type": "application/json", "User-Agent": "nr-xjukebox/1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log("could not hand the note to the station API: %s" % e)
+        return False
+
+
+def fetch_json(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "nr-xjukebox/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def x_call(method, path, params=None, body=None, timeout=20):
+    """One signed call to X. Returns (status, headers-lowercased, body-text); status 0 = network trouble."""
+    k = keys()
+    if not k:
+        return 0, {}, "no keys"
+    url = X_API + path
+    full = url + (("?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)) if params else "")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    hdr = {"Authorization": oauth_header(method, url, *k, params=params), "User-Agent": "nr-xjukebox/1"}
+    if data is not None:
+        hdr["Content-Type"] = "application/json"
+    req = urllib.request.Request(full, data=data, method=method, headers=hdr)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, {k2.lower(): v for k2, v in r.headers.items()}, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, {k2.lower(): v for k2, v in e.headers.items()}, e.read().decode("utf-8", "replace")[:1000]
+    except Exception as e:
+        return 0, {}, str(e)[:200]
+
+
+# ---------------------------------------------------------------- state
+def new_state():
+    return {"since_id": "", "user_id": "", "seen": {}, "stamps": [], "authors": {}, "inflight": {}, "alerts": {},
+            "backoff_until": 0, "dead": "", "refusals": 0, "clock_offset": 0.0, "rates": {}, "rate_accepted": {},
+            "rate_checked": 0, "sesh_since": 0, "price": {}, "ann": {"month": "", "n": 0, "seen": {}}, "would": [],
+            "daily_line": "", "today": {}, "station_down_since": 0, "hour_cap_told": 0, "cap_told": "", "console_told": "",
+            "credits": {}, "unconverted": [], "group_ping": False}
+
+
+def load_state():
+    st = new_state()
+    st.update(load_json("state.json", {}))
+    return st
+
+
+class Bot:
+    def __init__(self, xcall=None, getter=None, poster=None, notifier=None, fetcher=None):
+        self.x = xcall or x_call
+        self.get = getter or api_get
+        self.post = poster or api_post
+        self.tell = notifier or notify
+        self.fetch = fetcher or fetch_json
+        self.st = load_state()
+        self.ledger = Ledger(P("ledger.tsv"))
+        self.codes = load_json("codes.json", {})
+        self.due = {}
+        self.stopping = False
+        self.rebuild_unconverted()
+
+    def rebuild_unconverted(self):
+        """The waiting sats are replayed from the book: unconverted rows without a conv: income row (plus state's own)."""
+        conv = {r[4][5:] for r in self.ledger.rows if r[1] == "income" and r[4].startswith("conv:")}
+        out = [{"code": r[4][5:], "sats": r[3], "ts": r[0]} for r in self.ledger.rows if r[1] == "unconverted" and r[4].startswith("code:") and r[4][5:] not in conv]
+        have = {u["code"] for u in out}
+        for u in self.st.get("unconverted") or []:
+            if u.get("code") not in have and u.get("code") not in conv:
+                out.append(u)
+        self.st["unconverted"] = out
+
+    # ---- small helpers
+    def now(self):
+        return CLOCK()
+
+    def x_now(self):
+        return self.now() + float(self.st.get("clock_offset") or 0)
+
+    def live(self):
+        return os.path.exists(P("LIVE")) and not os.path.exists(P("OFF"))
+
+    def save(self):
+        now = self.now()
+        st = self.st
+        st["seen"] = {k: v for k, v in st["seen"].items() if now - v < 86400}
+        st["stamps"] = [t for t in st["stamps"] if now - t < 3600]
+        st["authors"] = {a: v for a, v in st["authors"].items() if now - float(v.get("last") or 0) < 2 * 86400}
+        st["would"] = st["would"][-200:]
+        save_json("state.json", st)
+
+    def save_codes(self):
+        save_json("codes.json", self.codes)
+
+    def alert(self, kind, text):
+        """One Telegram line per kind per 6 h."""
+        now = self.now()
+        if now - float(self.st["alerts"].get(kind, 0)) < ALERT_GAP_S:
+            return False
+        self.st["alerts"][kind] = now
+        log("ALERT %s: %s" % (kind, text))
+        self.tell("X jukebox: " + text)
+        # nr_groupping (SF 2026-09-12): money stopped -> ONE ping in the public group (the relay tags
+        # @noderunnersfm @plebroyale); if still stopped after 7 days, once more with @mospleb.
+        if kind in ("purse", "402"):
+            if not self.st.get("stopped_since"):
+                self.st["stopped_since"] = now
+                self.st["group_pinged"] = True
+                self.group_tell("the X lane stopped (%s). Check the bot's DM." % kind)
+        return True
+
+    def group_tell(self, text):
+        """A note for the public group too (a test notifier without the group flag just gets the text)."""
+        try:
+            self.tell("X jukebox: " + text, group=True)
+        except TypeError:
+            self.tell("X jukebox: " + text)
+
+    def stop_watch(self):
+        """Still stopped after a week -> one more group ping, this time for @mospleb. Cleared when money flows."""
+        since = float(self.st.get("stopped_since") or 0)
+        if not since:
+            return
+        if self.ledger.float() > 0 and not self.st.get("dead"):
+            self.st["stopped_since"] = 0; self.st["group_pinged"] = False; self.st["mospleb_pinged"] = False
+            return
+        if self.now() - since >= 7 * 86400 and not self.st.get("mospleb_pinged"):
+            self.st["mospleb_pinged"] = True
+            self.group_tell("@mospleb the X lane has been stopped for a week and nobody answered. Please poke @plebroyale or @noderunnersfm.")
+
+    def today(self):
+        d = day_of(self.now())
+        t = self.st["today"]
+        if t.get("day") != d:
+            self.st["today"] = t = {"day": d, "posts": 0, "replies": 0, "would": 0, "paid": 0, "trips": {}}
+        return t
+
+    def book(self, kind, usd, sats, ref):
+        """Ledger-first. Returns True when the line is on disk (fsync'd); False = the call it books must NOT happen."""
+        try:
+            self.ledger.append(kind, usd, sats, ref)
+            return True
+        except Exception as e:
+            log("BOOK FAILED (%s %.4f %s): %s -- the call is not made" % (kind, usd, ref, e))
+            self.alert("ledger", "the ledger cannot be written (%s). The lane is quiet until it can." % str(e)[:80])
+            return False
+
+    def spend_today(self):
+        return self.ledger.spend(day_start(self.now()))
+
+    def spend_month(self):
+        return self.ledger.spend(month_start(self.now()))
+
+    def daily_cap(self):
+        return read_float_file("budget-usd-per-day", 0.0) or 0.0
+
+    def console_cap(self):
+        return read_float_file("console-cap-usd", DEFAULT_CONSOLE_CAP) or DEFAULT_CONSOLE_CAP
+
+    def announcer_estimate(self):
+        a = self.st["ann"]
+        if a.get("month") != month_of(self.now()):
+            return 0.0
+        return round(int(a.get("n") or 0) * prices()["post"], 6)
+
+    def month_to_date(self):
+        return round(self.spend_month() + self.announcer_estimate(), 6)
+
+    def can_spend(self, usd, what):
+        """The purse, the daily limit and the console wall, before any booking. Returns a reason or ''."""
+        if self.ledger.float() < usd - 1e-9:
+            self.alert("purse", "the purse is empty (float $%.3f, next %s costs $%.3f). Earned this month $%.2f, spent $%.2f. Quiet until seed-usd is raised." % (
+                self.ledger.float(), what, usd, self.earned_month(), self.spend_month()))
+            return "purse"
+        cap = self.daily_cap()
+        if cap <= 0:
+            self.alert("nocap", "budget-usd-per-day is missing or 0 -- the lane stays quiet.")
+            return "daily-cap"
+        if self.spend_today() + usd > cap + 1e-9:
+            if self.st.get("cap_told") != day_of(self.now()):
+                self.st["cap_told"] = day_of(self.now())
+                self.st["alerts"].pop("cap", None)
+                self.alert("cap", "the daily limit ($%.2f) is reached: spent $%.3f today. Quiet until 00:00 UTC." % (cap, self.spend_today()))
+            return "daily-cap"
+        wall = CONSOLE_WALL * self.console_cap()
+        if self.month_to_date() + usd > wall:
+            if self.st.get("console_told") != month_of(self.now()):
+                self.st["console_told"] = month_of(self.now())
+                self.alert("console", "month-to-date spend $%.2f (this bot $%.2f + announcer est. $%.2f) reached 70 %% of the $%.0f console cap. Quiet until next month." % (
+                    self.month_to_date(), self.spend_month(), self.announcer_estimate(), self.console_cap()))
+            return "console"
+        return ""
+
+    def earned_month(self):
+        return round(sum(r[2] for r in self.ledger.rows if r[0] >= month_start(self.now()) and r[1] == "income"), 6)
+
+    # ---- the seed file -> the book
+    def seed_sync(self):
+        v = read_float_file("seed-usd")
+        if v is None:
+            return
+        v = round(v, 2)
+        rows = [r for r in self.ledger.rows if r[1] in ("seed", "topup")]
+        seen = round(sum(r[2] for r in rows), 6) if rows else None       # the column, never one line's ref
+        if seen is not None and abs(seen - v) < 0.005:
+            return
+        delta = round(v - (seen or 0.0), 2)
+        kind = "seed" if seen is None else "topup"
+        if self.book(kind, delta, 0, "seed-usd=%.2f" % v):
+            log("%s booked: %+.2f USD (seed-usd now %.2f; float %.3f)" % (kind, delta, v, self.ledger.float()))
+
+    # ---- the rate rule
+    def fetch_rates(self):
+        now = self.now()
+        if now - float(self.st.get("rate_checked") or 0) < RATE_EVERY_S:
+            return
+        self.st["rate_checked"] = now
+        rates = self.st.setdefault("rates", {})
+        try:
+            d = self.fetch(RATE_A)
+            rates["coinbase"] = {"usd": float(d["data"]["amount"]), "ts": now}
+        except Exception as e:
+            log("coinbase rate not read: %s" % str(e)[:80])
+        try:
+            d = self.fetch(RATE_B)
+            res = d["result"]
+            rates["kraken"] = {"usd": float(res[next(iter(res))]["c"][0]), "ts": now}
+        except Exception as e:
+            log("kraken rate not read: %s" % str(e)[:80])
+
+    def rate_usd(self):
+        """Two sources fresh within 24 h, agreeing within 10 %, the LOWER wins minus 10 %; an outlier (more than 15 % from
+        the last accepted, when that is under 72 h old) is rejected with a Telegram line. None = no valid rate."""
+        now = self.now()
+        rs = self.st.get("rates") or {}
+        vals = [float(r["usd"]) for k in ("coinbase", "kraken") for r in [rs.get(k)] if r and now - float(r["ts"]) < RATE_FRESH_S and float(r["usd"]) > 0]
+        if len(vals) < 2:
+            return None
+        a, b = vals
+        if abs(a - b) / max(a, b) > RATE_AGREE:
+            self.alert("rate-disagree", "the two BTC price sources disagree by more than 10 %% (%.0f vs %.0f). Sats wait as sats." % (a, b))
+            return None
+        r = min(a, b) * (1 - RATE_HAIRCUT)
+        acc = self.st.get("rate_accepted") or {}
+        if acc.get("usd") and now - float(acc.get("ts") or 0) < RATE_OUTLIER_REF_S and abs(r - float(acc["usd"])) / float(acc["usd"]) > RATE_OUTLIER:
+            self.alert("rate-outlier", "BTC rate %.0f rejected: more than 15 %% from the last accepted %.0f. Sats wait as sats." % (r, float(acc["usd"])))
+            return None
+        self.st["rate_accepted"] = {"usd": round(r, 2), "ts": now, "coinbase": a, "kraken": b}
+        return r
+
+    def rate_ref(self):
+        acc = self.st.get("rate_accepted") or {}
+        return "coinbase=%.2f;kraken=%.2f;used=%.2f" % (acc.get("coinbase", 0), acc.get("kraken", 0), acc.get("usd", 0))
+
+    def convert_pending(self):
+        if not self.st.get("unconverted"):
+            return
+        rate = self.rate_usd()
+        if rate is None:
+            return
+        keep = []
+        for u in list(self.st["unconverted"]):
+            usd = round(int(u["sats"]) / 1e8 * rate, 6)
+            if self.book("rate", 0, 0, self.rate_ref()) and self.book("income", usd, int(u["sats"]), "conv:%s" % u["code"]):
+                log("converted %d sats of code %s to $%.4f" % (int(u["sats"]), u["code"], usd))
+            else:
+                keep.append(u)
+        self.st["unconverted"] = keep
+
+    # ---- the song price of the day
+    def unpaid_per_paid(self):
+        since = self.now() - 30 * 86400
+        replies = self.ledger.count(("reply",), since, "code:")
+        paid = self.ledger.count(("income", "unconverted"), since, "code:")
+        if paid < UNPAID_MIN_PAID:
+            return UNPAID_DEFAULT
+        return max(0.0, replies - paid) / float(paid)
+
+    def price_file(self):
+        t = read_text("price-sats")
+        if t is None:
+            return None
+        try:
+            v = int(float(t.strip()))
+            return v if 21 <= v <= 100000 else None
+        except ValueError:
+            return None
+
+    def current_price(self):
+        v = self.price_file()
+        if v:
+            return v
+        return int(self.st["price"].get("sats") or 0) or DEFAULT_PRICE
+
+    def price_daily(self):
+        today = day_of(self.now())
+        if self.st["price"].get("day") == today:
+            return
+        rate = self.rate_usd()
+        if rate is None:
+            return
+        sats = compute_price(prices(), rate, self.unpaid_per_paid())
+        self.st["price"].update({"day": today, "sats": sats, "computed_at": self.now(), "unpaid": round(self.unpaid_per_paid(), 3)})
+        path = P("price-sats")
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+        written = float(self.st["price"].get("written_at") or 0)
+        hand = mtime is not None and (written == 0 or mtime > written + 1)
+        if hand:
+            self.st["price"]["hand"] = True
+            log("price of the day computed at %d sats; price-sats is set by hand (%s) and stays" % (sats, (read_text("price-sats") or "").strip()))
+            return
+        write_text("price-sats", "%d\n" % sats)
+        self.st["price"]["written_at"] = os.path.getmtime(path)
+        self.st["price"]["hand"] = False
+        log("price of the day: %d sats (rate %.0f, unpaid per paid %.2f)" % (sats, rate, self.unpaid_per_paid()))
+
+    # ---- X, wrapped: the clock offset and the error classes
+    def xreq(self, method, path, params=None, body=None):
+        code, hdrs, text = self.x(method, path, params, body)
+        d = hdrs.get("date") if hdrs else None
+        if d:
+            try:
+                off = round(email.utils.parsedate_to_datetime(d).timestamp() - self.now(), 1)
+                if abs(off) > 600:
+                    self.alert("clock", "X's clock is %.0f s away from this box; the offset is ignored (the last good one stays). Check the box's clock." % off)
+                else:
+                    self.st["clock_offset"] = off
+            except Exception:
+                pass
+        return code, hdrs, text
+
+    def x_error(self, code, hdrs, text, what):
+        """The common X error handling. Returns the reason string."""
+        now = self.now()
+        low = (text or "").lower()
+        if code == 401:
+            self.st["dead"] = "401"
+            self.alert("401", "X REJECTED the keys (401) on %s. Stopped until the keys are fixed and the service restarted." % what)
+            return "401"
+        if code == 402:
+            self.st["dead"] = "402"
+            self.alert("402", "X says PAYMENT REQUIRED (402): the credits are used up. Stopped until restarted (load credits first).")
+            return "402"
+        if code == 403:
+            if what == "reply" and ("duplicate" in low):
+                return "duplicate"
+            counts = not any(w in low for w in ("deleted", "not found", "no longer", "blocked", "does not exist"))
+            if what != "reply":
+                self.st["backoff_until"] = now + 1800
+                self.alert("403", "X refused a %s (403): %s -- back off 30 min. Check the app's permissions." % (what, text[:160]))
+                return "403"
+            if counts:
+                self.st["refusals"] = int(self.st.get("refusals") or 0) + 1
+                if self.st["refusals"] >= 3:
+                    self.st["refusals"] = 0
+                    self.st["backoff_until"] = now + 1800
+                    self.alert("403", "X refused 3 replies in a row (last: %s). The lane pauses 30 min." % text[:160])
+                    return "403-streak"
+                return "403"
+            return "403-nocount"
+        if code == 429:
+            try:
+                reset = float(hdrs.get("x-rate-limit-reset") or 0)
+            except ValueError:
+                reset = 0
+            until = reset if now + 5 <= reset <= now + 3600 else now + 900
+            self.st["backoff_until"] = until
+            log("X rate limit (429) on %s: sleeping until %s" % (what, time.strftime("%H:%M:%SZ", time.gmtime(until))))
+            return "429"
+        self.st["backoff_until"] = now + 120
+        log("X %s failed (%s %s): back off 2 min" % (what, code, (text or "")[:100]))
+        return "error %s" % code
+
+    def x_me(self):
+        """The bot's own user id, once (one billed read, booked as a user read), cached in state."""
+        if self.st.get("user_id"):
+            return "ok"
+        p = prices()
+        why = self.can_spend(p["user"], "users/me")
+        if why:
+            return why
+        if not self.book("read", -p["user"], 0, "users/me"):
+            return "ledger-failed"
+        code, hdrs, text = self.xreq("GET", "/2/users/me")
+        if code != 200:
+            self.book("read_adjust", p["user"], 0, "users/me:error")
+            return self.x_error(code, hdrs, text, "users/me")
+        try:
+            d = json.loads(text)["data"]
+            uid, uname = str(d["id"]), str(d.get("username") or "")
+        except Exception:
+            self.st["backoff_until"] = self.now() + 120
+            return "error me-body"
+        if uname and uname.casefold() != BOT_HANDLE.casefold():
+            self.st["dead"] = "wrong account"
+            self.alert("account", "the X keys belong to @%s, not @%s. Stopped." % (uname, BOT_HANDLE))
+            return "wrong-account"
+        self.st["user_id"] = uid
+        log("I am @%s (id %s)" % (uname or "?", uid))
+        return "ok"
+
+    # ---- one poll of the mentions
+    def cycle(self):
+        """One poll: the gates, the booking, the call, the correction, then every post in order. Returns a reason."""
+        now = self.now()
+        if os.path.exists(P("OFF")):
+            return "off"
+        self.stop_watch()
+        if self.st.get("dead"):
+            return "dead"
+        if now < float(self.st.get("backoff_until") or 0):
+            return "backoff"
+        self.seed_sync()
+        if not keys():
+            self.st["dead"] = "no keys"
+            self.alert("keys", "the four X keys are missing (x.env). Stopped.")
+            return "no-keys"
+        r = self.x_me()
+        if r != "ok":
+            return r
+        p = prices()
+        cost = MAX_RESULTS * p["read"]
+        why = self.can_spend(cost, "a poll")
+        if why:
+            return why
+        if not self.st.get("since_id"):
+            self.st["since_id"] = str(snowflake(self.x_now()))
+            log("first start: since_id = now (%s); the backlog is never read" % self.st["since_id"])
+            self.save()
+        if not self.book("read", -cost, 0, "poll"):
+            return "ledger-failed"
+        params = {"since_id": self.st["since_id"], "max_results": str(MAX_RESULTS),
+                  "tweet.fields": "author_id,created_at,in_reply_to_user_id,referenced_tweets,entities,edit_history_tweet_ids,note_tweet,reply_settings"}
+        code, hdrs, text = self.xreq("GET", "/2/users/%s/mentions" % self.st["user_id"], params)
+        if code != 200:
+            self.book("read_adjust", cost, 0, "poll:error")
+            return self.x_error(code, hdrs, text, "poll")
+        try:
+            d = json.loads(text)
+            posts = d.get("data") or []
+            meta = d.get("meta") or {}
+            if not isinstance(posts, list):
+                raise ValueError("data is not a list")
+        except Exception:
+            self.st["backoff_until"] = self.now() + 120
+            log("poll: unreadable answer from X; the booked reads stay booked; back off 2 min")
+            return "error body"
+        n = len(posts)
+        if n < MAX_RESULTS:
+            self.book("read_adjust", (MAX_RESULTS - n) * p["read"], 0, "poll:%d" % n)
+        self.today()["posts"] += n
+        if n:
+            newest = str(meta.get("newest_id") or max(int(x.get("id") or 0) for x in posts))
+            if int(newest) > int(self.st["since_id"]):
+                self.st["since_id"] = newest
+        reasons = []
+        for post in sorted(posts, key=lambda x: int(x.get("id") or 0)):
+            try:
+                reasons.append(self.handle_post(post))
+            except Exception as e:
+                log("post %s: error %s" % (post.get("id"), e))
+                reasons.append("error")
+            if self.stopping:
+                pass                                        # the cycle in hand is always finished
+        return "polled %d: %s" % (n, ",".join(reasons)) if n else "empty"
+
+    # ---- the checks of charter section 4, in order
+    def author(self, a):
+        rec = self.st["authors"].setdefault(a, {})
+        d = day_of(self.now())
+        if rec.get("day") != d:
+            rec.update({"day": d, "n": 0, "trips": 0})
+        return rec
+
+    def trip(self, a, why):
+        rec = self.author(a)
+        rec["trips"] = int(rec.get("trips") or 0) + 1
+        self.today()["trips"][a] = rec["trips"]
+        if rec["trips"] >= TRIPS_TO_IGNORE and not self.ignored(a):
+            until = self.now() + IGNORE_S
+            try:
+                with open(P("ignore.txt"), "a", encoding="utf-8", newline="\n") as fh:
+                    fh.write("%s\t%d\t%s\n" % (a, until, day_of(until)))
+            except OSError as e:
+                log("could not write ignore.txt: %s" % e)
+            log("author %s ignored for a week after %d trips today (last: %s)" % (a, rec["trips"], why))
+
+    def ignored(self, a):
+        now = self.now()
+        for line in (read_text("ignore.txt") or "").splitlines():
+            f = line.split("\t")
+            if f and f[0] == a and len(f) > 1:
+                try:
+                    if float(f[1]) > now:
+                        return True
+                except ValueError:
+                    pass
+        return False
+
+    def opted_out(self, a):
+        return a in (read_text("optout.txt") or "").split()
+
+    def open_code_for(self, a):
+        now = self.now()
+        return any(c.get("author") == a and c.get("status") in ("open", "minted") and float(c.get("expires_at") or 0) > now
+                   for c in self.codes.values())
+
+    def handle_post(self, post):
+        now = self.now()
+        pid = str(post.get("id") or "")
+        author = str(post.get("author_id") or "")
+        text = str(post.get("text") or "")
+        if not pid or not author:
+            return "malformed"
+        refs = [str(r.get("type")) for r in (post.get("referenced_tweets") or []) if isinstance(r, dict)]
+        if "retweeted" in refs:
+            return "retweet"
+        if "quoted" in refs:
+            return "quote"
+        if post.get("note_tweet"):
+            return "long"
+        if self.opted_out(author):
+            return "optedout"
+        if is_optout(text):
+            with open(P("optout.txt"), "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(author + "\n")
+            log("opt-out from author %s: never answered again" % author)
+            return "optout"
+        parsed = parse_play(text)
+        if not parsed:
+            return "not-for-bot"
+        ments = [m for m in ((post.get("entities") or {}).get("mentions") or []) if isinstance(m, dict)]
+        me = self.st.get("user_id") or ""
+        lead = _LEAD.match(text)
+        lead_end = lead.end() if lead else 0          # names X put in front (thread participants) are not the listener's friends
+        others, exclude, summoned = [], [], False
+        for m in ments:
+            mid, mu = str(m.get("id") or ""), str(m.get("username") or "")
+            try:
+                start = int(m.get("start") or 0)
+            except (TypeError, ValueError):
+                start = 0
+            if (mid and mid == me) or mu.casefold() == BOT_HANDLE.casefold():
+                summoned = True
+            elif mid and mid != author:
+                if mid not in exclude:
+                    exclude.append(mid)                  # nobody the listener's post names is ever tagged by the bot
+                if start >= lead_end and mid not in others:
+                    others.append(mid)
+        if not summoned:
+            return "not-summoned"
+        if len(others) > 1:
+            return "second-friend"
+        rs = str(post.get("reply_settings") or "everyone")
+        if rs not in ("everyone", "mentionedUsers"):
+            return "reply-restricted"                    # X would refuse the reply (403): no mint, no count, no streak
+        created = parse_created(post.get("created_at"))
+        if created is None:
+            return "no-time"
+        age = self.x_now() - created
+        if age > MAX_AGE_S:
+            self.today()["old"] = int(self.today().get("old") or 0) + 1
+            return "old"
+        if age < -MAX_FUTURE_S:
+            return "future"
+        eh = post.get("edit_history_tweet_ids") or [pid]
+        key = str(eh[0])
+        if key != pid:
+            return "edited"
+        if key in self.st["seen"]:
+            return "seen"
+        self.st["seen"][key] = now
+        if self.ignored(author):
+            return "ignored"
+        rec = self.author(author)
+        last = float(rec.get("last") or 0)
+        rec["last"] = now
+        if now - last < AUTHOR_COOLDOWN_S:
+            self.trip(author, "cooldown")
+            return "cooldown"
+        if self.open_code_for(author):
+            self.trip(author, "open-code")
+            return "open-code"
+        if int(rec.get("n") or 0) >= PER_AUTHOR_DAY:
+            self.trip(author, "author-cap")
+            return "author-cap"
+        _k, q_raw, msg_raw = parsed
+        if not q_raw:
+            return "no-query"
+        q = ann.clean(q_raw, QUERY_MAX)
+        note = ann.clean(msg_raw, NOTE_MAX)
+        bl = ann.load_blocklist()
+        if (q and ann.blocked(q, bl)) or (note and ann.blocked(note, bl)):
+            self.trip(author, "blocklist")
+            log("blocklist hit from author %s: silence" % author)
+            return "blocked"
+        if len([t for t in self.st["stamps"] if now - t < 3600]) >= MAX_PER_HOUR:
+            if now - float(self.st.get("hour_cap_told") or 0) > 3600:
+                self.st["hour_cap_told"] = now
+                self.alert("hour", "%d replies in an hour -- quiet until the hour passes." % MAX_PER_HOUR)
+            return "hour-cap"
+        if not self.live():
+            rec["n"] = int(rec.get("n") or 0) + 1
+            self.st["stamps"].append(now)
+            self.today()["would"] += 1
+            self.st["would"].append({"ts": now, "post": pid, "author": author, "q": q, "note": note, "friend": others[:1], "exclude": exclude})
+            log("[practice] would reply to post %s (author %s): q=%r note=%r friend=%s" % (pid, author, q, note, others[:1]))
+            return "would-reply"
+        p = prices()
+        why = self.can_spend(p["reply"], "a reply")
+        if why:
+            return why
+        if not q:
+            return self.send(pid, author, exclude, compose_nomatch(""), "nomatch", None, note)
+        sats = self.current_price()
+        probe = compose_reply(SITE + "/?jukebox&p=" + "x" * 8, sats, sats + 210)
+        if weighted(probe) > 280:
+            self.alert("template", "the reply template runs over 280 -- nothing is minted.")
+            return "too-long"
+        code, body = self.post("/api/x/code", {"q": q, "sats": str(sats), "note": note})
+        if code == 409:
+            self.st["station_down_since"] = 0
+            if not self.st.get("sesh_since"):
+                self.st["sesh_since"] = now
+            if float(rec.get("sesh") or 0) >= float(self.st["sesh_since"]):
+                return "sesh-quiet"
+            rec["sesh"] = now
+            name = ann.clean(body.get("dj") or body.get("name") or "", 24) or "the crew"
+            return self.send(pid, author, exclude, compose_sesh(name), "sesh", None, note)
+        if code == 400:
+            self.st["station_down_since"] = 0
+            err = str(body.get("error") or "")
+            if "missing q" in err:
+                return self.send(pid, author, exclude, compose_nomatch(q), "nomatch", None, note)
+            self.alert("config", "the station refused a code (400: %s). Check price-sats (%d)." % (err[:100], sats))
+            return "config"
+        if code != 200 or not body.get("code") or not body.get("url"):
+            if not self.st.get("station_down_since"):
+                self.st["station_down_since"] = now
+            elif now - float(self.st["station_down_since"]) > STATION_DOWN_ALERT_S:
+                self.alert("station", "the station has not minted a code for 6 hours (last: HTTP %s %s)." % (code, str(body)[:80]))
+            log("station did not mint (HTTP %s %s): no code, no reply" % (code, str(body)[:100]))
+            return "station-down"
+        self.st["station_down_since"] = 0
+        self.st["sesh_since"] = 0
+        xc = str(body["code"])
+        url = str(body["url"])
+        sats_m = int(body.get("sats") or sats)
+        wl = int(body.get("wl_sats") or sats_m + 210)
+        self.codes[xc] = {"author": author, "sats": sats_m, "wl_sats": wl, "minted_ts": now,
+                          "expires_at": now + int(body.get("expires_in") or CODE_LIFE_S), "status": "open", "post": pid, "q": q}
+        self.save_codes()
+        return self.send(pid, author, exclude, compose_reply(url, sats_m, wl), "code", xc, note)
+
+    def send(self, pid, author, exclude, text, kind, xc, note=""):
+        """In-flight to disk, the reply in the book, THEN the POST, THEN 'sent'. Never a second reply for this post."""
+        now = self.now()
+        rec = self.author(author)
+        ref = ("code:%s" % xc) if xc else kind
+        self.st["inflight"][pid] = {"code": xc or "", "author": author, "kind": kind, "ts": now, "day_n": int(rec.get("n") or 0) + 1}
+        try:
+            self.save()
+        except Exception as e:
+            log("could not write the in-flight record: %s -- no reply" % e)
+            self.st["inflight"].pop(pid, None)
+            return "state-failed"
+        if not self.book("reply", -prices()["reply"], 0, ref):
+            self.st["inflight"].pop(pid, None)
+            if xc:
+                self.tell("X jukebox: code %s was minted but the reply was not sent (the ledger cannot be written)." % xc)
+            return "booking-failed"
+        if weighted(text) > 280:
+            self.st["inflight"].pop(pid, None)
+            return "too-long"
+        body = {"text": text, "reply": {"in_reply_to_tweet_id": pid}}
+        if exclude:
+            body["reply"]["exclude_reply_user_ids"] = list(exclude)
+        bal_before = None                               # charter section 3: the real balance around the first reply of the day
+        if self.st.get("balance_day") != day_of(now) and os.path.exists(P("balance-check")):
+            self.st["balance_day"] = day_of(now)
+            bal_before = self.balance_check("before the first reply of the day")
+        code, hdrs, resp = self.xreq("POST", "/2/tweets", None, body)
+        self.st["inflight"].pop(pid, None)
+        if code in (200, 201):
+            rec["n"] = int(rec.get("n") or 0) + 1        # counted only when X took the reply (a refusal burns nothing)
+            self.st["stamps"].append(now)
+            self.st["refusals"] = 0
+            self.today()["replies"] += 1
+            try:
+                rid = json.loads(resp).get("data", {}).get("id", "?")
+            except Exception:
+                rid = "?"
+            log("replied %s to post %s (%s%s): %s" % (rid, pid, kind, (" " + xc) if xc else "", text.replace("\n", " / ")))
+            if bal_before is not None:
+                after = self.balance_check("after the first reply of the day")
+                if after is not None:
+                    taken, expect = bal_before - after, prices()["reply"]
+                    log("balance check: X took $%.4f for the reply; the book expected $%.4f" % (taken, expect))
+                    if taken > 3 * expect:
+                        self.st["dead"] = "balance"
+                        self.alert("balance", "X took $%.4f for one reply, more than 3x the booked $%.4f. Stopped until restarted; check prices.json." % (taken, expect))
+            self.save()
+            return "replied"
+        r = self.x_error(code, hdrs, resp, "reply")
+        log("reply to post %s NOT sent (HTTP %s %s): %s" % (pid, code, r, resp[:160]))
+        if xc:
+            self.alert("minted-unsent", "code %s was minted but the reply was not sent (HTTP %s: %s). The post is not retried." % (xc, code, resp[:120]))
+        self.save()
+        return "reply-failed"
+
+    # ---- the code watcher and the announcer count
+    def watch(self):
+        now = self.now()
+        changed = False
+        for xc, c in list(self.codes.items()):
+            if c.get("status") == "paid":
+                if now - float(c.get("paid_ts") or now) > 86400:
+                    self.codes.pop(xc)
+                    changed = True
+                continue
+            if now > float(c.get("minted_ts") or 0) + PAID_WINDOW_S:
+                self.codes.pop(xc)
+                changed = True
+                continue
+            if now < float(c.get("expires_at") or 0) + 120 or c.get("status") == "open":
+                code, body = self.get("/api/x/code", c=xc)
+                if code == 200:
+                    if body.get("status") == "minted" and c.get("status") != "minted":
+                        c.update({"status": "minted", "artist": body.get("artist") or "", "title": body.get("title") or ""})
+                        changed = True
+                        if self.st.get("sesh_since"):
+                            self.st["sesh_since"] = 0        # a mint went through at the station: the sesh is over
+                elif code == 404 and c.get("status") == "open":
+                    c["status"] = "dead"
+                    changed = True
+        code, body = self.get("/api/nowplaying")
+        if code == 200:
+            changed = self.scan_nowplaying(body) or changed
+            changed = self.quote_onair(body) or changed      # nr_xquote: after the credit, never before it
+        if changed:
+            self.save_codes()
+        return changed
+
+    def scan_nowplaying(self, body):
+        """A paid request on air or in the queue: ours (a minted code's song, requested via X) -> income; else the
+        announcer's post is counted for the console wall."""
+        now = self.now()
+        a = self.st["ann"]
+        if a.get("month") != month_of(now):
+            a.update({"month": month_of(now), "n": 0})
+        a["seen"] = {k: v for k, v in (a.get("seen") or {}).items() if now - v < 86400}
+        changed = False
+        items = [body.get("now_playing")] + list(body.get("queue") or [])
+        for t in items:
+            if not isinstance(t, dict) or not t.get("requested") or not t.get("req_id"):
+                continue
+            rid = str(t["req_id"])
+            if rid in a["seen"]:
+                continue
+            a["seen"][rid] = now
+            via, who = str(t.get("note_via") or ""), str(t.get("who") or "")
+            ours = None
+            if via == "x" and who == "an X listener":          # strictly the X lane's own stamp
+                key = ((t.get("artist") or "").casefold(), (t.get("title") or "").casefold())
+                hits = [(int(c.get("sats") or 0), float(c.get("minted_ts") or 0), xc) for xc, c in self.codes.items()
+                        if c.get("status") == "minted" and ((c.get("artist") or "").casefold(), (c.get("title") or "").casefold()) == key]
+                if hits:
+                    hits.sort()
+                    ours = hits[0][2]                            # the LOWEST sats when more than one code holds the song
+                    if len(hits) > 1:
+                        log("ambiguous: %d minted codes hold %s - %s; crediting the lowest (%s, %d sats)" % (len(hits), t.get("artist"), t.get("title"), ours, hits[0][0]))
+            if ours is None:
+                a["n"] = int(a.get("n") or 0) + 1
+                continue
+            c = self.codes[ours]
+            if self.ledger.count(("income", "unconverted"), 0, "code:%s" % ours):
+                log("code %s is already in the book as paid; not booked twice" % ours)
+                c.update({"status": "paid", "paid_ts": now, "req_id": rid})
+                changed = True
+                continue
+            p = prices()
+            self.book("onair", -p["post"], 0, "code:%s" % ours)
+            sats = int(c.get("sats") or 0)
+            rate = self.rate_usd()
+            booked = False
+            if rate is not None:
+                usd = round(sats / 1e8 * rate, 6)
+                booked = self.book("rate", 0, 0, self.rate_ref()) and self.book("income", usd, sats, "code:%s" % ours)
+                if booked:
+                    log("PAID: code %s -> %s - %s, %d sats = $%.4f (float %.3f)" % (ours, t.get("artist"), t.get("title"), sats, usd, self.ledger.float()))
+            if not booked:
+                self.book("unconverted", 0, sats, "code:%s" % ours)
+                self.st["unconverted"].append({"code": ours, "sats": sats, "ts": now})   # state keeps it even if that line failed too
+                log("PAID: code %s -> %s - %s, %d sats wait in the book as sats" % (ours, t.get("artist"), t.get("title"), sats))
+            c.update({"status": "paid", "paid_ts": now, "req_id": rid})
+            self.today()["paid"] += 1
+            changed = True
+        return changed
+
+    # ---- nr_xquote (SF 2026-09-13): the on-air post is a quote post of the listener's own request
+    def quote_onair(self, body):
+        """The song a listener paid for through X is NOW PLAYING: quote their original post, once.
+        The cost was booked as "onair" when scan_nowplaying credited the song, so nothing more is booked here."""
+        np = body.get("now_playing") if isinstance(body, dict) else None
+        if not isinstance(np, dict) or not np.get("requested") or not np.get("req_id"):
+            return False
+        rid = str(np["req_id"])
+        hits = [xc for xc, c in self.codes.items()
+                if c.get("status") == "paid" and str(c.get("req_id") or "") == rid and not c.get("quoted")]
+        if not hits:
+            return False
+        xc = hits[0]
+        c = self.codes[xc]
+        src = str(c.get("post") or "")
+        if not src:
+            c["quoted"] = "no-source"
+            return True
+        text = compose_onair(np.get("artist") or c.get("artist") or "", np.get("title") or c.get("title") or "",
+                             np.get("note") or "", ann.load_blocklist())
+        if not text or weighted(text) > 280:
+            c["quoted"] = "nothing-to-say"
+            log("code %s on air, but there is nothing to say; no quote post" % xc)
+            return True
+        if not self.live():
+            c["quoted"] = "practice"
+            log("[practice] would quote post %s (code %s): %s" % (src, xc, text))
+            return True
+        if self.st.get("dead") or self.now() < float(self.st.get("backoff_until") or 0):
+            return False                                   # tried again next minute, while the song is still on air
+        c["quoted"] = "inflight"                           # on disk BEFORE the call: a crash never posts twice
+        try:
+            self.save_codes()
+        except Exception as e:
+            c.pop("quoted", None)
+            log("could not write codes.json before the quote post (%s) -- not posted" % e)
+            return False
+        code, hdrs, resp = self.xreq("POST", "/2/tweets", None, {"text": text, "quote_tweet_id": src})
+        if code in (200, 201):
+            c["quoted"] = "posted"
+            try:
+                qid = json.loads(resp).get("data", {}).get("id", "?")
+            except Exception:
+                qid = "?"
+            c["quote_id"] = qid
+            log("quoted %s -> %s (code %s): %s" % (src, qid, xc, text))
+            if "\u201c" in text:
+                self.tell("X jukebox: quote post %s carried a shoutout. Delete it on X if it must go: %s" % (qid, text))
+            return True
+        low = (resp or "").lower()
+        if code in (400, 403, 404) and any(w in low for w in ("deleted", "not found", "no longer", "does not exist",
+                                                               "unavailable", "not allowed", "cannot quote")):
+            c["quoted"] = "source-gone"
+            log("the listener's post %s cannot be quoted (HTTP %s: %s) -- not retried" % (src, code, resp[:160]))
+            return True
+        c["quoted"] = "failed"
+        r = self.x_error(code, hdrs, resp, "quote post")
+        log("quote post for code %s NOT sent (HTTP %s %s): %s" % (xc, code, r, (resp or "")[:160]))
+        return True
+
+    # ---- the daily line and the balance check
+    def daily_line(self):
+        now = self.now()
+        d = day_of(now)
+        if self.st.get("daily_line") == d or time.gmtime(now).tm_hour < DAILY_LINE_H:
+            return False
+        self.st["daily_line"] = d
+        t = self.today()
+        acc = self.st.get("rate_accepted") or {}
+        age = ("%.0f h" % ((now - float(acc["ts"])) / 3600)) if acc.get("ts") else "-"
+        offenders = [a for a, n in (t.get("trips") or {}).items() if n >= TRIPS_TO_IGNORE]
+        line = ("day %s: %d posts read (%d too old), %d replies, %d would-reply, %d paid songs; spent today $%.3f, this month $%.2f "
+                "(+$%.2f for %d announcer posts seen by this bot); float $%.3f; price %d sats%s; rate $%s (%s old); %s; repeat offenders: %s" % (
+                    d, t["posts"], int(t.get("old") or 0), t["replies"], t["would"], t["paid"], self.spend_today(), self.spend_month(), self.announcer_estimate(),
+                    int(self.st["ann"].get("n") or 0) if self.st["ann"].get("month") == month_of(now) else 0,
+                    self.ledger.float(), self.current_price(), " (by hand)" if self.st["price"].get("hand") else "",
+                    ("%.0f" % float(acc["usd"])) if acc.get("usd") else "none", age, "LIVE" if self.live() else "practice",
+                    ", ".join(offenders) or "none"))
+        log("daily line: " + line)
+        self.tell("X jukebox " + line)
+        return True
+
+    def balance_check(self, when):
+        """Behind the balance-check file. GET /2/usage/credits is UNVERIFIED for pay-per-use: tolerant of 404, logged."""
+        if not os.path.exists(P("balance-check")):
+            return None
+        pu = prices()["user"]
+        if not self.book("read", -pu, 0, "usage/credits"):
+            return None
+        code, hdrs, text = self.xreq("GET", "/2/usage/credits")
+        if code == 404:
+            self.book("read_adjust", pu, 0, "usage/credits:404")
+        log("balance check (%s): HTTP %s %s" % (when, code, (text or "")[:300].replace("\n", " ")))
+        val = None
+        if code == 200:
+            try:
+                d = json.loads(text)
+                flat = d.get("data", d) if isinstance(d, dict) else {}
+                for k, v in (flat.items() if isinstance(flat, dict) else []):
+                    if isinstance(v, (int, float)) and any(w in k.lower() for w in ("balance", "credit", "remaining", "available")):
+                        val = float(v)
+                        break
+            except Exception:
+                pass
+        self.st["credits"] = {"ts": self.now(), "http": code, "value": val, "when": when, "body": (text or "")[:300]}
+        return val
+
+    # ---- the service tick
+    def tick(self):
+        now = self.now()
+        out = []
+        if os.path.exists(P("OFF")):
+            return "off"
+        if now >= self.due.get("rates", 0):
+            self.due["rates"] = now + 60
+            self.fetch_rates()
+            self.convert_pending()
+            self.price_daily()
+        if now >= self.due.get("poll", 0):
+            self.due["poll"] = now + POLL_S
+            r = self.cycle()
+            out.append(r)
+            if r not in ("backoff", "dead", "off", "empty"):
+                self.save()
+        if now >= self.due.get("watch", 0):
+            self.due["watch"] = now + WATCH_S
+            try:
+                if self.watch():
+                    self.save()
+            except Exception as e:
+                log("watch error: %s" % e)
+        if self.daily_line():
+            self.save()
+        return ",".join(out) or "idle"
+
+    def on_start(self):
+        """A restart means 'try again now'; a reply that was in flight at the last stop is never sent again."""
+        self.st["dead"] = ""
+        self.st["backoff_until"] = 0
+        for pid, rec in list(self.st["inflight"].items()):
+            self.st["seen"][pid] = self.now()
+            log("a reply to post %s (%s %s) was in flight at the last stop: NOT resent" % (pid, rec.get("kind"), rec.get("code") or ""))
+            if rec.get("code"):
+                self.tell("X jukebox: at the last stop a reply for code %s was in flight; it is not resent." % rec["code"])
+        self.st["inflight"] = {}
+        if self.ledger.bad:
+            self.alert("ledger", "%d damaged line(s) in ledger.tsv were skipped on start; the float may be off." % self.ledger.bad)
+
+
+ONAIR_HEAD = "Now playing on NoderunnersRadio.com\U0001F3A7 "     # SF's wording, 2026-09-13
+
+
+def compose_onair(artist, title, note, blocklist=()):
+    """The quote post's text: 'Now playing on NoderunnersRadio.com🎧 Artist — Title.' and, when the listener left one,
+    ' With shoutout: “…”'. The announcer's clean() and word list, so one set of rules everywhere. None = nothing to say."""
+    a0 = ann.clean(artist, 80, tracknum=True)
+    t0 = ann.clean(title, 120, tracknum=True)
+    if t0.casefold() == "unknown track":
+        t0 = ""
+    if not a0 and not t0:
+        return None
+    n0 = ann.clean(note, 80)
+    if n0 and blocklist and ann.blocked(n0, blocklist):
+        log("shoutout withheld (blocklist): " + n0)
+        n0 = ""
+
+    def build(a, t, n):
+        song = "%s \u2014 %s" % (a, t) if a and t else (a or t)
+        s = ONAIR_HEAD + song + ("" if song[-1:] in ".!?\u2026" else ".")
+        if n:
+            s += " With shoutout: \u201c%s\u201d" % n
+        return s
+
+    def cut(x, keep):
+        return x if keep >= len(x) else x[:keep].rstrip() + "\u2026"
+
+    note, keep_n, keep_t, keep_a = n0, len(n0), len(t0), len(a0)
+    text = build(a0, t0, note)
+    while weighted(text) > 280 and keep_n > 12:                 # 1. shorten the shoutout
+        keep_n -= 1; note = cut(n0, keep_n); text = build(a0, t0, note)
+    if weighted(text) > 280 and note:                           # 2. drop it
+        note = ""; text = build(a0, t0, note)
+    while weighted(text) > 280 and keep_t > 8:                  # 3. shorten the title
+        keep_t -= 1; text = build(a0, cut(t0, keep_t), note)
+    while weighted(text) > 280 and keep_a > 4:                  # 4. shorten the artist
+        keep_a -= 1; text = build(cut(a0, keep_a), cut(t0, keep_t), note)
+    return text
+
+
+def compute_price(p, btc_usd, unpaid):
+    """charter section 2: (owned read + reply + post + unpaid_per_paid x (owned read + reply)) x margin, in sats,
+    rounded up to the next 10, never under 100, never over 500."""
+    usd = (p["read_owned"] + p["reply"] + p["post"] + unpaid * (p["read_owned"] + p["reply"])) * p["margin"]
+    sats = usd / float(btc_usd) * 1e8
+    sats = int(math.ceil(sats / 10.0 - 1e-9) * 10)
+    return max(PRICE_MIN, min(PRICE_MAX, sats))
+
+
+# ---------------------------------------------------------------- main
+_stop = False
+
+
+def _on_term(signum, frame):
+    """systemd stop/restart: the cycle in hand is finished (a reply X already accepted must be marked sent), then leave."""
+    global _stop
+    _stop = True
+
+
+def check_cmd():
+    """State and settings, no network, no writes."""
+    bot = Bot()
+    st = bot.st
+    now = CLOCK()
+    print("home: %s\nstation: %s   X: %s\nkeys: %s\nmode: %s   LIVE: %s   OFF: %s" % (
+        HOME, API, X_API, "present" if keys() else "MISSING", "LIVE" if bot.live() else "PRACTICE (touch %s to go live)" % P("LIVE"),
+        os.path.exists(P("LIVE")), os.path.exists(P("OFF"))))
+    print("bot user id: %s   since_id: %s   clock offset: %s s" % (st.get("user_id") or "(not yet)", st.get("since_id") or "(first start)", st.get("clock_offset")))
+    print("ledger: %d lines (%d bad)   float: $%.4f   spent today: $%.4f   this month: $%.4f (+announcer est. $%.2f)" % (
+        len(bot.ledger.rows), bot.ledger.bad, bot.ledger.float(), bot.spend_today(), bot.spend_month(), bot.announcer_estimate()))
+    print("seed-usd: %s   budget-usd-per-day: %s   console-cap-usd: %s (wall at 70%% = $%.2f)" % (
+        read_float_file("seed-usd"), read_float_file("budget-usd-per-day"), bot.console_cap(), CONSOLE_WALL * bot.console_cap()))
+    p = prices()
+    print("prices booked: read %.3f reply %.3f post %.3f user %.3f   song price: %d sats (%s)   unpaid per paid: %.2f" % (
+        p["read"], p["reply"], p["post"], p["user"], bot.current_price(), "file by hand" if st["price"].get("hand") else ("file" if bot.price_file() else "default"), bot.unpaid_per_paid()))
+    acc = st.get("rate_accepted") or {}
+    print("rate: %s   unconverted: %d   open codes: %d   minted: %d   paid: %d" % (
+        ("$%.0f (%.1f h old)" % (float(acc["usd"]), (now - float(acc["ts"])) / 3600)) if acc.get("usd") else "none yet",
+        len(st.get("unconverted") or []), sum(1 for c in bot.codes.values() if c.get("status") == "open"),
+        sum(1 for c in bot.codes.values() if c.get("status") == "minted"), sum(1 for c in bot.codes.values() if c.get("status") == "paid")))
+    print("seen (24 h): %d   replies last hour: %d   dead: %s   backoff: %s   refusal streak: %d   in flight: %d" % (
+        len(st["seen"]), len([t for t in st["stamps"] if now - t < 3600]), st.get("dead") or "no",
+        "until %s" % time.strftime("%H:%M:%SZ", time.gmtime(float(st["backoff_until"]))) if now < float(st.get("backoff_until") or 0) else "no",
+        int(st.get("refusals") or 0), len(st["inflight"])))
+    print("opt-outs: %d   ignored: %d   would-reply lines: %d   blocklist: %d entries" % (
+        len((read_text("optout.txt") or "").split()), len((read_text("ignore.txt") or "").splitlines()), len(st["would"]), len(ann.load_blocklist()) if ann else -1))
+    if st["would"]:
+        w = st["would"][-1]
+        print("last would-reply: %s q=%r note=%r" % (time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(w["ts"])), w["q"], w["note"]))
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    if args not in ([], ["--once"], ["--check"]):
+        print(__doc__)
+        return 64
+    try:
+        load_announcer()
+    except Exception as e:
+        log("STOP: cannot load the announcer's text rules from %s: %s" % (ANN_PATH, e))
+        return 3
+    if args == ["--check"]:
+        return check_cmd()
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    try:
+        globals()["_LOCK"] = take_lock(P(".lock"))
+    except OSError:
+        log("STOP: another nr-xjukebox is running (the service?).")
+        return 65
+    bot = Bot()
+    bot.on_start()
+    try:
+        bot.save()
+    except Exception as e:
+        log("could not write the state file: %s" % e)
+    log("watching mentions every %d s -- %s; float $%.3f; price %d sats" % (
+        POLL_S, "LIVE (minting and replying)" if bot.live() else "PRACTICE (nothing is posted; touch %s to go live)" % P("LIVE"),
+        bot.ledger.float(), bot.current_price()))
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _on_term)
+    if args == ["--once"]:
+        r = bot.cycle()
+        bot.watch()
+        bot.save()
+        print(r)
+        return 0
+    return serve(bot)
+
+
+def serve(bot):
+    global _stop
+    while not _stop:
+        try:
+            bot.stopping = _stop
+            bot.tick()
+        except Exception as e:
+            log("tick error: %s" % e)
+        for _ in range(1):
+            if _stop:
+                break
+            SLEEP(1)
+    try:
+        bot.save()
+    except Exception as e:
+        log("could not write the state file: %s" % e)
+    log("stopping (signal); state saved")
+    return 0
+
+
+# ---------------------------------------------------------------- self-test: fakes only, nothing leaves the box
+def selftest():
+    global HOME, API, X_API, CLOCK
+    import tempfile, shutil, atexit
+    d = tempfile.mkdtemp(prefix="nr-xjukebox-test-")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    HOME = d
+    API = "http://127.0.0.1:9"            # a dead port: nothing the test does may reach a real station
+    X_API = "http://127.0.0.1:9"
+    load_announcer()
+    ann.HOME = os.path.join(d, "ann")
+    os.makedirs(ann.HOME)
+    with open(os.path.join(ann.HOME, "blocklist.txt"), "w", encoding="utf-8") as fh:
+        fh.write("badword\nkanker*\n")
+    os.environ.update({"X_API_KEY": "ck", "X_API_SECRET": "cs", "X_ACCESS_TOKEN": "at", "X_ACCESS_SECRET": "ats"})
+    fails, total = [], [0]
+
+    def check(name, cond):
+        total[0] += 1
+        print(("PASS " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    # 1 the signer: the X docs' worked example (query + form parameters in the base string)
+    h = oauth_header("POST", "https://api.twitter.com/1.1/statuses/update.json", "xvz1evFS4wEEPTGEFPHBog", "kAcSOqF21Fu85e7zjz7ZN2U4ZRhfV3WpwPAoE3Z7kBw",
+                     "370773112-GmHxMAgYyLbNEtIKZeRNFsMKPR9EyMZeS9weJAEb", "LswwdoUaIvS8ltyTt5jkRh4J50vUPVVHtR2YPi5kE",
+                     params={"include_entities": "true", "status": "Hello Ladies + Gentlemen, a signed OAuth request!"},
+                     nonce="kYjzVBB8Y0ZFabxSWbWovY3uYSQ2pTgmZeNu2VS4cg", ts=1318622958)
+    check("signer known answer (X docs): query + body params signed", 'oauth_signature="hCtSmYh%2BiHYCEqBWrE7C7hYmtUk%3D"' in h)
+    h2 = oauth_header("POST", "https://api.twitter.com/1.1/statuses/update.json", "xvz1evFS4wEEPTGEFPHBog", "kAcSOqF21Fu85e7zjz7ZN2U4ZRhfV3WpwPAoE3Z7kBw",
+                      "370773112-GmHxMAgYyLbNEtIKZeRNFsMKPR9EyMZeS9weJAEb", "LswwdoUaIvS8ltyTt5jkRh4J50vUPVVHtR2YPi5kE",
+                      params=None, nonce="kYjzVBB8Y0ZFabxSWbWovY3uYSQ2pTgmZeNu2VS4cg", ts=1318622958)
+    check("signer: leaving the query out changes the signature (the announcer's bug)", "hCtSmYh" not in h2)
+    base = oauth_base("GET", "https://api.x.com/2/users/1/mentions", {"since_id": "5", "tweet.fields": "a,b", "oauth_version": "1.0"})
+    check("base string: sorted, twice-encoded parameters", base == "GET&https%3A%2F%2Fapi.x.com%2F2%2Fusers%2F1%2Fmentions&oauth_version%3D1.0%26since_id%3D5%26tweet.fields%3Da%252Cb")
+    # 2 xlen / weighted
+    check("xlen: emoji weighs 2, ascii 1", xlen("🎧a") == 3 and xlen("abc") == 3)
+    check("weighted: a link weighs 23", weighted("see https://noderunnersradio.com/?jukebox&p=abcdefgh now") == 4 + 23 + 4)
+    check("weighted: a bare domain weighs 23", weighted("go noderunnersradio.com") == 3 + 23)
+    t = compose_reply("https://noderunnersradio.com/?jukebox&p=k7q2m3xz", 500, 710)
+    check("the reply fits 280 weighted at the top price and carries nothing but the url that autolinks", weighted(t) <= 280 and t.count("http") == 1 and "@" not in t and "#" not in t)
+    check("the reply wording is final", t.startswith("Pick your song and zap: https://noderunnersradio.com/?jukebox&p=k7q2m3xz\n500 sats · a Wavlake song 710 sats · good for 15 minutes · cheaper on the site itself"))
+    check("the no-match link prefills the search", compose_nomatch("dire straits") == NOMATCH.format(url="https://noderunnersradio.com/?jukebox&q=dire%20straits"))
+    check("the live-sesh words", compose_sesh("DJ Ann") == "A live sesh is on — DJ Ann has the deck. The jukebox reopens when the sesh ends. noderunnersradio.com" and "the crew" in compose_sesh(""))
+    # 3 parsing
+    check("parse: play a | b", parse_play("@JukeboxLNDbot play dire straits | thanks Marco") == ("play", "dire straits", "thanks Marco"))
+    check("parse: @bot play (no query)", parse_play("@JukeboxLNDbot play") == ("play", "", ""))
+    check("parse: PLAY is case-insensitive", parse_play("@JukeboxLNDbot PLAY Nero") == ("play", "Nero", ""))
+    check("parse: several leading names are stripped", parse_play("@a @JukeboxLNDbot @b play x") == ("play", "x", ""))
+    check("parse: not a request when play is not first", parse_play("@JukeboxLNDbot hey play x") is None and parse_play("@JukeboxLNDbot playground") is None)
+    check("parse: html entities are unescaped", parse_play("@JukeboxLNDbot play Tom &amp; Jerry") == ("play", "Tom & Jerry", ""))
+    check("opt-out: stop", is_optout("@JukeboxLNDbot stop") and is_optout("@JukeboxLNDbot please STOP it") and not is_optout("@JukeboxLNDbot stopwatch"))
+    check("opt-out: Don't Stop Me Now is a request", not is_optout("@JukeboxLNDbot play Don't Stop Me Now") and parse_play("@JukeboxLNDbot play Don't Stop Me Now")[1] == "Don't Stop Me Now")
+    check("snowflake of a known moment", snowflake(1288834974.657 + 1) == (1000 << 22))
+    check("created_at parses", parse_created("2026-09-12T10:00:00.000Z") == calendar.timegm((2026, 9, 12, 10, 0, 0)))
+    # 4 the price formula (charter section 2)
+    p = prices()
+    check("prices: floors when there is no file", p["read"] == 0.005 and p["reply"] == 0.010 and p["post"] == 0.015 and p["margin"] == 1.5)
+    with open(P("prices.json"), "w") as fh:
+        fh.write(json.dumps({"read": 0.001, "reply": 0.02, "post": "x"}))
+    p = prices()
+    check("prices: the file may raise, never lower", p["read"] == 0.005 and p["reply"] == 0.02 and p["post"] == 0.015)
+    os.remove(P("prices.json"))
+    p = prices()
+    check("price at 77,130 with unpaid 2 -> 100", compute_price(p, 77130, 2) == 100)
+    check("price at 40,000 with unpaid 2 -> 180", compute_price(p, 40000, 2) == 180)
+    check("price at 120,000 with unpaid 2 -> under 100, clamped to 100", compute_price(p, 120000, 2) == 100)
+    check("price clamps at 500", compute_price(p, 5000, 9) == 500)
+    # 5 the ledger
+    L = Ledger(P("ledger.tsv"))
+    t0 = {"t": 1_800_000_000.0}
+    CLOCK = lambda: t0["t"]
+    L.append("seed", 5.0, 0, "seed-usd=5.00")
+    L.append("read", -0.025, 0, "poll")
+    L.append("read_adjust", 0.015, 0, "poll:2")
+    L2 = Ledger(P("ledger.tsv"))
+    check("the float is replayed from the file", L2.float() == 4.99 and len(L2.rows) == 3)
+    check("spend today counts the spend kinds net of the correction", abs(L2.spend(day_start(t0["t"])) - 0.010) < 1e-9)
+    with open(P("ledger.tsv"), "a") as fh:
+        fh.write("garbage line\n")
+    L3 = Ledger(P("ledger.tsv"))
+    check("a damaged line is skipped and counted", L3.bad == 1 and L3.float() == 4.99)
+    os.remove(P("ledger.tsv"))
+    # 6 the bot with fakes
+    xlog, notes, station, posted = [], [], {"live": False, "down": False, "codes": {}, "np": {"now_playing": None, "queue": []}, "next": 1}, []
+    xmode = {"mentions": None, "tweets": None, "date_skew": 0.0}
+    inbox = []
+
+    def fx(method, path, params=None, body=None):
+        xlog.append((method, path, params, body))
+        hdrs = {"date": email.utils.formatdate(t0["t"] + xmode["date_skew"], usegmt=True)}
+        if path == "/2/users/me":
+            if xmode.get("me"):
+                c, b, h = xmode["me"]
+                return c, hdrs, b
+            return 200, hdrs, json.dumps({"data": {"id": "42", "username": "JukeboxLNDbot"}})
+        if path.endswith("/mentions"):
+            if xmode["mentions"]:
+                c, b, h = xmode["mentions"]
+                hdrs.update(h or {})
+                return c, hdrs, b
+            since = int(params["since_id"])
+            got = sorted([p_ for p_ in inbox if int(p_["id"]) > since], key=lambda p_: -int(p_["id"]))[:int(params["max_results"])]
+            return 200, hdrs, json.dumps({"data": got, "meta": {"result_count": len(got), "newest_id": got[0]["id"] if got else None}} if got else {"meta": {"result_count": 0}})
+        if path == "/2/tweets":
+            if xmode["tweets"]:
+                c, b, h = xmode["tweets"]
+                hdrs.update(h or {})
+                return c, hdrs, b
+            posted.append(body)
+            return 201, hdrs, json.dumps({"data": {"id": "9%03d" % len(posted), "text": body["text"]}})
+        if path == "/2/usage/credits":
+            if xmode.get("credits"):
+                c, b = xmode["credits"].pop(0)
+                return c, hdrs, json.dumps(b)
+            return 404, hdrs, "{}"
+        return 500, hdrs, "?"
+
+    def fget(path, timeout=8, **q):
+        if station["down"]:
+            return 0, {}
+        if path == "/api/x/code":
+            c = station["codes"].get(q.get("c"))
+            if not c:
+                return 404, {"error": "expired"}
+            out = {"q": c["q"], "sats": c["sats"], "wl_sats": c["sats"] + 210, "status": c["status"], "expires_in": 800}
+            if c["status"] == "minted":
+                out.update({"artist": c["artist"], "title": c["title"]})
+            return 200, out
+        if path == "/api/nowplaying":
+            return 200, station["np"]
+        return 404, {}
+
+    def fpost(path, form, timeout=15):
+        if station["down"]:
+            return 0, {}
+        if path == "/api/x/code":
+            if not form.get("q"):
+                return 400, {"error": "missing q"}
+            if int(form["sats"]) < 21:
+                return 400, {"error": "sats out of range (floor 21)"}
+            if station["live"]:
+                return 409, {"error": "A live sesh is on -- the DJ has the deck. The jukebox reopens when the sesh ends."}
+            code = "code%04d" % station["next"]
+            station["next"] += 1
+            station["codes"][code] = {"q": form["q"], "sats": int(form["sats"]), "note": form.get("note", ""), "status": "open"}
+            return 200, {"code": code, "sats": int(form["sats"]), "wl_sats": int(form["sats"]) + 210, "expires_in": 900, "url": SITE + "/?jukebox&p=" + code}
+        return 404, {}
+
+    rates = {"a": 77130.0, "b": 77000.0}
+
+    def ffetch(url, timeout=8):
+        if url == RATE_A:
+            if rates["a"] is None:
+                raise OSError("down")
+            return {"data": {"base": "BTC", "currency": "USD", "amount": "%.2f" % rates["a"]}}
+        if rates["b"] is None:
+            raise OSError("down")
+        return {"error": [], "result": {"XXBTZUSD": {"a": ["1"], "c": ["%.1f" % rates["b"], "0.1"]}}}
+
+    def mk(author, text, secs_ago=5, friends=(), rt=None, note_tweet=None, edited=False, bot=True, lead=(), reply_settings=None):
+        pid = str(snowflake(t0["t"]) + len(inbox))
+        ments = ([{"start": 0, "end": 14, "username": "JukeboxLNDbot", "id": "42"}] if bot else []) + [{"start": 900, "end": 905, "username": "f%s" % f, "id": f} for f in friends]
+        ments += [{"start": 0, "end": 5, "username": "t%s" % f, "id": f} for f in lead]          # names X put in front (a thread)
+        post = {"id": pid, "author_id": author, "text": text, "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t0["t"] - secs_ago)),
+                "entities": {"mentions": ments}, "edit_history_tweet_ids": [str(int(pid) - 7) if edited else pid]}
+        if reply_settings:
+            post["reply_settings"] = reply_settings
+        if rt:
+            post["referenced_tweets"] = [{"type": rt, "id": "1"}]
+        if note_tweet:
+            post["note_tweet"] = {"text": note_tweet}
+        inbox.append(post)
+        return post
+
+    def run():
+        r = bot.cycle()
+        inbox.clear()
+        return r
+
+    write_text("budget-usd-per-day", "0.50\n")
+    write_text("console-cap-usd", "60\n")
+    bot = Bot(xcall=fx, getter=fget, poster=fpost, notifier=lambda s: notes.append(s), fetcher=ffetch)
+    check("no seed: the purse is empty and the lane is quiet, SF told once", bot.cycle() == "purse" and any("purse is empty" in n for n in notes) and not xlog)
+    write_text("seed-usd", "5.00\n")
+    r = bot.cycle()
+    check("the seed is booked once, users/me read once and booked, since_id = now", bot.ledger.rows[0][1] == "seed" and bot.ledger.rows[0][2] == 5.0
+          and bot.ledger.rows[1][1:3] == ("read", -0.010) and bot.st["user_id"] == "42" and bot.st["since_id"] == str(snowflake(t0["t"])))
+    check("an empty poll costs nothing (booked 5 reads, corrected to 0)", r == "empty" and bot.ledger.rows[-2][1:3] == ("read", -0.025) and bot.ledger.rows[-1][1:3] == ("read_adjust", 0.025) and abs(bot.ledger.float() - 4.99) < 1e-9)
+    n0 = len(bot.ledger.rows)
+    bot.cycle()
+    check("the seed is not booked again", len(bot.ledger.rows) == n0 + 2 and bot.ledger.count(("seed", "topup"), 0) == 1)
+    write_text("seed-usd", "7.00\n")
+    bot.cycle()
+    check("a change of seed-usd is booked once as a topup", bot.ledger.count(("topup",), 0) == 1 and bot.ledger.last(("topup",))[2] == 2.0)
+    # practice mode
+    t0["t"] += 60
+    p0 = mk("A1", "@JukeboxLNDbot play dire straits | thanks Marco")
+    r = run()
+    check("practice: would-reply logged, nothing posted, no code minted", r.endswith("would-reply") and not posted and not station["codes"] and bot.st["would"][-1]["q"] == "dire straits" and bot.st["would"][-1]["note"] == "thanks Marco")
+    check("read_adjust after a poll of 1 post booked as 5", bot.ledger.rows[-1][1:3] == ("read_adjust", 0.020) and bot.ledger.rows[-1][4] == "poll:1")
+    check("since_id moves to the newest post", bot.st["since_id"] == p0["id"])
+    open(P("LIVE"), "w").close()
+    # live: the plain path
+    t0["t"] += 60
+    p1 = mk("A2", "@JukeboxLNDbot play dire straits | for Marco", friends=("77",))
+    r = run()
+    check("live: one reply with the station's url and the price", r.endswith("replied") and len(posted) == 1 and "?jukebox&p=code0001" in posted[0]["text"] and "100 sats" in posted[0]["text"] and "310 sats" in posted[0]["text"])
+    check("the POST body replies to the post and excludes the friend", posted[0]["reply"]["in_reply_to_tweet_id"] == p1["id"] and posted[0]["reply"]["exclude_reply_user_ids"] == ["77"])
+    check("the message went to the station in note=, never echoed", station["codes"]["code0001"]["note"] == "for Marco" and "Marco" not in posted[0]["text"])
+    rows = [r_ for r_ in bot.ledger.rows if r_[1] == "reply"]
+    check("the reply is booked before the POST", rows and rows[-1][4] == "code:code0001" and rows[-1][2] == -0.010)
+    check("the code is remembered as open with its sats", bot.codes["code0001"]["status"] == "open" and bot.codes["code0001"]["sats"] == 100 and bot.codes["code0001"]["author"] == "A2")
+    check("in-flight is cleared after 'sent'", not bot.st["inflight"])
+    # seen twice: one reply
+    t0["t"] += 60
+    check("the same post again: seen, no second reply", bot.handle_post(p1) == "seen" and len(posted) == 1)
+    # per-author: open code, cooldown, day cap
+    t0["t"] += 60
+    mk("A2", "@JukeboxLNDbot play nero")
+    r = run()
+    check("an open code blocks a second request from the same person", r.endswith("open-code") and len(posted) == 1)
+    bot.codes["code0001"]["status"] = "dead"
+    t0["t"] += 5
+    mk("A2", "@JukeboxLNDbot play nero")
+    r = run()
+    check("20 s cooldown", r.endswith("cooldown") and len(posted) == 1)
+    t0["t"] += 30
+    mk("A2", "@JukeboxLNDbot play nero")
+    r = run()
+    check("after the cooldown the person is served again", r.endswith("replied") and len(posted) == 2)
+    bot.codes["code0002"]["status"] = "dead"
+    t0["t"] += 30
+    mk("A2", "@JukeboxLNDbot play bonobo")
+    r = run()
+    check("the third reply of the day", r.endswith("replied") and len(posted) == 3)
+    bot.codes["code0003"]["status"] = "dead"
+    t0["t"] += 30
+    mk("A2", "@JukeboxLNDbot play again")
+    r = run()
+    check("per-author cap: 3 a day", r.endswith("author-cap") and len(posted) == 3)
+    check("3 trips in a day -> the ignore list for a week", bot.ignored("A2") and "A2" in (read_text("ignore.txt") or ""))
+    t0["t"] += 30
+    mk("A2", "@JukeboxLNDbot play once more")
+    r = run()
+    check("an ignored person is silence", r.endswith("ignored"))
+    # the ignored checks
+    t0["t"] += 60
+    mk("A3", "@JukeboxLNDbot play x", friends=("77", "78"))
+    mk("A4", "@JukeboxLNDbot play x", note_tweet="a very long post")
+    mk("A5", "@JukeboxLNDbot play x", rt="retweeted")
+    mk("A6", "@JukeboxLNDbot play x", rt="quoted")
+    mk("A7", "@JukeboxLNDbot play x", edited=True)
+    r = run()
+    check("a second friend tag, a long post, a retweet, a quote and an edit are ignored",
+          all(w in r for w in ("second-friend", "long", "retweet", "quote", "edited")) and len(posted) == 3)
+    t0["t"] += 60
+    mk("A8", "@JukeboxLNDbot play x", secs_ago=320)
+    mk("A9", "hey @JukeboxLNDbot play x")
+    mk("A10", "@JukeboxLNDbot play")
+    mk("A11", "@JukeboxLNDbot play x", bot=False)
+    r = run()
+    check("older than 300 s, not starting with play, play alone, not summoned: ignored", all(w in r for w in ("old", "not-for-bot", "no-query", "not-summoned")) and len(posted) == 3 and bot.today()["old"] == 1)
+    xmode["date_skew"] = 100.0
+    t0["t"] += 60
+    mk("A12", "@JukeboxLNDbot play x", secs_ago=220)
+    r = run()
+    check("X's clock is used for the age (Date header offset)", abs(bot.st["clock_offset"] - 100.0) < 2 and r.endswith("old"))
+    xmode["date_skew"] = 900.0
+    t0["t"] += 60
+    mk("A12b", "@JukeboxLNDbot play x", secs_ago=250)
+    r = run()
+    check("a Date offset over 600 s is ignored (the last good one stays) and SF is told once", abs(bot.st["clock_offset"] - 100.0) < 2 and any("clock" in n for n in notes) and r.endswith("old"))
+    xmode["date_skew"] = 0.0
+    t0["t"] += 60
+    mk("A12c", "@JukeboxLNDbot play x", lead=("501", "502"), friends=("77",))
+    r = run()
+    check("names X put in front (a thread) are not friends, but everyone is kept out of the reply", r.endswith("replied") and sorted(posted[-1]["reply"]["exclude_reply_user_ids"]) == ["501", "502", "77"])
+    t0["t"] += 60
+    mk("A12d", "@JukeboxLNDbot play x", reply_settings="following")
+    nm = len(station["codes"])
+    r = run()
+    check("reply_settings not everyone/mentionedUsers: skipped in silence before any mint or count", r.endswith("reply-restricted") and len(station["codes"]) == nm and int(bot.author("A12d").get("n") or 0) == 0)
+    t0["t"] += 60
+    mk("A12e", "@JukeboxLNDbot play x", reply_settings="mentionedUsers")
+    r = run()
+    check("reply_settings mentionedUsers is answered", r.endswith("replied"))
+    t0["t"] += 60
+    mk("A12f", "please stop", rt="retweeted")
+    r = run()
+    check("a retweet is gated before the opt-out check", r.endswith("retweet") and "A12f" not in (read_text("optout.txt") or ""))
+    # opt-out
+    t0["t"] += 60
+    np_s = len(posted)
+    mk("A13", "@JukeboxLNDbot stop")
+    mk("A13", "@JukeboxLNDbot play x")
+    r = run()
+    check("stop opts the person out, for good", "optout" in r and r.endswith("optedout") and "A13" in (read_text("optout.txt") or "").split() and len(posted) == np_s)
+    t0["t"] += 60
+    mk("A14", "@JukeboxLNDbot play Don't Stop Me Now")
+    r = run()
+    lc = list(station["codes"])[-1]
+    check("Don't Stop Me Now is a request", r.endswith("replied") and lc in posted[-1]["text"] and station["codes"][lc]["q"] == "Don't Stop Me Now")
+    # blocklist
+    t0["t"] += 60
+    np_b = len(posted)
+    mk("A15", "@JukeboxLNDbot play some badword song")
+    mk("A16", "@JukeboxLNDbot play fine song | jij kankerhoer")
+    r = run()
+    check("a blocklist hit in the query or the message is silence", r.count("blocked") == 2 and len(posted) == np_b)
+    # the message is cleaned and capped
+    t0["t"] += 60
+    mk("A17", "@JukeboxLNDbot play nero | " + "@elon #btc http://spam.example " + "m" * 100)
+    r = run()
+    note = station["codes"][list(station["codes"])[-1]]["note"]
+    check("the message loses links, @ and #, and is capped at 80", "@" not in note and "#" not in note and "http" not in note and len(note) <= 80 and note.startswith("elon btc"))
+    # live sesh
+    station["live"] = True
+    t0["t"] += 60
+    mk("A18", "@JukeboxLNDbot play nero")
+    r = run()
+    check("live sesh: the exact words, once per person", r.endswith("replied") and posted[-1]["text"] == "A live sesh is on — the crew has the deck. The jukebox reopens when the sesh ends. noderunnersradio.com")
+    n0 = len(posted)
+    t0["t"] += 60
+    mk("A18", "@JukeboxLNDbot play nero again")
+    r = run()
+    check("the same person in the same sesh: silence", r.endswith("sesh-quiet") and len(posted) == n0)
+    station["live"] = False
+    t0["t"] += 60
+    mk("A18", "@JukeboxLNDbot play nero third")
+    r = run()
+    check("after the sesh the person is served (a code) and the sesh episode closes", r.endswith("replied") and "?jukebox&p=" in posted[-1]["text"] and not bot.st["sesh_since"])
+    # station down / no match
+    station["down"] = True
+    t0["t"] += 60
+    mk("A19", "@JukeboxLNDbot play nero")
+    r = run()
+    check("station down: no code, no reply, the post is spent", r.endswith("station-down") and len(posted) == n0 + 1 and bot.st["station_down_since"] > 0)
+    station["down"] = False
+    t0["t"] += 60
+    mk("A20", "@JukeboxLNDbot play ####")
+    r = run()
+    check("a search that cleans to nothing gets the friendly no-match answer", r.endswith("replied") and posted[-1]["text"].startswith("Nothing aboard by that name") and "?jukebox&q=" in posted[-1]["text"])
+    # hourly cap
+    bot.st["stamps"] = [t0["t"]] * MAX_PER_HOUR
+    t0["t"] += 60
+    mk("A21", "@JukeboxLNDbot play nero")
+    r = run()
+    check("20 replies an hour: quiet, SF told once", r.endswith("hour-cap") and any("replies in an hour" in n for n in notes))
+    bot.st["stamps"] = []
+    # X errors
+    xmode["tweets"] = (403, json.dumps({"detail": "You are not permitted to reply to this post"}), None)
+    for i in range(3):
+        t0["t"] += 60
+        mk("B%d" % i, "@JukeboxLNDbot play nero")
+        r = run()
+    check("three real refusals pause the lane 30 min with one Telegram line", "403-streak" not in r and r.endswith("reply-failed") and bot.st["backoff_until"] > t0["t"] and any("refused 3 replies" in n for n in notes))
+    check("a refused reply does not count toward the person's 3 a day", int(bot.author("B0").get("n") or 0) == 0)
+    check("a code minted but no reply sent reaches SF", any("minted but the reply was not sent" in n for n in notes))
+    bot.st["backoff_until"] = 0
+    xmode["tweets"] = (403, json.dumps({"detail": "The post you are replying to was deleted"}), None)
+    t0["t"] += 60
+    mk("B9", "@JukeboxLNDbot play nero")
+    r = run()
+    check("a deleted post does not count toward the streak", bot.st["refusals"] == 0 and bot.st["backoff_until"] == 0)
+    t0["t"] += 60
+    xmode["tweets"] = (429, "{}", {"x-rate-limit-reset": str(int(t0["t"] + 600))})
+    mk("B10", "@JukeboxLNDbot play nero")
+    r = run()
+    check("429: sleep until x-rate-limit-reset", abs(bot.st["backoff_until"] - (t0["t"] + 600)) < 2 and bot.cycle() == "backoff")
+    bot.st["backoff_until"] = 0
+    xmode["tweets"] = (503, "down", None)
+    t0["t"] += 60
+    mk("B11", "@JukeboxLNDbot play nero")
+    r = run()
+    check("5xx: back off 2 min", abs(bot.st["backoff_until"] - (t0["t"] + 120)) < 2)
+    bot.st["backoff_until"] = 0
+    xmode["tweets"] = (402, "payment required", None)
+    t0["t"] += 60
+    mk("B12", "@JukeboxLNDbot play nero")
+    r = run()
+    check("402: stop + Telegram", bot.st["dead"] == "402" and any("PAYMENT REQUIRED" in n for n in notes) and bot.cycle() == "dead")
+    bot.st["dead"] = ""
+    xmode["tweets"] = None
+    xmode["mentions"] = (401, "unauthorized", None)
+    t0["t"] += 60
+    r = bot.cycle()
+    check("401 on a poll: dead until restart, reads corrected", r == "401" and bot.st["dead"] == "401" and bot.ledger.rows[-1][1] == "read_adjust" and bot.cycle() == "dead")
+    bot.on_start()
+    check("a restart clears dead and back-off", not bot.st["dead"] and not bot.st["backoff_until"])
+    xmode["mentions"] = (200, "this is not json", None)
+    t0["t"] += 60
+    r = bot.cycle()
+    check("an unreadable 200 keeps the 5 reads booked and backs off 2 min", r == "error body" and bot.ledger.rows[-1][1:3] == ("read", -0.025) and abs(bot.st["backoff_until"] - (t0["t"] + 120)) < 2)
+    bot.st["backoff_until"] = 0
+    xmode["mentions"] = None
+    bot.st["user_id"] = ""
+    xmode["me"] = (503, "down", None)
+    t0["t"] += 60
+    r = bot.cycle()
+    check("users/me failing refunds its read", r.startswith("error") and bot.ledger.rows[-1][1:3] == ("read_adjust", 0.010) and bot.ledger.rows[-2][4] == "users/me")
+    xmode["me"] = None
+    bot.st["backoff_until"] = 0
+    t0["t"] += 60
+    bot.cycle()
+    check("users/me succeeds again", bot.st["user_id"] == "42")
+    # in-flight recovery
+    bot.st["inflight"] = {"555": {"code": "codeX", "author": "Z", "kind": "code", "ts": t0["t"]}}
+    bot.on_start()
+    check("a reply in flight at the last stop is marked seen and never sent", "555" in bot.st["seen"] and not bot.st["inflight"] and any("in flight" in n for n in notes))
+    # ledger-first: a booking that fails means no call
+    open(P("OFF"), "w").close()
+    check("OFF: nothing runs", bot.cycle() == "off" and bot.tick() == "off")
+    os.remove(P("OFF"))
+    nx = len(xlog)
+    bot.ledger.path = os.path.join(d, "nodir", "ledger.tsv")
+    t0["t"] += 60
+    r = bot.cycle()
+    check("ledger-first: when the book cannot be written the poll is not made", r == "ledger-failed" and len(xlog) == nx)
+    bot.ledger.path = P("ledger.tsv")
+    t0["t"] += 60
+    mk("C1", "@JukeboxLNDbot play nero")
+    inbox_snapshot = list(inbox)
+    real_append = bot.ledger.append
+
+    def failing_append(kind, usd, sats, ref):
+        if kind == "reply":
+            raise OSError("disk full")
+        return real_append(kind, usd, sats, ref)
+    bot.ledger.append = failing_append
+    np0 = len(posted)
+    r = run()
+    check("ledger-first: when the reply cannot be booked it is not posted (code minted, SF told)", r.endswith("booking-failed") and len(posted) == np0 and any("ledger cannot be written" in n for n in notes))
+    bot.ledger.append = real_append
+    # daily cap stops polling
+    write_text("budget-usd-per-day", "0.10\n")
+    spent = bot.spend_today()
+    bot.ledger.append("reply", -(0.10 - spent + 0.001), 0, "test-fill")
+    t0["t"] += 60
+    mk("C2", "@JukeboxLNDbot play nero")
+    r = run()
+    check("daily cap: no polling, one Telegram line", r == "daily-cap" and any("daily limit" in n for n in notes))
+    nx = len(xlog)
+    bot.cycle()
+    check("daily cap: still no poll", len(xlog) == nx)
+    t0["t"] = day_start(t0["t"]) + 86400 + 10
+    r = bot.cycle()
+    check("after 00:00 UTC the lane polls again", r == "empty" and len(xlog) == nx + 1)
+    write_text("budget-usd-per-day", "0.50\n")
+    # float dry stops everything
+    f = bot.ledger.float()
+    bot.ledger.append("test", -(f - 0.001), 0, "test-drain")      # not a spend kind: only the float is drained
+    nx = len(xlog)
+    t0["t"] += 60
+    r = bot.cycle()
+    check("float dry: nothing is polled", r == "purse" and len(xlog) == nx)
+    write_text("seed-usd", "12.00\n")
+    t0["t"] += 60
+    r = bot.cycle()
+    check("a top-up wakes the lane", r == "empty" and bot.ledger.last(("topup",))[2] == 5.0)
+    bot.ledger.append("topup", 1.0, 0, "a stray line with no seed-usd= ref")
+    bot.seed_sync()
+    check("the seed seen is the SUM of the seed/topup column: a stray line is reconciled, not trusted", bot.ledger.last(("topup",))[2] == -1.0)
+    write_text("seed-usd", "12.004\n")
+    nl = len(bot.ledger.rows)
+    bot.seed_sync()
+    check("the seed file is read to the cent", len(bot.ledger.rows) == nl)
+    write_text("seed-usd", "12.00\n")
+    # the console wall
+    write_text("console-cap-usd", "1.00\n")
+    bot.st["ann"] = {"month": month_of(t0["t"]), "n": 40, "seen": {}}
+    t0["t"] += 60
+    r = bot.cycle()
+    check("the console wall counts the announcer's posts (40 x 0.015 = 0.60 + own spend > 0.70): quiet", r == "console" and any("console cap" in n for n in notes))
+    write_text("console-cap-usd", "60\n")
+    bot.st["ann"] = {"month": "", "n": 0, "seen": {}}
+    # income: minted, then on air -> onair + income at the rate rule
+    t0["t"] += 60
+    mk("D1", "@JukeboxLNDbot play dire straits")
+    r = run()
+    xc = [c for c in bot.codes if bot.codes[c]["author"] == "D1"][0]
+    station["codes"][xc].update({"status": "minted", "artist": "Dire Straits", "title": "Sultans Of Swing"})
+    bot.fetch_rates()
+    bot.watch()
+    check("the watcher sees the code minted with its song", bot.codes[xc]["status"] == "minted" and bot.codes[xc]["title"] == "Sultans Of Swing")
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-other", "who": "Bob", "note_via": "telegram"},
+                     "queue": [{"artist": "Dire Straits", "title": "Sultans Of Swing", "requested": True, "req_id": "r-x1", "who": "an X listener", "note_via": "x"}]}
+    bot.watch()
+    inc = bot.ledger.last(("income",))
+    check("the paid song: onair booked, income = sats at the lower rate minus 10 %", bot.codes[xc]["status"] == "paid" and bot.ledger.last(("onair",))[2] == -0.015
+          and inc and inc[3] == 100 and abs(inc[2] - 100 / 1e8 * 77000 * 0.9) < 1e-9)
+    check("the rate line names both sources and the one used", bot.ledger.last(("rate",))[4] == "coinbase=77130.00;kraken=77000.00;used=69300.00")
+    check("another lane's paid request counts for the announcer's estimate", bot.st["ann"]["n"] == 1 and abs(bot.announcer_estimate() - 0.015) < 1e-9)
+    bot.watch()
+    check("the same play is not booked twice", bot.ledger.count(("income",), 0) == 1)
+    bot.codes[xc]["status"] = "minted"
+    bot.st["ann"]["seen"] = {}
+    bot.watch()
+    check("after a crash between the book and codes.json the income is not booked again (the book already holds code:)", bot.ledger.count(("income",), 0) == 1 and bot.codes[xc]["status"] == "paid")
+    # nr_xquote: the on-air quote post
+    n0 = len(posted)
+    bot.watch()
+    check("quote: a paid X song still waiting in the queue is not announced yet", len(posted) == n0 and not bot.codes[xc].get("quoted"))
+    station["np"] = {"now_playing": {"artist": "Dire Straits", "title": "Sultans Of Swing", "requested": True, "req_id": "r-x1",
+                                     "who": "an X listener", "note_via": "x", "note": "Shoutout to all the Noderunners!"}, "queue": []}
+    bot.watch()
+    q = posted[-1] if len(posted) == n0 + 1 else {}
+    check("quote: on air, ONE quote post of the listener's own request (not a reply)", q.get("quote_tweet_id") == bot.codes[xc]["post"] and "reply" not in q and bot.codes[xc]["quoted"] == "posted")
+    check("quote: SF's wording", q.get("text") == "Now playing on NoderunnersRadio.com\U0001F3A7 Dire Straits \u2014 Sultans Of Swing. With shoutout: \u201cShoutout to all the Noderunners!\u201d")
+    check("quote: a shoutout in a quote post is reported to SF", any("carried a shoutout" in n for n in notes))
+    bot.watch()
+    check("quote: the same song still on air is not quoted twice", len(posted) == n0 + 1)
+    check("quote: nothing more is booked (the on-air cost was booked when the song was credited)", bot.ledger.count(("onair",), 0) == 1)
+    had_live = os.path.exists(P("LIVE"))
+    bot.codes["prac1"] = {"author": "Q0", "sats": 100, "wl_sats": 310, "minted_ts": t0["t"], "expires_at": t0["t"] + 900, "status": "paid",
+                          "paid_ts": t0["t"], "req_id": "r-prac", "post": "556", "artist": "Nero", "title": "Promises"}
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-prac", "who": "an X listener", "note_via": "x"}, "queue": []}
+    if had_live:
+        os.remove(P("LIVE"))
+    n1 = len(posted)
+    bot.watch()
+    if had_live:
+        open(P("LIVE"), "w").close()
+    check("quote: practice mode logs and posts nothing", len(posted) == n1 and bot.codes["prac1"]["quoted"] == "practice")
+    bot.codes.pop("prac1")
+    bot.codes["gone1"] = {"author": "Q1", "sats": 100, "wl_sats": 310, "minted_ts": t0["t"], "expires_at": t0["t"] + 900, "status": "paid",
+                          "paid_ts": t0["t"], "req_id": "r-gone", "post": "555", "artist": "Nero", "title": "Promises"}
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-gone", "who": "an X listener", "note_via": "x"}, "queue": []}
+    xmode["tweets"] = (403, '{"detail":"Quoting this post is not allowed because it has been deleted."}', {})
+    b0 = float(bot.st.get("backoff_until") or 0)
+    bot.watch()
+    xmode["tweets"] = None
+    check("quote: the listener deleted the post -> not retried, and the lane does not back off", bot.codes["gone1"]["quoted"] == "source-gone" and float(bot.st.get("backoff_until") or 0) == b0)
+    bot.watch()
+    check("quote: a gone source is never tried again", not any(isinstance(b, dict) and b.get("quote_tweet_id") == "555" for b in posted))
+    bot.codes.pop("gone1")
+    t = compose_onair("A" * 80, "B" * 120, "N" * 80, [])
+    check("quote text: a long post still fits X's 280", t is not None and weighted(t) <= 280)
+    check("quote text: a listed word drops the shoutout, the song still posts", compose_onair("A", "T", "hey badword", [("badword", False)]) == ONAIR_HEAD + "A \u2014 T.")
+    check("quote text: no shoutout, no 'With shoutout'; no double stop after a title ending in ?", compose_onair("A", "Why?", "", []) == ONAIR_HEAD + "A \u2014 Why?")
+    check("quote text: the 'Unknown track' stand-in is left out", compose_onair("Nero", "Unknown track", "", []) == ONAIR_HEAD + "Nero.")
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-other", "who": "Bob", "note_via": "telegram"},
+                     "queue": [{"artist": "Dire Straits", "title": "Sultans Of Swing", "requested": True, "req_id": "r-x1", "who": "an X listener", "note_via": "x"}]}
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-loose", "who": "", "note_via": ""}, "queue": []}
+    bot.codes["loose1"] = {"author": "L1", "sats": 100, "wl_sats": 310, "minted_ts": t0["t"], "expires_at": t0["t"] + 900, "status": "minted", "artist": "Nero", "title": "Promises"}
+    n_ann = bot.st["ann"]["n"]
+    bot.watch()
+    check("a paid play without the X stamp (who + note_via) is never ours", bot.codes["loose1"]["status"] == "minted" and bot.st["ann"]["n"] == n_ann + 1)
+    bot.codes["loose2"] = {"author": "L2", "sats": 150, "wl_sats": 360, "minted_ts": t0["t"] - 5, "expires_at": t0["t"] + 900, "status": "minted", "artist": "Nero", "title": "Promises"}
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-amb", "who": "an X listener", "note_via": "x"}, "queue": []}
+    bot.watch()
+    check("two minted codes hold the same song: the LOWEST sats is credited", bot.codes["loose1"]["status"] == "paid" and bot.codes["loose2"]["status"] == "minted" and bot.ledger.last(("income",))[3] == 100)
+    bot.codes.pop("loose2")
+    # rate rules
+    bot.st["rate_checked"] = 0
+    rates["b"] = 60000.0
+    bot.fetch_rates()
+    check("sources 10 % apart: no rate, SF told", bot.rate_usd() is None and any("disagree" in n for n in notes))
+    rates["b"] = 77000.0
+    rates["a"] = None
+    bot.st["rate_checked"] = 0
+    bot.st["rates"]["coinbase"]["ts"] = t0["t"] - 90000
+    bot.fetch_rates()
+    check("one source stale (>24 h) and the other down: no rate", bot.rate_usd() is None)
+    rates["a"] = 77130.0
+    bot.st["rate_checked"] = 0
+    bot.fetch_rates()
+    check("both fresh again: the rate is back", abs(bot.rate_usd() - 69300) < 1)
+    rates["a"] = rates["b"] = 100000.0
+    bot.st["rate_checked"] = 0
+    bot.fetch_rates()
+    check("an outlier (>15 % from the last accepted) is rejected with a Telegram line", bot.rate_usd() is None and any("rejected" in n for n in notes))
+    t0["t"] += 60
+    mk("D2", "@JukeboxLNDbot play nero")
+    run()
+    xc2 = [c for c in bot.codes if bot.codes[c]["author"] == "D2"][0]
+    station["codes"][xc2].update({"status": "minted", "artist": "Nero", "title": "Promises"})
+    bot.watch()
+    station["np"] = {"now_playing": {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "r-x2", "who": "an X listener", "note_via": "x"}, "queue": []}
+    bot.watch()
+    check("no valid rate: the sats wait as unconverted", bot.ledger.last(("unconverted",))[3] == 100 and bot.st["unconverted"] and bot.ledger.last(("income",))[4] != "code:" + xc2)
+    rates["a"] = rates["b"] = 70000.0
+    bot.st["rate_checked"] = 0
+    bot.fetch_rates()
+    bot.convert_pending()
+    check("a rate returns: the waiting sats are converted", not bot.st["unconverted"] and bot.ledger.last(("income",))[4] == "conv:" + xc2 and abs(bot.ledger.last(("income",))[2] - 100 / 1e8 * 63000) < 1e-9)
+    real_append2 = bot.ledger.append
+
+    def income_fails(kind, usd, sats, ref):
+        if kind == "income":
+            raise OSError("disk full")
+        return real_append2(kind, usd, sats, ref)
+    bot.ledger.append = income_fails
+    bot.codes["fail1"] = {"author": "F1", "sats": 100, "wl_sats": 310, "minted_ts": t0["t"], "expires_at": t0["t"] + 900, "status": "minted", "artist": "Fail", "title": "Song"}
+    station["np"] = {"now_playing": {"artist": "Fail", "title": "Song", "requested": True, "req_id": "r-fail", "who": "an X listener", "note_via": "x"}, "queue": []}
+    bot.watch()
+    bot.ledger.append = real_append2
+    check("an income line that cannot be written: the sats go to unconverted, nothing is lost", bot.st["unconverted"] and bot.st["unconverted"][-1]["code"] == "fail1" and bot.ledger.last(("unconverted",))[4] == "code:fail1")
+    bot.st["unconverted"] = []
+    b3 = Bot(xcall=fx, getter=fget, poster=fpost, notifier=lambda s: notes.append(s), fetcher=ffetch)
+    check("the unconverted list is rebuilt from the book at start (conv: rows excluded)", [u["code"] for u in b3.st["unconverted"]] == ["fail1"])
+    bot.st["unconverted"] = [{"code": "fail1", "sats": 100, "ts": t0["t"]}]
+    bot.st["rate_checked"] = 0
+    bot.fetch_rates()
+    bot.convert_pending()
+    check("and converted when the rate holds", not bot.st["unconverted"] and bot.ledger.last(("income",))[4] == "conv:fail1")
+    bot.st["sesh_since"] = t0["t"]
+    bot.codes["sesh1"] = {"author": "S1", "sats": 100, "wl_sats": 310, "minted_ts": t0["t"], "expires_at": t0["t"] + 900, "status": "open"}
+    station["codes"]["sesh1"] = {"q": "x", "sats": 100, "note": "", "status": "minted", "artist": "A", "title": "B"}
+    bot.watch()
+    check("a code turning minted after a sesh started ends the sesh episode", bot.st["sesh_since"] == 0)
+    bot.codes.pop("sesh1")
+    # the price of the day and the file
+    bot.st["price"] = {}
+    bot.price_daily()
+    check("price of the day written to price-sats", bot.price_file() == compute_price(prices(), bot.rate_usd(), UNPAID_DEFAULT) and bot.codes[xc]["sats"] == 100)
+    write_text("price-sats", "150\n")
+    os.utime(P("price-sats"), (t0["t"] + 1e6, time.time() + 100))
+    bot.st["price"]["day"] = ""
+    bot.price_daily()
+    check("a hand-edited price-sats wins and is not overwritten", bot.price_file() == 150 and bot.st["price"].get("hand") and bot.current_price() == 150)
+    t0["t"] += 60
+    mk("D3", "@JukeboxLNDbot play nero")
+    run()
+    xc3 = [c for c in bot.codes if bot.codes[c]["author"] == "D3"][0]
+    check("a code is minted at the price of the day and keeps it", station["codes"][xc3]["sats"] == 150 and bot.codes[xc3]["sats"] == 150 and bot.codes[xc]["sats"] == 100)
+    check("unpaid per paid defaults to 2 under 10 paid requests", bot.unpaid_per_paid() == 2.0)
+    # daily line
+    bot.st["daily_line"] = ""
+    t0["t"] = day_start(t0["t"]) + DAILY_LINE_H * 3600 + 5
+    n0 = len(notes)
+    check("one line a day at 20:00 UTC with the numbers", bot.daily_line() and notes[-1].startswith("X jukebox day ") and "float $" in notes[-1] and "rate $" in notes[-1] and "announcer posts seen by this bot" in notes[-1] and "too old" in notes[-1] and not bot.daily_line())
+    # alerts: once per 6 h
+    bot.st["alerts"] = {}
+    a1 = bot.alert("t", "one")
+    a2 = bot.alert("t", "two")
+    t0["t"] += ALERT_GAP_S + 1
+    a3 = bot.alert("t", "three")
+    check("the same event at most once per 6 h", a1 and not a2 and a3)
+    # balance check behind its flag
+    check("balance check off without the flag", bot.balance_check("test") is None and not any(x[1] == "/2/usage/credits" for x in xlog))
+    open(P("balance-check"), "w").close()
+    check("balance check tolerates a 404 and logs it", bot.balance_check("test") is None and bot.st["credits"]["http"] == 404)
+    check("the balance check is booked as a user read first and refunded on 404", bot.ledger.rows[-2][1:5] == ("read", -0.010, 0, "usage/credits") and bot.ledger.rows[-1][1:5] == ("read_adjust", 0.010, 0, "usage/credits:404"))
+    xmode["credits"] = [(200, {"data": {"balance": 10.0}}), (200, {"data": {"balance": 9.95}})]
+    bot.st["balance_day"] = ""
+    t0["t"] += 60
+    mk("G1", "@JukeboxLNDbot play nero")
+    r = run()
+    check("first live reply of the day: balance read before and after; X took 3x more than booked -> stop + Telegram",
+          r.endswith("replied") and not xmode["credits"] and bot.st["dead"] == "balance" and any("more than 3x" in n for n in notes))
+    bot.st["dead"] = ""
+    xmode["credits"] = [(200, {"data": {"balance": 10.0}}), (200, {"data": {"balance": 9.99}})]
+    bot.st["balance_day"] = ""
+    t0["t"] += 60
+    mk("G2", "@JukeboxLNDbot play nero")
+    r = run()
+    check("a normal charge passes the balance check", r.endswith("replied") and not bot.st["dead"])
+    t0["t"] += 60
+    mk("G3", "@JukeboxLNDbot play nero")
+    nx = len([x for x in xlog if x[1] == "/2/usage/credits"])
+    run()
+    check("the balance is read only around the first reply of the day", len([x for x in xlog if x[1] == "/2/usage/credits"]) == nx)
+    os.remove(P("balance-check"))
+    # state round trip
+    bot.save()
+    b2 = Bot(xcall=fx, getter=fget, poster=fpost, notifier=lambda s: notes.append(s), fetcher=ffetch)
+    check("state, codes and the float survive a restart", b2.st["since_id"] == bot.st["since_id"] and b2.codes.keys() == bot.codes.keys() and b2.ledger.float() == bot.ledger.float() and b2.st["user_id"] == "42")
+    # --check spends nothing
+    nl = len(bot.ledger.rows)
+    nx = len(xlog)
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = check_cmd()
+    check("--check prints and spends nothing", rc == 0 and "float:" in buf.getvalue() and len(Ledger(P("ledger.tsv")).rows) == nl and len(xlog) == nx)
+    # flock
+    lk = take_lock(P(".lock"))
+    try:
+        take_lock(P(".lock"))
+        second = False
+    except OSError:
+        second = True
+    check("the lock refuses a second instance", second)
+    lk.close()
+    # SIGTERM finishes the cycle
+    t0["t"] += 60
+    mk("E1", "@JukeboxLNDbot play nero")
+    _on_term(15, None)
+    bot.stopping = _stop
+    np0 = len(posted)
+    r = run()
+    check("a stop signal only raises the flag; the cycle in hand still completes", _stop and r.endswith("replied") and len(posted) == np0 + 1 and not bot.st["inflight"])
+    print("RESULT: %d failed of %d" % (len(fails), total[0]))
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

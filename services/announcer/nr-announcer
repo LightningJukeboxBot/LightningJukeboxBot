@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-announcer -- posts every paid jukebox request on X as @JukeboxLNDbot, as it goes on air (SF's ruling
+2026-09-08: "announce every request as they come in ... review after a while").
+
+HOW IT WORKS
+  Every 10 s it reads the station's own public /api/nowplaying. A track with requested=true and a new
+  req_id is a paid request going on air. One post per request, never a link (X charges 13x for a post
+  with a URL; the links live in the bot's bio and pinned post), never a hashtag, never a mention except
+  a HAND-VERIFIED artist handle from handles.tsv for Wavlake plays. A requester's name is included as
+  plain text with any leading "@" removed, so the bot never mentions a stranger. The requester's message
+  rides along in quotes when the site shows it (the station scrubs it: 80 chars, no links, no @; this
+  program scrubs it again and drops any #). When a post runs long, the message is shortened first.
+  A message with a word from blocklist.txt is WITHHELD (the song still posts). Every post that carried a
+  message, and every withheld message, is shown to SF in Telegram at once through the admin-notes channel,
+  so he can judge it and delete the post on X if he must. The ship cannot judge abuse; SF can.
+
+SWITCHES (files in /home/sf/.config/nr-announcer, no restart needed)
+  LIVE      exists -> posts for real.   Absent -> DRY: logs "[dry] would post: ..." and nothing leaves the box.
+  OFF       exists -> idles (watches nothing, posts nothing). Remove it to resume.
+  handles.tsv   artist<TAB>@handle, one per line, hand-verified by SF. Case-insensitive on the artist.
+  blocklist.txt one word or phrase per line, # comments, trailing * = any word that starts so; whole words on
+                case/accent/punctuation-folded text. Built from the LDNOOBW lists (en + nl, CC BY 4.0).
+  state.json    what was already announced (24 h), the hourly count, back-off, last alerts.
+
+LIMITS
+  MAX_PER_HOUR (default 20). Over the cap a request is logged and skipped, never queued for later.
+  X errors: 401 -> stop posting until restart (keys wrong); 402 -> credits gone, back off 30 min;
+  403 duplicate -> skip; 403 other / 429 -> back off; network/5xx -> back off 2 min. Every kind of
+  error reaches SF's Telegram ONCE per 6 h through the station API's admin-notes channel.
+
+RUN  (systemd: nr-announcer.service, User=sf)      nr-announcer
+     nr-announcer --check      config status, no network      nr-announcer --once   one poll cycle
+     nr-announcer --selftest   offline tests of the text rules and the state machine
+"""
+import os, sys, re, json, time, uuid, hmac, base64, hashlib, unicodedata, signal, urllib.parse, urllib.request, urllib.error
+
+HOME = os.environ.get("NR_ANNOUNCER_HOME", os.path.expanduser("~/.config/nr-announcer"))
+API = os.environ.get("NR_API_BASE", "http://127.0.0.1:7100").rstrip("/")
+POLL_S = int(os.environ.get("NR_ANNOUNCER_POLL_S", "10"))
+MAX_PER_HOUR = int(os.environ.get("NR_ANNOUNCER_MAX_PER_HOUR", "20"))
+X_POST_URL = "https://api.x.com/2/tweets"
+HEAD = "Now playing on NoderunnersRadio.com\U0001F3A7 "     # SF 2026-09-13; a link to X (weighs 23, xlen counts 20)
+ALERT_GAP_S = 6 * 3600
+STATE = os.path.join(HOME, "state.json")
+
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # the journal is UTF-8; a Windows console is not
+except Exception:
+    pass
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " nr-announcer: " + msg, flush=True)
+
+
+# ---------------------------------------------------------------- OAuth 1.0a (stdlib)
+def _pct(s):
+    return urllib.parse.quote(str(s), safe="-._~")
+
+
+def oauth_header(method, url, ck, cs, at, ats):
+    o = {"oauth_consumer_key": ck, "oauth_nonce": uuid.uuid4().hex, "oauth_signature_method": "HMAC-SHA1",
+         "oauth_timestamp": str(int(time.time())), "oauth_token": at, "oauth_version": "1.0"}
+    norm = "&".join("%s=%s" % (_pct(k), _pct(o[k])) for k in sorted(o))
+    base = "&".join([method.upper(), _pct(url), _pct(norm)])
+    key = ("%s&%s" % (_pct(cs), _pct(ats))).encode()
+    o["oauth_signature"] = base64.b64encode(hmac.new(key, base.encode(), hashlib.sha1).digest()).decode()
+    return "OAuth " + ", ".join('%s="%s"' % (_pct(k), _pct(o[k])) for k in sorted(o))
+
+
+def keys():
+    names = ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET")
+    k = tuple(os.environ.get(n, "") for n in names)
+    if not all(k):                      # from a shell (--check, --once) systemd did not load x.env for us
+        env = {}
+        try:
+            with open(os.path.join(HOME, "x.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        n, v = line.split("=", 1); env[n.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+        k = tuple(env.get(n, "") for n in names)
+    return k if all(k) else None
+
+
+# ---------------------------------------------------------------- text rules
+_URLISH = re.compile(r"(https?://\S*|www\.\S*)", re.I)
+_DOTTLD = re.compile(r"(?<=\S)\.(?=[^\W\d_]{2,})")   # "Radio.co" / "caf\u00e9.co" -> "Radio. co": X autolinks bare word.tld, never across a space
+_LOOKALIKE = re.compile("[\u201c\u201d\u201e\u201f\u2033\u2036\u00ab\u00bb\u300c\u300d]")   # quote signs that could close the post's own quotes early
+
+
+def xlen(t):
+    """X's weighted length: 1 for most Latin/Cyrillic/Greek and common punctuation, 2 for everything else (emoji, CJK, ellipsis)."""
+    return sum(1 if (o <= 0x10FF or 0x2000 <= o <= 0x200D or 0x2010 <= o <= 0x201F or 0x2032 <= o <= 0x2037) else 2
+               for o in map(ord, t))
+
+
+# "0019 Dire Straits", "01. Brothers In Arms", "12 - Telegraph Road" lose their track number; "99 Luftballons",
+# "16 Horsepower", "1000 Clowns" and "10.8" keep theirs (a leading zero or a . _ - separator marks a prefix).
+_TRACKNUM = re.compile(r"^(?:0\d{1,3}[\s._-]+|\d{1,4}\s*[._]+\s*|\d{1,4}\s*-+\s+)(?=[^\d\s])")
+
+
+def clean(s, limit, tracknum=False):
+    """Plain text only: no control chars, no URL-looking pieces, no leading @ (that would mention someone)."""
+    s = unicodedata.normalize("NFKC", str(s or "")).replace("\x00", ", ")   # NFKC: fullwidth @ # and friends become plain
+    s = "".join(ch if ch.isprintable() else " " for ch in s).strip()
+    s = _URLISH.sub("", s)
+    s = re.sub(r"[@#\uff20\uff03]+|(?<!\S)\$(?=[A-Za-z])", "", s)   # no mention, no hashtag, no cashtag ($5 and A$AP stay)
+    s = _DOTTLD.sub(". ", s)                                 # after the scrub: "spam.#com" must not become "spam.com"
+    s = _LOOKALIKE.sub("'", s).replace("\u00b7", "-")      # only the program's own quotes and separators shape the post
+    if tracknum:
+        s = _TRACKNUM.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" -—")
+    return s[:limit]
+
+
+def load_handles():
+    m = {}
+    try:
+        with open(os.path.join(HOME, "handles.tsv"), encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip() or line.startswith("#") or "\t" not in line:
+                    continue
+                a, h = line.rstrip("\n").split("\t", 1)
+                h = h.strip()
+                if re.fullmatch(r"@[A-Za-z0-9_]{1,15}", h):
+                    m[a.strip().casefold()] = h
+    except OSError:
+        pass
+    return m
+
+
+def _fold(t):
+    """Case, accents and punctuation folded: 'Naïve  Word!' -> 'naive word'. Matching happens on this form."""
+    t = unicodedata.normalize("NFKD", str(t or ""))
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).casefold()
+    return " ".join(re.findall(r"[^\W_]+", t))
+
+
+def load_blocklist():
+    """HOME/blocklist.txt: one word or phrase per line, # comments; a trailing * matches any word that starts so
+    ("kanker*" catches the Dutch compound insults). SF's list. A first line of defence against abuse in the requester's
+    message, not a wall: leetspeak and spacing tricks pass, and the message is withheld, never the song."""
+    out = []
+    try:
+        with open(os.path.join(HOME, "blocklist.txt"), encoding="utf-8") as fh:
+            for line in fh:
+                raw = line.split("#", 1)[0].strip()
+                w = _fold(raw.rstrip("*"))
+                if w:
+                    out.append((w, raw.endswith("*")))
+                elif raw:
+                    log("blocklist: line folds to nothing, skipped: %r" % raw[:40])
+    except OSError:
+        pass
+    return out
+
+
+def blocked(text, words):
+    f = " %s " % _fold(text)
+    for w, prefix in words:
+        if (" %s" % w) in f if prefix else (" %s " % w) in f:
+            return True
+    return False
+
+
+def compose(np, handles, blocklist=()):
+    """The post text for one paid request, or None if there is nothing worth saying.
+    SF 2026-09-13: "Now playing on NoderunnersRadio.com🎧 Artist — Title. With shoutout: “…”". No requester name."""
+    raw_artist = str(np.get("artist") or "").strip()
+    artist = clean(np.get("artist"), 80, tracknum=True)
+    title = clean(np.get("title"), 120, tracknum=True)
+    if title.casefold() == "unknown track":     # the station's stand-in for a file without tags (a real title "Unknown" stays)
+        title = ""
+    if not artist and not title:
+        return None
+    # The requester's message (SF 2026-09-08). The station already scrubbed it (NOTE_MAX 80, no links, no @, no quotes)
+    # and only hands it over when the site shows it; clean() runs once more.
+    note = clean(np.get("note"), 80)
+    if note and blocked(note, blocklist):
+        log("message withheld (blocklist): " + note)
+        notify("Message withheld by the blocklist (the song still posts): " + note)
+        note = ""
+    lane = str(np.get("lane") or "")
+    tail = ""
+    if lane == "v4v":                   # handles.tsv is keyed on the artist's name as SF sees it, so try the raw name first
+        h = handles.get(raw_artist.casefold()) or handles.get(artist.casefold())
+        tail = "%s on Wavlake." % h if h else "Via Wavlake."
+
+    def build(a, t, n):
+        song = "%s \u2014 %s" % (a, t) if a and t else (a or t)
+        s = HEAD + song + ("" if song[-1:] in ".!?\u2026" else ".")
+        if tail:
+            s += " " + tail
+        if n:
+            s += " With shoutout: \u201c%s\u201d" % n
+        return s
+
+    def cut(x, keep):
+        return x if keep >= len(x) else x[:keep].rstrip() + "\u2026"
+
+    text = build(artist, title, note)
+    if xlen(text) > 276:                # X's weighted count; the 4 spare also covers the site name weighing 23 as a link
+        note0, keep_n, keep_t, keep_a = note, len(note), len(title), len(artist)
+        while xlen(text) > 276 and keep_n > 12:                 # 1. shorten the shoutout
+            keep_n -= 1; note = cut(note0, keep_n); text = build(artist, title, note)
+        if xlen(text) > 276 and note:                           # 2. drop the shoutout
+            note = ""; text = build(artist, title, note)
+        while xlen(text) > 276 and keep_t > 8:                  # 3. shorten the title
+            keep_t -= 1; text = build(artist, cut(title, keep_t), note)
+        while xlen(text) > 276 and keep_a > 4:                  # 4. shorten the artist; the handle is never cut
+            keep_a -= 1; text = build(cut(artist, keep_a), cut(title, keep_t), note)
+    return text
+
+
+# ---------------------------------------------------------------- state
+def on_start(st):
+    """A service (re)start means "try again now": 401/402 come back on their own if they are still true."""
+    st["dead"] = ""; st["backoff_until"] = 0
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+        if isinstance(st, dict):
+            st.setdefault("seen", {}); st.setdefault("stamps", []); st.setdefault("alerts", {})
+            return st
+    except Exception:
+        pass
+    return {"seen": {}, "stamps": [], "alerts": {}, "backoff_until": 0, "dead": ""}
+
+
+def save_state(st):
+    now = time.time()
+    st["seen"] = {k: v for k, v in st["seen"].items() if now - v < 86400}
+    st["stamps"] = [t for t in st["stamps"] if now - t < 3600]
+    tmp = STATE + ".new"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, STATE)
+
+
+# ---------------------------------------------------------------- station API
+def api_get(path, timeout=8):
+    req = urllib.request.Request(API + path, headers={"User-Agent": "nr-announcer/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def notify(text):
+    """One line to SF's Telegram through the station API's localhost admin-notes channel (the bot relays, max 3/min)."""
+    try:
+        data = json.dumps({"src": "announcer", "text": text[:600]}).encode()
+        req = urllib.request.Request(API + "/api/admin/note", data=data, headers={"Content-Type": "application/json", "User-Agent": "nr-announcer/1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log("could not hand the note to the station API: %s" % e)
+        return False
+
+
+def alert(st, kind, text):
+    """One Telegram note per kind per 6 h."""
+    now = time.time()
+    if now - float(st["alerts"].get(kind, 0)) < ALERT_GAP_S:
+        return
+    st["alerts"][kind] = now
+    log("ALERT %s: %s" % (kind, text))
+    notify(text)
+
+
+# ---------------------------------------------------------------- X
+def x_post(text, k):
+    """Returns (status_code, body_text). 201 = posted."""
+    ck, cs, at, ats = k
+    body = json.dumps({"text": text}).encode("utf-8")
+    req = urllib.request.Request(X_POST_URL, data=body, method="POST",
+                                 headers={"Authorization": oauth_header("POST", X_POST_URL, ck, cs, at, ats),
+                                          "Content-Type": "application/json", "User-Agent": "nr-announcer/1"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")[:400]
+    except Exception as e:
+        return 0, str(e)
+
+
+# ---------------------------------------------------------------- one cycle
+def cycle(st, poster=x_post, now_fn=time.time, getter=api_get):
+    """One poll. Returns a short reason string (used by --once and the self-test)."""
+    now = now_fn()
+    if os.path.exists(os.path.join(HOME, "OFF")):
+        return "off"
+    try:
+        d = getter("/api/nowplaying")
+    except Exception as e:
+        return "api-down: %s" % e
+    np = (d or {}).get("now_playing") or {}
+    rid = str(np.get("req_id") or "")
+    if not np.get("requested") or not rid:
+        return "not-a-request"
+    if rid in st["seen"]:
+        return "seen"
+    if str(np.get("lane") or "") == "gift":
+        st["seen"][rid] = now
+        return "gift-skipped"
+    # nr_xquote (SF 2026-09-13): a song paid through the X lane is announced by the X jukebox bot as a quote post of the
+    # listener's own request. The same strict stamp the bot uses: note_via "x" AND who "an X listener".
+    if str(np.get("note_via") or "") == "x" and str(np.get("who") or "") == "an X listener":
+        st["seen"][rid] = now
+        log("X-lane song, left to the X jukebox bot's quote post: %s \u2014 %s" % (np.get("artist") or "", np.get("title") or ""))
+        return "x-lane"
+    text = compose(np, load_handles(), load_blocklist())
+    if not text:
+        st["seen"][rid] = now
+        return "nothing-to-say"
+    if len([t for t in st["stamps"] if now - t < 3600]) >= MAX_PER_HOUR:
+        st["seen"][rid] = now
+        log("cap: %d posts in the last hour -- skipped: %s" % (MAX_PER_HOUR, text))
+        return "cap"
+    if st.get("dead"):
+        return "dead"
+    if now < float(st.get("backoff_until") or 0):
+        return "backoff"
+    live = os.path.exists(os.path.join(HOME, "LIVE"))
+    if not live:
+        st["seen"][rid] = now
+        log("[dry] would post: " + text)
+        return "dry"
+    k = keys()
+    if not k:
+        st["dead"] = "no keys"
+        alert(st, "keys", "X announcer: the four X keys are missing from x.env -- not posting.")
+        return "no-keys"
+    code, body = poster(text, k)
+    if code in (200, 201):
+        st["seen"][rid] = now
+        st["stamps"].append(now)
+        st["errs"] = 0
+        try:
+            pid = json.loads(body).get("data", {}).get("id", "?")
+        except Exception:
+            pid = "?"
+        log("posted %s: %s" % (pid, text))
+        if "\u201c" in text:
+            notify("X post %s carried a message. Delete it on X if it must go: %s" % (pid, text))
+        return "posted"
+    if code == 401:
+        st["dead"] = "401"
+        alert(st, "401", "X REJECTED the announcer's keys (401). Posting stopped until the keys are fixed and the service restarted.")
+        return "401"
+    if code == 402:
+        st["backoff_until"] = now + 1800
+        alert(st, "402", "X says PAYMENT REQUIRED (402): the credits are used up. Announcer retries every 30 min; load credits to resume.")
+        return "402"
+    if code == 403 and "duplicate" in body.lower():
+        st["seen"][rid] = now
+        log("X: duplicate post, skipped: " + text)
+        return "duplicate"
+    if code == 403:
+        st["backoff_until"] = now + 1800
+        alert(st, "403", "X REFUSED a post (403): %s -- announcer backs off 30 min. Check the app's Read and write permission." % body[:160])
+        return "403"
+    if code == 429:
+        st["backoff_until"] = now + 900
+        alert(st, "429", "X rate limit hit (429). Announcer backs off 15 min.")
+        return "429"
+    st["backoff_until"] = now + 120
+    st["errs"] = int(st.get("errs") or 0) + 1
+    if st["errs"] >= 30:
+        alert(st, "net", "X posts have failed %d times in a row (last: HTTP %s %s). Still retrying every 2 min." % (st["errs"], code, body[:100]))
+    return "error %s" % code
+
+
+_stop = False
+
+
+def _on_term(signum, frame):
+    """systemd stop/restart: finish the cycle in hand (a post that X already accepted must be marked seen), then leave."""
+    global _stop
+    _stop = True
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    if args == ["--check"]:
+        print("home: %s\nkeys: %s\nLIVE: %s  OFF: %s\nhandles: %d  blocklist: %d entries\nmax/hour: %d  poll: %d s" % (
+            HOME, "present" if keys() else "MISSING", os.path.exists(os.path.join(HOME, "LIVE")), os.path.exists(os.path.join(HOME, "OFF")),
+            len(load_handles()), len(load_blocklist()), MAX_PER_HOUR, POLL_S))
+        st = load_state(); print("state: %d seen (24 h), %d posts in the last hour, backoff %s, dead: %s" % (
+            len(st["seen"]), len([t for t in st["stamps"] if time.time() - t < 3600]), "yes" if time.time() < float(st.get("backoff_until") or 0) else "no", st.get("dead") or "no"))
+        return 0
+    if args not in ([], ["--once"]):
+        print(__doc__); return 64
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    st = load_state()
+    on_start(st)
+    try:
+        save_state(st)                  # so --check agrees with the running service at once
+    except Exception as e:
+        log("could not write the state file: %s" % e)
+    log("watching %s every %d s -- %s" % (API, POLL_S, "LIVE (posting to X)" if os.path.exists(os.path.join(HOME, "LIVE")) else "DRY (no posts leave the box; touch %s/LIVE to go live)" % HOME))
+    signal.signal(signal.SIGTERM, _on_term); signal.signal(signal.SIGINT, _on_term)
+    last_down = False
+    while True:
+        if _stop:
+            try:
+                save_state(st)
+            except Exception as e:
+                log("could not write the state file: %s" % e)
+            log("stopping (signal); state saved")
+            return 0
+        try:
+            r = cycle(st)
+            down = r.startswith("api-down")
+            if down != last_down:
+                log(r if down else "station API reachable again")
+            last_down = down
+            if r not in ("not-a-request", "seen", "off", "backoff", "dead") and not down:
+                save_state(st)
+            if args == ["--once"]:
+                print(r); return 0
+        except Exception as e:
+            log("cycle error: %s" % e)
+        for _ in range(POLL_S):            # sleep in 1-s steps so a stop is answered within a second
+            if _stop:
+                break
+            time.sleep(1)
+
+
+def selftest():
+    global HOME, STATE, API
+    import tempfile
+    import shutil, atexit
+    d = tempfile.mkdtemp(prefix="nr-announcer-test-"); HOME = d; STATE = os.path.join(d, "state.json")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    API = "http://127.0.0.1:9"          # a dead port: the test's alerts must never reach the real station API
+    fails = []
+    def check(name, cond):
+        print(("PASS " if cond else "FAIL ") + name); (not cond) and fails.append(name)
+    with open(os.path.join(d, "handles.tsv"), "w", encoding="utf-8") as fh:
+        fh.write("# artist\thandle\nAinsley Costello\t@AinsleyCostello\nbad\tnot-a-handle\n")
+    h = load_handles()
+    check("handles: one valid entry, the bad one dropped", h == {"ainsley costello": "@AinsleyCostello"})
+    t = compose({"artist": "Nero", "title": "Promises", "who": "@someone", "lane": "paid"}, h)
+    check("plain request: the requester is not named", t == HEAD + "Nero — Promises.")
+    t = compose({"artist": "Ainsley Costello", "title": "Cherry Blossom", "lane": "v4v"}, h)
+    check("wavlake with a verified handle", t == HEAD + "Ainsley Costello — Cherry Blossom. @AinsleyCostello on Wavlake.")
+    t = compose({"artist": "Unknown Wavlaker", "title": "Song", "lane": "v4v"}, h)
+    check("wavlake without a handle", t.endswith("Via Wavlake.") and "@" not in t)
+    t = compose({"artist": "Evil", "title": "visit http://spam.example now #ad", "lane": "paid"}, h)
+    check("no URL, no hashtag survives", "http" not in t and "#" not in t and "example" not in t)
+    t = compose({"artist": "A" * 80, "title": "B" * 200, "lane": "paid"}, h)
+    check("long ASCII fits without a trim", xlen(t) <= 280 and "…" not in t)
+    t = compose({"artist": "🎸" * 80, "title": "B" * 200, "lane": "paid"}, h)
+    check("heavy artist forces a title trim", xlen(t) <= 280 and "…" in t)
+    t = compose({"artist": "東京事変", "title": "あ" * 120, "lane": "paid"}, h)
+    check("CJK title trimmed by X weight", xlen(t) <= 280 and len(t) < 160 and "…" in t)
+    check("emoji head weighs 2", xlen("🎧a") == 3 and xlen("abc") == 3)
+    t = compose({"artist": "Radio.co Session", "title": "Mr. Bungle vs Dr.Dre", "lane": "paid"}, h)
+    check("bare word.tld defanged, words kept", t == HEAD + "Radio. co Session — Mr. Bungle vs Dr. Dre.")
+    check("nothing to say", compose({"artist": "", "title": "", "lane": "paid"}, h) is None)
+    t = compose({"artist": "0019 Dire Straits", "title": "01. Brothers In Arms", "lane": "paid"}, h)
+    check("track-number prefixes stripped", t == HEAD + "Dire Straits — Brothers In Arms.")
+    t = compose({"artist": "2Pac", "title": "1999", "lane": "paid"}, h)
+    check("a numeric name is not a prefix", t == HEAD + "2Pac — 1999.")
+    for raw, want in (("99 Luftballons", "99 Luftballons"), ("16 Horsepower", "16 Horsepower"), ("1000 Clowns", "1000 Clowns"),
+                      ("50 Ways to Leave Your Lover", "50 Ways to Leave Your Lover"), ("10.8", "10.8"), ("26-17", "26-17"),
+                      ("0019 Dire Straits", "Dire Straits"), ("0005 Led Zeppelin", "Led Zeppelin"), ("01. Brothers In Arms", "Brothers In Arms"),
+                      ("12 - Telegraph Road", "Telegraph Road"), ("07_Sultans", "Sultans")):
+        check("track-number rule: %r -> %r" % (raw, want), clean(raw, 80, tracknum=True) == want)
+    check("the requester name never loses its number", clean("01. Nick", 24) == "01. Nick")
+    check("NUL-joined artists get a comma", clean("Dax Wadley\x00Arno sojo", 80) == "Dax Wadley, Arno sojo")
+    check("no-break space becomes a space", clean("Sink\xa0in the\xa0Soil", 120) == "Sink in the Soil")
+    t = compose({"artist": "Bent Fabric", "title": "Jukebox", "who": "leplebroyale", "note": "Hello people of X! Requested this song for you all!", "lane": "paid"}, h)
+    check("the message rides along as a shoutout", t == HEAD + "Bent Fabric — Jukebox. With shoutout: \u201cHello people of X! Requested this song for you all!\u201d")
+    notes = []
+    global notify
+    _notify0 = notify
+    notify = lambda text: (notes.append(text), True)[1]
+    t = compose({"artist": "A", "title": "T", "note": "see http://spam.example and www.x.com @me #tag radio.co", "lane": "paid"}, h)
+    check("message: no link, no mention, no hashtag", "http" not in t and "www" not in t and "@" not in t and "#" not in t and "radio.co" not in t and "me tag" in t)
+    t = compose({"artist": "10 jukebox booster", "title": "Unknown track", "who": "LePlebRoyale", "lane": "paid"}, h)
+    check("the 'Unknown track' stand-in is not posted", t == HEAD + "10 jukebox booster.")
+    t = compose({"artist": "A" * 80, "title": "B" * 80, "note": "N" * 80, "lane": "paid"}, h)
+    check("a long message is shortened first", xlen(t) <= 276 and t.endswith("…\u201d") and ("B" * 80) in t)
+    t = compose({"artist": "\U0001F3B8" * 80, "title": "B" * 120, "note": "N" * 80, "lane": "paid"}, h)
+    check("then dropped, before the title is touched", xlen(t) <= 276 and "\u201c" not in t and "…" in t)
+    with open(os.path.join(d, "blocklist.txt"), "w", encoding="utf-8") as fh:
+        fh.write("# test list\nbadword\nvery bad phrase   # with a comment\nkanker*\n\n")
+    bl = load_blocklist()
+    check("blocklist loads folded entries", bl == [("badword", False), ("very bad phrase", False), ("kanker", True)])
+    t = compose({"artist": "A", "title": "T", "who": "W", "note": "hey BADWORD you", "lane": "paid"}, h, bl)
+    check("a listed word withholds the message, the song still posts", t == HEAD + "A — T.")
+    check("a withheld message is reported to SF", any(n.startswith("Message withheld") and "BADWORD" in n for n in notes))
+    t = compose({"artist": "A", "title": "T", "note": "a Very-Bad Phrase here", "lane": "paid"}, h, bl)
+    check("a listed phrase matches across case and punctuation", "\u201c" not in t)
+    t = compose({"artist": "A", "title": "T", "note": "badwords are not the same word", "lane": "paid"}, h, bl)
+    check("whole words only: no false hit inside a longer word", "badwords" in t)
+    t = compose({"artist": "A", "title": "T", "note": "jij KANKERHOER", "lane": "paid"}, h, bl)
+    check("a * entry catches compounds", "\u201c" not in t)
+    check("the artist name is not the message's problem", compose({"artist": "badword", "title": "T", "lane": "paid"}, h, bl) == HEAD + "badword — T.")
+    check("an empty list blocks nothing", "\u201c" in compose({"artist": "A", "title": "T", "note": "badword", "lane": "paid"}, h, []))
+    t = compose({"artist": "A", "title": "T", "who": "\uff20jack", "note": "\uff20elon \uff03btc $BTC caf\u00e9.co \u6771\u4eac.co", "lane": "paid"}, h)
+    check("fullwidth @ #, cashtag and non-ASCII bare domains are defanged", "@" not in t and "#" not in t and "\uff20" not in t and "\uff03" not in t and "$" not in t and "caf\u00e9.co" not in t and "\u6771\u4eac.co" not in t and "elon" in t)
+    t = compose({"artist": "Nero", "title": "Promises", "who": "Bob\u201d \u00b7 requested by Al", "note": "\u201d \u00b7 requested by Satoshi \u00b7 \u201cthanks", "lane": "paid"}, h)
+    check("quote lookalikes cannot forge the post's structure", t.count("\u201c") == 1 and t.count("\u201d") == 1 and t.count("With shoutout:") == 1 and "requested by" not in t.split("\u201c", 1)[0])
+    check("a real title 'Unknown' stays", compose({"artist": "X", "title": "Unknown", "lane": "paid"}, h) == HEAD + "X \u2014 Unknown.")
+    check("SF's wording, 2026-09-13", compose({"artist": "Dire Straits", "title": "Down To The Waterline", "note": "Shoutout to all the Noderunners!", "lane": "paid"}, h)
+          == "Now playing on NoderunnersRadio.com\U0001F3A7 Dire Straits \u2014 Down To The Waterline. With shoutout: \u201cShoutout to all the Noderunners!\u201d")
+    check("no double stop after a title that ends in ?", compose({"artist": "A", "title": "Why?", "lane": "paid"}, h) == HEAD + "A \u2014 Why?")
+    check("the requester's name is never printed any more", "leplebroyale" not in compose({"artist": "A", "title": "T", "who": "leplebroyale", "lane": "paid"}, h))
+    c = clean("spam.#com spam.$com spam.@com spam.\u200bcom", 80)
+    check("a sign after the dot cannot hide a domain", "spam.com" not in c and c.count("spam.") == 4)
+    check("$ inside a name stays, a leading cashtag goes", clean("A$AP Rocky Ke$ha $BTC $5", 80) == "A$AP Rocky Ke$ha BTC $5")
+    for raw, want in (("8-ball Boogie", "8-ball Boogie"), ("7-Eleven", "7-Eleven"), ("12 - Telegraph Road", "Telegraph Road"), ("12-Telegraph Road", "12-Telegraph Road"), ("3.Song", "Song")):
+        check("track-number rule: %r -> %r" % (raw, want), clean(raw, 80, tracknum=True) == want)
+    check("fold keeps non-Latin letters", _fold("\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440!") == "\u043f\u0440\u0438\u0432\u0435\u0442 \u043c\u0438\u0440")
+    check("a Cyrillic entry can match", blocked("\u044d\u0442\u043e \u0431\u043b\u044f\u0434\u044c", [("\u0431\u043b\u044f\u0434\u044c", False)]))
+    check("$5 in a message stays", "$5" in compose({"artist": "A", "title": "T", "note": "zapped $5 worth", "lane": "paid"}, h))
+    t = compose({"artist": "ill.gates", "title": "Song", "lane": "v4v"}, {"ill.gates": "@illgates"})
+    check("handle found by the raw artist name", t.endswith("@illgates on Wavlake."))
+    heavy = "\U0001F3B8" * 80
+    t = compose({"artist": heavy, "title": "B", "who": "\U0001F600" * 24, "lane": "v4v"}, {heavy: "@ArtistHandle12"})
+    check("handle never cut", xlen(t) <= 280 and t.endswith("@ArtistHandle12 on Wavlake.") and "requested by" not in t)
+    for n in ("X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"):
+        os.environ.pop(n, None)
+    check("keys: none in the env and no x.env", keys() is None)
+    with open(os.path.join(d, "x.env"), "w", encoding="utf-8") as fh:
+        fh.write("# test\nX_API_KEY=a\nX_API_SECRET='b'\nX_ACCESS_TOKEN=\"c\"\nX_ACCESS_SECRET=d\n")
+    check("keys: read from x.env when the env is empty", keys() == ("a", "b", "c", "d"))
+    os.remove(os.path.join(d, "x.env"))
+    # state machine with fakes
+    posts = []
+    def poster_ok(text, k): posts.append(text); return 201, '{"data":{"id":"1"}}'
+    np1 = {"now_playing": {"artist": "A", "title": "T", "requested": True, "req_id": "r1", "lane": "paid"}}
+    os.environ.update({"X_API_KEY": "a", "X_API_SECRET": "b", "X_ACCESS_TOKEN": "c", "X_ACCESS_SECRET": "d"})
+    st = load_state()
+    check("dry mode logs, marks seen, posts nothing", cycle(st, poster_ok, getter=lambda p: np1) == "dry" and "r1" in st["seen"] and not posts)
+    open(os.path.join(d, "LIVE"), "w").close()
+    np2 = {"now_playing": {"artist": "A", "title": "T2", "requested": True, "req_id": "r2", "lane": "paid"}}
+    check("live: posts once", cycle(st, poster_ok, getter=lambda p: np2) == "posted" and posts == [HEAD + "A — T2."])
+    check("same req_id again: seen, no second post", cycle(st, poster_ok, getter=lambda p: np2) == "seen" and len(posts) == 1)
+    npg = {"now_playing": {"artist": "A", "title": "G", "requested": True, "req_id": "r3", "lane": "gift"}}
+    check("gift lane skipped", cycle(st, poster_ok, getter=lambda p: npg) == "gift-skipped" and len(posts) == 1)
+    npx = {"now_playing": {"artist": "A", "title": "X1", "requested": True, "req_id": "rx", "lane": "paid", "who": "an X listener", "note_via": "x"}}
+    check("an X-lane song is left to the X jukebox bot", cycle(st, poster_ok, getter=lambda p: npx) == "x-lane" and "rx" in st["seen"] and len(posts) == 1)
+    npy = {"now_playing": {"artist": "A", "title": "Y1", "requested": True, "req_id": "ry", "lane": "paid", "who": "an X listener", "note_via": "telegram"}}
+    check("the stamp is strict: the name alone is not the X lane", cycle(st, poster_ok, getter=lambda p: npy) == "posted" and len(posts) == 2)
+    posts.pop()
+    st["stamps"] = [time.time()] * MAX_PER_HOUR
+    np4 = {"now_playing": {"artist": "A", "title": "T4", "requested": True, "req_id": "r4", "lane": "paid"}}
+    check("hourly cap skips and marks seen", cycle(st, poster_ok, getter=lambda p: np4) == "cap" and "r4" in st["seen"] and len(posts) == 1)
+    st["stamps"] = []
+    def poster_402(text, k): return 402, "payment required"
+    np5 = {"now_playing": {"artist": "A", "title": "T5", "requested": True, "req_id": "r5", "lane": "paid"}}
+    check("402: back-off, alert once, NOT marked seen", cycle(st, poster_402, getter=lambda p: np5) == "402" and "r5" not in st["seen"] and st["alerts"].get("402"))
+    check("during back-off nothing is tried", cycle(st, poster_ok, getter=lambda p: np5) == "backoff")
+    st["backoff_until"] = 0
+    def poster_dup(text, k): return 403, '{"detail":"You are not allowed to create a Tweet with duplicate content."}'
+    check("403 duplicate: skipped, marked seen", cycle(st, poster_dup, getter=lambda p: np5) == "duplicate" and "r5" in st["seen"])
+    def poster_401(text, k): return 401, "unauthorized"
+    np6 = {"now_playing": {"artist": "A", "title": "T6", "requested": True, "req_id": "r6", "lane": "paid"}}
+    check("401: dead until restart", cycle(st, poster_401, getter=lambda p: np6) == "401" and st["dead"] == "401" and cycle(st, poster_ok, getter=lambda p: np6) == "dead")
+    save_state(st); st = load_state()
+    check("dead survives a save/load", st.get("dead") == "401")
+    on_start(st)
+    check("a restart clears dead and back-off", not st.get("dead") and not st.get("backoff_until"))
+    save_state(st)
+    check("the cleared state is on disk for --check", not load_state().get("dead"))
+    st["errs"] = 7; np7 = {"now_playing": {"artist": "A", "title": "T7", "requested": True, "req_id": "r7", "lane": "paid"}}
+    check("a success resets the error streak", cycle(st, poster_ok, getter=lambda p: np7) == "posted" and st["errs"] == 0)
+    def poster_200(text, k): posts.append(text); return 200, '{"data":{"id":"2"}}'
+    np8 = {"now_playing": {"artist": "A", "title": "T8", "requested": True, "req_id": "r8", "lane": "paid"}}
+    check("HTTP 200 counts as posted", cycle(st, poster_200, getter=lambda p: np8) == "posted")
+    n0 = len(notes)
+    npm = {"now_playing": {"artist": "A", "title": "T10", "who": "W", "note": "hello there", "requested": True, "req_id": "r10", "lane": "paid"}}
+    check("a posted message is reported to SF with the post id", cycle(st, poster_ok, getter=lambda p: npm) == "posted" and len(notes) == n0 + 1 and notes[-1].startswith("X post 1 carried a message") and "hello there" in notes[-1])
+    npn = {"now_playing": {"artist": "A", "title": "T11", "who": "W", "requested": True, "req_id": "r11", "lane": "paid"}}
+    check("a post without a message is not reported", cycle(st, poster_ok, getter=lambda p: npn) == "posted" and len(notes) == n0 + 1)
+    notify = _notify0
+    st["dead"] = ""
+    open(os.path.join(d, "OFF"), "w").close()
+    check("OFF file idles", cycle(st, poster_ok, getter=lambda p: np6) == "off")
+    os.remove(os.path.join(d, "OFF"))
+    check("api down is reported, not fatal", cycle(st, poster_ok, getter=lambda p: (_ for _ in ()).throw(OSError("x"))).startswith("api-down"))
+    save_state(st); st2 = load_state()
+    check("state survives a save/load", st2["seen"].keys() == st["seen"].keys())
+    _on_term(15, None)
+    check("a stop signal only raises the flag; the cycle in hand still completes", _stop is True and cycle(st, poster_ok, getter=lambda p: {"now_playing": {"artist": "A", "title": "T9", "requested": True, "req_id": "r9", "lane": "paid"}}) == "posted" and "r9" in st["seen"])
+    print("RESULT: %d failed" % len(fails)); return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
