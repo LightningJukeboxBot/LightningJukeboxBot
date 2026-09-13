@@ -7,7 +7,7 @@ Listen, request a song, or just hang out: **[noderunnersradio.com](https://noder
 
 ![Lightning Jukebox Bot](assets/20230307-Bot-logo-new.jpg)
 
-> Still being built, in the open. Things break sometimes. Use it at your own risk.
+> Still being built, in the open — beta. Things break sometimes. Use it at your own risk.
 
 ---
 
@@ -25,6 +25,19 @@ Listen, request a song, or just hang out: **[noderunnersradio.com](https://noder
   before any repeats.
 
 Listeners pay one invoice per song. There are no listener accounts or balances to top up.
+
+---
+
+## Where this is going
+
+The [manifesto](https://noderunnersradio.com/manifesto) sets the course:
+
+- **A real FM/AM broadcaster** that quietly transmits the state of the Bitcoin network alongside the music — so the
+  timechain reaches people even when the internet does not.
+- **Musicians hashing their work to the timechain** as proof of creation: a verifiable timestamp that the work existed,
+  made by its maker, growing into an organic replacement for legacy copyright.
+- **The split flips in the artists' favour** as the station matures: 21% to the radio, 79% to the DJs and to the
+  artists whose work is played.
 
 ---
 
