@@ -1,0 +1,1470 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-nostr-jukebox (2026-09-09) -- the Telegram jukebox bot's twin on Nostr, speaking as the Jukebox Lightning Bot
+(the same key nr-nostr announces with). SF's ruling 2026-09-08: "give the nostr bot the same functionality that the
+t.me/noderunnersradiojukeboxbot has" -- mention -> numbered results -> reply with a number -> invoice -> the SAME payment
+path (/api/play + /api/play/status) -> "queued". DMs come later.
+
+HOW IT WORKS
+  1  It holds one subscription per relay (relays.txt, the same list nr-nostr posts to) for kind-1 notes that carry the bot's
+     p tag. Every event is verified (id + BIP-340 signature) before it is looked at; anything older than 3 minutes, from
+     the bot itself, or seen before (24 h memory, survives a restart) is dropped.
+  2  A note that MENTIONS the bot (nostr:npub..., nostr:nprofile..., or a fresh note with no thread) is a command:
+        play <song>   ->  the ship's library first, then the V4V lane if it is on; a numbered list (max 6) as a reply
+        random        ->  a hand from the ship's own sampler
+        queue / now   ->  what is lined up / what is on air
+        anything else ->  the help note, once an hour per person
+  3  A reply to one of the bot's result notes that is a number, BY THE SAME PERSON, mints the invoice: the same checks as
+     Telegram (one open invoice per person, no live session, nothing already lined up, deck not full), POST /api/play with
+     the exact artist/title from the search (+ source/guid on the Wavlake lane), "who" = the requester's profile name.
+     The reply carries the bolt11 in plain text: Nostr apps show a Pay button for it.
+  4  One watcher thread polls /api/play/status like the Telegram bot (3/10/30 s by age, at most 50 invoices). queued ->
+     "Zapped and queued, you are #N"; expired -> a short note; paid-but-not-queued -> the station is told through the
+     admin-notes channel (the Telegram bot relays it to SF) and the listener is told the station knows.
+  4b When a paid song is NOW PLAYING, the bot quotes the listener's own "play" note (NIP-18 q tag + nostr:note1…) in
+     SF's words: "Now playing on NoderunnersRadio.com🎧 Artist — Title." Once per song, kept on disk from queued to air.
+  5  Limits: 60-char queries, 20 s between searches per person, 40 replies per hour station-wide (then it goes quiet and
+     tells SF once), the announcer's blocklist on the echoed query (a blocked query is answered without the echo).
+  6  DRY unless HOME/jukebox.LIVE exists: it reads and logs "[dry] would ..." and never mints or posts. HOME/jukebox.OFF
+     makes it idle. Keys: HOME/nostr.env (nr-nostr-keys.py). Nothing else is written outside HOME/jukebox-state.json.
+
+nr-nostr-jukebox              run (the service)        nr-nostr-jukebox --check     what it would do, no side effects
+nr-nostr-jukebox --selftest   offline tests: a fake relay and a fake station on the loopback, nothing leaves the box
+"""
+import os, sys, re, json, time, socket, ssl, base64, hashlib, secrets, threading, queue, heapq, signal
+import importlib.machinery, importlib.util, urllib.request, urllib.parse, urllib.error
+
+HOME = os.environ.get("NR_NOSTR_HOME", os.path.expanduser("~/.config/nr-nostr"))
+NOSTR_PATH = os.environ.get("NR_NOSTR_PATH", "/usr/local/bin/nr-nostr")
+API = os.environ.get("NR_API_BASE", "http://127.0.0.1:7100").rstrip("/")
+SITE = "https://noderunnersradio.com"
+V4V_ENABLED = os.environ.get("NR_V4V_ENABLED", "0") == "1"
+MAX_QUERY_CHARS = 60
+SEARCH_COOLDOWN_S = 20
+MAX_ROWS = 6
+ROW_TTL_S = 3600
+INVOICE_TTL_S = 900
+MAX_TRACKED = 50
+QUEUE_FULL_AT = 12
+MAX_REPLIES_PER_HOUR = int(os.environ.get("NR_NOSTR_JUKEBOX_MAX_PER_HOUR", "40"))   # chatter only; money replies are exempt
+PERSON_REPLIES_PER_HOUR = 8            # chatter per person; one key cannot spend the station's hour
+MONEY_KINDS = ("invoice", "queued", "expired", "failed")
+EVENT_MAX_AGE_S = 180
+EVENT_MAX_FUTURE_S = 300
+HELP_GAP_S = 3600
+RELAY_IDLE_S = 40
+STATUS_TIMEOUT = 20
+STATE = os.path.join(HOME, "jukebox-state.json")
+LIVE_FLAG = os.path.join(HOME, "jukebox.LIVE")
+OFF_FLAG = os.path.join(HOME, "jukebox.OFF")
+
+nn = None          # the nr-nostr module: keys, signing, bech32, websocket framing, publish, relays, the announcer's rules
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + "jukebox: " + str(msg), flush=True)
+
+
+def load_nostr():
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("nr_nostr", NOSTR_PATH)
+    spec = importlib.util.spec_from_loader("nr_nostr", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    for name in ("keys", "pubkey", "make_event", "schnorr_verify", "bech32_encode", "bech32_decode", "publish",
+                 "load_relays", "load_announcer", "_frame", "_Reader"):
+        if not hasattr(mod, name):
+            raise RuntimeError("%s lacks %s" % (NOSTR_PATH, name))
+    mod.ann = mod.load_announcer()
+    return mod
+
+
+# ---------------------------------------------------------------- the station (urllib only; no third-party module)
+def api_get(path, timeout=15, **params):
+    url = API + path + (("?" + urllib.parse.urlencode(params)) if params else "")
+    return _api(urllib.request.Request(url, headers={"User-Agent": "nr-nostr-jukebox/1"}), timeout)
+
+
+def api_post(path, form, timeout=25):
+    req = urllib.request.Request(API + path, data=urllib.parse.urlencode(form).encode(),
+                                 headers={"User-Agent": "nr-nostr-jukebox/1",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    return _api(req, timeout)
+
+
+def _api(req, timeout):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw.decode("utf-8")) if raw else {})
+    except urllib.error.HTTPError as e:
+        try:
+            raw = e.read()
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            body = {}
+        return e.code, body if isinstance(body, dict) else {}
+    except Exception as e:
+        log("station %s failed: %s" % (req.full_url.split("?")[0], str(e)[:100]))
+        return 0, {}
+
+
+def notify(text):
+    """A line for SF, through the station's admin-notes channel (the Telegram bot relays it)."""
+    try:
+        data = json.dumps({"src": "nostr-jukebox", "text": text[:600]}).encode()
+        req = urllib.request.Request(API + "/api/admin/note", data=data,
+                                     headers={"Content-Type": "application/json", "User-Agent": "nr-nostr-jukebox/1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log("could not hand the note to the station API: %s" % e)
+        return False
+
+
+# ---------------------------------------------------------------- websocket: open, subscribe, keep listening
+def ws_open(url, timeout):
+    m = re.fullmatch(r"(wss?)://([^/:\s]+)(?::(\d+))?(/\S*)?", url.strip())
+    if not m:
+        raise ValueError("bad relay url")
+    scheme, host = m.group(1), m.group(2)
+    port = int(m.group(3) or (443 if scheme == "wss" else 80))
+    path = m.group(4) or "/"
+    raw = socket.create_connection((host, port), timeout=timeout)
+    s = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if scheme == "wss" else raw
+    s.settimeout(timeout)
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    hosthdr = host if port == (443 if scheme == "wss" else 80) else "%s:%d" % (host, port)
+    s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\nUser-Agent: nr-nostr-jukebox/1\r\n\r\n" % (path, hosthdr, key)).encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        c = s.recv(4096)
+        if not c:
+            raise OSError("handshake: the relay closed the connection")
+        resp += c
+        if len(resp) > 65536:
+            raise OSError("handshake: reply too long")
+    head, rest = resp.split(b"\r\n\r\n", 1)
+    if b" 101 " not in head.split(b"\r\n", 1)[0]:
+        raise OSError("handshake refused: " + head.split(b"\r\n", 1)[0].decode("latin-1")[:80])
+    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    if accept.encode() not in head:
+        raise OSError("handshake: wrong accept key")
+    try:                                                 # a dead path (NAT reset, ISP blip) must not look 'up' for 15 minutes
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, name):
+                raw.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), val)
+    except Exception:
+        pass
+    return s, Reader(s, rest)
+
+
+class Reader:
+    """nr-nostr's frame reader, with one difference: a PONG is handed up as (10, payload) so the caller can tell a quiet
+    relay from a dead one. Pings are still answered here; continuation frames are joined; a close frame comes up as (8, ...)."""
+
+    def __init__(self, sock, buf=b""):
+        self.s, self.buf = sock, buf
+
+    def take(self, n):
+        while len(self.buf) < n:
+            c = self.s.recv(65536)
+            if not c:
+                raise OSError("the relay closed the connection")
+            self.buf += c
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _one(self):
+        b0, b1 = self.take(2)
+        fin, op, masked, n = b0 & 0x80, b0 & 0x0F, b1 & 0x80, b1 & 0x7F
+        if n == 126:
+            n = int.from_bytes(self.take(2), "big")
+        elif n == 127:
+            n = int.from_bytes(self.take(8), "big")
+        if n > (1 << 20):
+            raise OSError("frame too big")
+        mask = self.take(4) if masked else b""
+        data = self.take(n)
+        if masked:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return bool(fin), op, data
+
+    def frame(self):
+        data = b""
+        first = None
+        while True:
+            fin, op, part = self._one()
+            if op == 9:
+                try:
+                    self.s.sendall(nn._frame(part, 10))
+                except Exception:
+                    pass
+                continue
+            if op == 10:
+                return 10, part
+            if op == 8:
+                return 8, part
+            if op in (1, 2):
+                if first is not None:
+                    raise OSError("a new message started while one was still open")
+                first = op
+            elif op == 0:
+                if first is None:
+                    raise OSError("a continuation frame with no message open")
+            else:
+                raise OSError("unknown websocket opcode %d" % op)
+            data += part
+            if len(data) > (1 << 20):
+                raise OSError("message too big")
+            if fin:
+                return first, data
+
+
+def _close(s):
+    try:
+        s.sendall(nn._frame(b"\x03\xe8", 8))
+    except Exception:
+        pass
+    try:
+        s.close()
+    except Exception:
+        pass
+
+
+class Relay(threading.Thread):
+    """One relay, one subscription, for the life of the process. Reconnects with backoff; every EVENT goes to the queue.
+    No cursor is kept between connections: each REQ asks for the last EVENT_MAX_AGE_S seconds (the loop drops anything
+    older anyway), so no note, however dated, can move the subscription into the future (review finding)."""
+
+    def __init__(self, url, pk_hex, out, stop, now_fn=time.time):
+        super().__init__(daemon=True, name="relay:" + url)
+        self.url, self.pk, self.out, self.stop, self.now = url, pk_hex, out, stop, now_fn
+        self.up = None
+
+    def run(self):
+        backoff = 5
+        while not self.stop.is_set():
+            s = None
+            born = self.now()
+            try:
+                s, rd = ws_open(self.url, 12)
+                s.settimeout(RELAY_IDLE_S)
+                sub = "nrj" + secrets.token_hex(4)
+                filt = {"kinds": [1], "#p": [self.pk], "since": int(self.now() - EVENT_MAX_AGE_S)}
+                s.sendall(nn._frame(json.dumps(["REQ", sub, filt], separators=(",", ":")).encode()))
+                if self.up is not True:
+                    log("relay up: " + self.url)
+                    self.up = True
+                waiting_pong = False
+                while not self.stop.is_set():
+                    try:
+                        op, data = rd.frame()
+                    except socket.timeout:
+                        if waiting_pong:
+                            raise OSError("no pong within %d s" % RELAY_IDLE_S)
+                        s.sendall(nn._frame(b"nr", 9))          # keep-alive ping: a pong (or any frame) must follow
+                        waiting_pong = True
+                        continue
+                    waiting_pong = False
+                    if self.now() - born > 60:
+                        backoff = 5                          # a connection that lived a minute earns a fresh backoff
+                    if op == 8:
+                        raise OSError("relay closed: " + data[2:60].decode("utf-8", "replace"))
+                    if op != 1:
+                        continue
+                    try:
+                        msg = json.loads(data.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if not isinstance(msg, list) or not msg:
+                        continue
+                    if msg[0] == "EVENT" and len(msg) >= 3 and msg[1] == sub and isinstance(msg[2], dict):
+                        self.out.put((self.url, msg[2]))
+                    elif msg[0] == "CLOSED" and len(msg) > 1 and msg[1] == sub:
+                        raise OSError("subscription closed: " + str(msg[2:3])[:80])
+            except Exception as e:
+                if self.up is not False:
+                    log("relay down: %s (%s)" % (self.url, str(e)[:100]))
+                    self.up = False
+            finally:
+                if s is not None:
+                    _close(s)
+            for _ in range(backoff):
+                if self.stop.is_set():
+                    break
+                time.sleep(1)
+            backoff = min(backoff * 2, 120)
+
+
+def fetch_name(pk_hex, relays, timeout=3):
+    """The requester's profile name (kind 0) from the first of two relays that answers; "" when none does. The kind-0
+    event must be signed by that very pubkey (a relay's word is not taken)."""
+    for u in relays[:2]:
+        s = None
+        try:
+            s, rd = ws_open(u, timeout)
+            s.settimeout(timeout)
+            sub = "nrp" + secrets.token_hex(3)
+            s.sendall(nn._frame(json.dumps(["REQ", sub, {"kinds": [0], "authors": [pk_hex], "limit": 1}],
+                                           separators=(",", ":")).encode()))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                op, data = rd.frame()
+                if op == 8:
+                    break
+                if op != 1:
+                    continue
+                msg = json.loads(data.decode("utf-8"))
+                if not isinstance(msg, list) or not msg or msg[1:2] != [sub]:
+                    continue
+                if msg[0] == "EVENT" and len(msg) >= 3 and isinstance(msg[2], dict):
+                    ev = msg[2]
+                    if ev.get("pubkey") == pk_hex and event_ok(ev, kind=0):
+                        prof = json.loads(ev.get("content") or "{}")
+                        if isinstance(prof, dict):
+                            return str(prof.get("display_name") or prof.get("name") or "")[:60]
+                    break
+                if msg[0] == "EOSE":
+                    break
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                _close(s)
+    return ""
+
+
+# ---------------------------------------------------------------- events: verify, read, mention
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_MENTION = re.compile(r"(?:nostr:)?(?:npub1|nprofile1|note1|nevent1|naddr1)[02-9ac-hj-np-z]{6,}", re.I)
+
+
+def event_ok(ev, kind=1):
+    """A well-formed event of this kind whose id and signature check out."""
+    try:
+        pk, eid, sig = ev["pubkey"], ev["id"], ev["sig"]
+        ca, kind_, tags, content = int(ev["created_at"]), int(ev["kind"]), ev["tags"], ev["content"]
+        if not (_HEX64.fullmatch(pk) and _HEX64.fullmatch(eid) and re.fullmatch(r"[0-9a-f]{128}", sig)):
+            return False
+        if kind_ != kind or not isinstance(tags, list) or not isinstance(content, str):
+            return False
+        kind = kind_
+        if not all(isinstance(t, list) and all(isinstance(x, str) for x in t) for t in tags):
+            return False
+        ser = json.dumps([0, pk, ca, kind, tags, content], separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        if hashlib.sha256(ser).hexdigest() != eid:
+            return False
+        return nn.schnorr_verify(bytes.fromhex(eid), bytes.fromhex(pk), bytes.fromhex(sig))
+    except Exception:
+        return False
+
+
+def strip_mentions(text):
+    return re.sub(r"\s+", " ", _MENTION.sub(" ", text or "")).strip()
+
+
+def bech32_any(s):
+    """bech32 without the 90-character cap: NIP-19 TLV forms (nprofile with relay hints) run longer. Returns (hrp, bytes)."""
+    s = str(s or "").strip().lower()
+    pos = s.rfind("1")
+    if pos < 1 or pos + 7 > len(s) or len(s) > 1000:
+        raise ValueError("not bech32")
+    hrp, data = s[:pos], [nn._B32.find(c) for c in s[pos + 1:]]
+    if -1 in data or nn._polymod(nn._hrp_expand(hrp) + data) != 1:
+        raise ValueError("bad checksum")
+    return hrp, bytes(nn._convertbits(data[:-6], 5, 8, False))
+
+
+def mentions(text, pk_hex):
+    """Does the content name this pubkey (npub, or an nprofile whose TLV carries it, relay hints or not)?"""
+    for m in _MENTION.finditer(text or ""):
+        tok = m.group(0).lower()
+        if tok.startswith("nostr:"):
+            tok = tok[6:]
+        try:
+            hrp, raw = bech32_any(tok)
+        except Exception:
+            continue
+        if hrp == "npub" and raw.hex() == pk_hex:
+            return True
+        if hrp == "nprofile":
+            i = 0
+            while i + 2 <= len(raw):
+                t, n = raw[i], raw[i + 1]
+                if t == 0 and raw[i + 2:i + 2 + n].hex() == pk_hex:
+                    return True
+                i += 2 + n
+    return False
+
+
+def parse_cmd(text):
+    t = strip_mentions(text).strip().lstrip("/").strip()
+    m = re.match(r"(?is)^(play|request|add)\b[\s:,-]*(.*)$", t)
+    if m:
+        q = m.group(2).strip()
+        return ("play", q) if q else ("help", "")
+    w = t.lower().strip(" ?!.")
+    if w in ("queue", "q", "what's queued", "whats queued", "what is queued"):
+        return "queue", ""
+    if w in ("now", "np", "nowplaying", "now playing", "what's playing", "whats playing", "what is playing"):
+        return "now", ""
+    if w in ("random", "shuffle"):
+        return "play", "random"
+    return "help", ""
+
+
+def thread_tags(parent, own_pk=None):
+    """NIP-10 tags for a reply to `parent`: the thread root (from the parent's own root marker, else its first e tag,
+    else the parent itself), the parent as 'reply', and the people to notify: the parent's author -- or, when the
+    parent is one of OUR notes (a receipt under our invoice note), the people our note tagged, never ourselves."""
+    root = None
+    es = [t for t in parent.get("tags", []) if len(t) >= 2 and t[0] == "e" and _HEX64.fullmatch(t[1] or "")]
+    for t in es:
+        if len(t) >= 4 and t[3] == "root":
+            root = t[1]
+    if root is None and es:
+        root = es[0][1]
+    tags = []
+    if root and root != parent["id"]:
+        tags.append(["e", root, "", "root"])
+        tags.append(["e", parent["id"], "", "reply"])
+    else:
+        tags.append(["e", parent["id"], "", "root"])
+    if own_pk and parent.get("pubkey") == own_pk:
+        people = []
+        for t in parent.get("tags", []):
+            if len(t) >= 2 and t[0] == "p" and _HEX64.fullmatch(t[1] or "") and t[1] != own_pk and t[1] not in people:
+                people.append(t[1])
+    else:
+        people = [parent["pubkey"]]
+    for p in people[:4]:
+        tags.append(["p", p])
+    return tags
+
+
+def fmt_dur(d):
+    try:
+        d = int(d or 0)
+    except (TypeError, ValueError):
+        d = 0
+    return " · %d:%02d" % divmod(d, 60) if d > 0 else ""
+
+
+HELP = ("Hi, I am the Noderunners Radio jukebox. Mention me with:\n"
+        "play <artist or song> — I list what is aboard; reply to that list with a number and I hand you a 21-sat invoice. "
+        "Pay it and the song joins the queue.\n"
+        "queue — what is lined up.  now — what is on air.  random — a hand from the ship's own sampler.\n"
+        "Listen: " + SITE)
+
+
+# ---------------------------------------------------------------- the bot
+ONAIR_HEAD = "Now playing on NoderunnersRadio.com\U0001F3A7 "     # SF's wording, 2026-09-13 (the X lane says the same)
+ONAIR_MAX_AGE_S = 8 * 3600            # a queued song that has not aired in 8 h is forgotten
+ONAIR_POLL_S = 15
+
+
+def compose_quote(np_, rec, blocklist):
+    """(content, tags) for the on-air quote note of a listener's own play note, or (None, None)."""
+    artist = nn.ann.clean(np_.get("artist") or rec.get("artist") or "", 80, tracknum=True)
+    title = nn.ann.clean(np_.get("title") or rec.get("title") or "", 120, tracknum=True)
+    if title.casefold() == "unknown track":
+        title = ""
+    if not artist and not title:
+        return None, None
+    note = nn.ann.clean(np_.get("note") or "", 80)
+    if note and blocklist and nn.ann.blocked(note, blocklist):
+        log("shoutout withheld (blocklist): " + note)
+        note = ""
+    song = "%s \u2014 %s" % (artist, title) if artist and title else (artist or title)
+    content = ONAIR_HEAD + song + ("" if song[-1:] in ".!?\u2026" else ".")
+    if note:
+        content += " With shoutout: \u201c%s\u201d" % note
+    content += "\nnostr:" + nn.bech32_encode("note", bytes.fromhex(rec["origin"]))
+    tags = [["q", rec["origin"], "", rec["origin_pk"]], ["p", rec["origin_pk"]], ["t", "noderunnersradio"], ["r", SITE]]
+    return content, tags
+
+
+class Jukebox:
+    def __init__(self, seckey, relays, live_fn, now_fn=time.time, publisher=None, name_fn=None):
+        self.sk = seckey
+        self.pk = nn.pubkey(seckey).hex()
+        self.npub = nn.bech32_encode("npub", bytes.fromhex(self.pk))
+        self.relays = relays
+        self.live_fn = live_fn
+        self.now = now_fn
+        self.publisher = publisher or nn.publish
+        self.name_fn = name_fn or (lambda pk: fetch_name(pk, relays))
+        self.lock = threading.Lock()
+        self.results = {}       # our results-note id -> (rows, owner_pk, expires_at, query)
+        self.open = {}          # requester pk -> (payment_hash, expires_at)
+        self.last_search = {}   # requester pk -> time
+        self.helped = {}        # requester pk -> time of the last help note
+        self.names = {}         # requester pk -> (profile name, fetched_at)
+        self.watch = []         # heap of (due, payment_hash)
+        self.pending = {}       # payment_hash -> dict(parent=our invoice note, requester, started, src, artist, title)
+        self.inflight = set()
+        self.seen = {}          # event id -> time
+        self.stamps = []        # times of our CHATTER replies (the hourly budget; money replies are never counted)
+        self.chatter = {}       # requester pk -> times of chatter replies to them (the per-person budget)
+        self.quiet_told = 0.0
+        self.our_notes = {}     # our note id -> time (for "is this a reply to us")
+        self.blocklist = nn.ann.load_blocklist()
+        self.dirty = False
+        self.posted = 0
+        self.stale = 0          # events dropped as stale since the last log line
+        self.origin = {}        # nr_nostrquote: our results-note id -> (the listener's play note id, their pubkey)
+        self.onair = {}         # nr_nostrquote: payment_hash -> the queued song waiting to air (on disk)
+        self.next_np = 0.0
+
+    # ---- housekeeping
+    def gc(self):
+        now = self.now()
+        with self.lock:
+            for k in [k for k, v in self.results.items() if v[2] < now]:
+                self.results.pop(k, None)
+            for k in [k for k, v in self.open.items() if v[1] < now]:
+                self.open.pop(k, None)
+            for k in [k for k, t in self.last_search.items() if now - t > 3600]:
+                self.last_search.pop(k, None)
+            for k in [k for k, t in self.seen.items() if now - t > 86400]:
+                self.seen.pop(k, None)
+            for k in [k for k, t in self.our_notes.items() if now - t > 86400]:
+                self.our_notes.pop(k, None)
+            for k in [k for k, v in self.names.items() if now - v[1] > 86400]:
+                self.names.pop(k, None)
+            self.stamps = [t for t in self.stamps if now - t < 3600]
+            for k in [k for k in self.origin if k not in self.results]:
+                self.origin.pop(k, None)
+            for k in [k for k, v in self.onair.items() if now - float(v.get("queued_at") or 0) > ONAIR_MAX_AGE_S]:
+                self.onair.pop(k, None)
+            for k in list(self.chatter):
+                self.chatter[k] = [t for t in self.chatter[k] if now - t < 3600]
+                if not self.chatter[k]:
+                    self.chatter.pop(k, None)
+            if self.stale:
+                log("dropped %d stale event(s) (older than %d s, or from the future)" % (self.stale, EVENT_MAX_AGE_S))
+                self.stale = 0
+
+    def budget_left(self, pk=None):
+        """Chatter budget: the station's hour, and this person's hour. Money replies never ask."""
+        now = self.now()
+        with self.lock:
+            used = len([t for t in self.stamps if now - t < 3600])
+            mine = len([t for t in self.chatter.get(pk, ()) if now - t < 3600]) if pk else 0
+        return min(MAX_REPLIES_PER_HOUR - used, PERSON_REPLIES_PER_HOUR - mine)
+
+    # ---- one reply note
+    def reply(self, parent, content, kind="reply"):
+        """Sign and post a NIP-10 reply. Returns the event (also in DRY, unposted), or None when it could not post.
+        Chatter (lists, help, refusals) is budgeted per hour and per person; the money replies (invoice, queued, expired,
+        failed) always go out -- a paid listener is never left without a word (review finding)."""
+        who = parent.get("pubkey") if parent.get("pubkey") != self.pk else None
+        if kind not in MONEY_KINDS:
+            left = self.budget_left(who)
+            if left <= 0:
+                now = self.now()
+                if MAX_REPLIES_PER_HOUR - len([t for t in self.stamps if now - t < 3600]) <= 0 and now - self.quiet_told > 3600:
+                    self.quiet_told = now
+                    log("hourly chatter budget spent (%d); quiet until the hour passes (money replies still go out)" % MAX_REPLIES_PER_HOUR)
+                    notify("Nostr jukebox: %d replies in an hour -- gone quiet until the hour passes (invoices and receipts still go out)." % MAX_REPLIES_PER_HOUR)
+                return None
+        ev = nn.make_event(self.sk, content, thread_tags(parent, self.pk))
+        with self.lock:
+            self.our_notes[ev["id"]] = self.now()
+        if not self.live_fn():
+            log("[dry] would %s: %s" % (kind, content.replace("\n", " / ")[:160]))
+            return ev
+        res = self.publisher(ev, self.relays)
+        ok = [u for u, good, _m in res if good]
+        if not ok:
+            log("%s NOT posted: %s" % (kind, "; ".join("%s: %s" % (u, m) for u, _g, m in res)[:300]))
+            return None
+        if kind not in MONEY_KINDS:
+            with self.lock:                              # charged only for a reply that really went out
+                self.stamps.append(self.now())
+                if who:
+                    self.chatter.setdefault(who, []).append(self.now())
+        self.posted += 1
+        log("%s posted to %d/%d relays: %s" % (kind, len(ok), len(res), content.replace("\n", " / ")[:120]))
+        return ev
+
+    # ---- the station
+    def live_session(self):
+        code, body = api_get("/api/livesplit", timeout=8)
+        if code == 200 and body.get("live"):
+            return body.get("dj") or "a guest DJ"
+        return None
+
+    def queue_state(self):
+        code, body = api_get("/api/nowplaying", timeout=8)
+        if code != 200:
+            return None, set(), 0, None
+
+        def key(t):
+            if not t:
+                return None
+            return "%s|%s" % ((t.get("artist") or "").lower(), (t.get("title") or "").lower())
+        q = body.get("queue") or []
+        return key(body.get("now_playing")), {key(t) for t in q if t}, len(q), body
+
+    # ---- incoming
+    def handle(self, ev):
+        now = self.now()
+        if not isinstance(ev, dict) or not event_ok(ev):
+            return "bad"
+        if ev["pubkey"] == self.pk:
+            return "own"
+        ca = int(ev["created_at"])
+        if ca < now - EVENT_MAX_AGE_S or ca > now + EVENT_MAX_FUTURE_S:
+            with self.lock:
+                self.stale += 1
+            return "stale"
+        with self.lock:
+            if ev["id"] in self.seen:
+                return "seen"
+            self.seen[ev["id"]] = now
+            self.dirty = True
+        if not self.live_fn() and os.path.exists(OFF_FLAG):
+            return "off"
+        pk = ev["pubkey"]
+        content = ev.get("content") or ""
+        refs = [t[1] for t in ev.get("tags", []) if len(t) >= 2 and t[0] == "e"]
+        with self.lock:
+            rid = next((r for r in refs if r in self.results), None)
+            to_us = any(r in self.our_notes for r in refs)
+        if rid:
+            return self.pick(ev, rid, content)
+        if not (mentions(content, self.pk) or not refs or to_us):
+            return "thread-noise"          # a reply in a thread that merely carries our p tag
+        cmd, arg = parse_cmd(content)
+        if cmd == "play":
+            return self.play(ev, arg)
+        if cmd == "queue":
+            return self.info(ev, "queue")
+        if cmd == "now":
+            return self.info(ev, "now")
+        with self.lock:
+            last = self.helped.get(pk, 0.0)
+            if now - last < HELP_GAP_S:
+                return "help-quiet"
+            self.helped[pk] = now
+        self.reply(ev, HELP, "help")
+        return "help"
+
+    def info(self, ev, what):
+        pk = ev["pubkey"]
+        now = self.now()
+        with self.lock:
+            if now - self.last_search.get(pk, 0.0) < SEARCH_COOLDOWN_S:
+                return "cooldown"
+            self.last_search[pk] = now
+        npk, _qk, qlen, body = self.queue_state()
+        if body is None:
+            self.reply(ev, "The station did not answer. Try again in a minute.", what)
+            return what
+        np_ = body.get("now_playing") or {}
+        line = "%s — %s" % (np_.get("artist") or "?", np_.get("title") or "?") if np_ else "nothing on air"
+        if what == "now":
+            self.reply(ev, "On air now: %s\nListen: %s" % (line, SITE), "now")
+            return "now"
+        q = body.get("queue") or []
+        if not q:
+            self.reply(ev, "Nothing lined up. On air: %s\nMention me with: play <song>" % line, "queue")
+            return "queue"
+        lines = ["%d. %s — %s" % (i, t.get("artist") or "?", t.get("title") or "?") for i, t in enumerate(q[:8], 1)]
+        self.reply(ev, "Lined up (%d):\n%s\nOn air: %s" % (len(q), "\n".join(lines), line), "queue")
+        return "queue"
+
+    def play(self, ev, query):
+        pk = ev["pubkey"]
+        now = self.now()
+        query = "".join(c for c in query if c >= " ")[:MAX_QUERY_CHARS].strip()
+        if not query:
+            return self.handle_help(ev)
+        with self.lock:
+            on_cooldown = now - self.last_search.get(pk, 0.0) < SEARCH_COOLDOWN_S
+            open_inv = self.open.get(pk)
+        if on_cooldown:
+            return "cooldown"
+        with self.lock:
+            self.last_search[pk] = now                   # armed before ANY answer: a refusal must not be free to repeat
+        if open_inv and open_inv[1] > now:
+            self.reply(ev, "You already have an invoice open. Pay that one, or let it expire, before asking for another song.", "busy")
+            return "open-invoice"
+        live = self.live_session()
+        if live:
+            self.reply(ev, "A live sesh is on — %s has the deck. The jukebox reopens when the sesh ends. %s" % (live, SITE), "sesh")
+            return "live-session"
+        shown = nn.ann.clean(query, MAX_QUERY_CHARS)
+        if not shown or nn.ann.blocked(shown, self.blocklist):
+            self.reply(ev, "Nothing aboard for that. Try an artist or a song title.", "blocked")
+            return "blocked"
+        rolling = query.lower() in ("random", "shuffle")
+        if rolling:
+            code, body = api_get("/api/sample", timeout=15, n=str(MAX_ROWS))
+        else:
+            code, body = api_get("/api/search", timeout=15, q=query, src="library")
+        if code != 200:
+            self.reply(ev, "Search is down for a moment. Try again shortly.", "down")
+            return "search-down"
+        results = (body.get("results") or [])[:MAX_ROWS]
+        if V4V_ENABLED and not rolling and len(results) < MAX_ROWS:
+            def k(t):
+                return "%s|%s" % ((t.get("artist") or "").lower(), (t.get("title") or "").lower())
+            have = {k(t) for t in results}
+            wcode, wbody = api_get("/api/search", timeout=20, q=query, src="wavlake")
+            if wcode == 200:
+                extra = [t for t in (wbody.get("results") or []) if k(t) not in have]
+                results = results + extra[:MAX_ROWS - len(results)]
+        if not results:
+            self.reply(ev, "Nothing aboard for “%s”. The station plays its own library, so not everything is here yet." % shown, "none")
+            return "no-results"
+        rows, lines = [], []
+        for n, t in enumerate(results, 1):
+            src = (t.get("source") or "library").lower()
+            rows.append((t.get("artist") or "", t.get("title") or "", src, t.get("guid") or t.get("source_uri") or "",
+                         int(t.get("sats") or 21)))
+            tag = "V4V " if src == "wavlake" else ""
+            line = "%d. %s%s — %s%s" % (n, tag, t.get("artist") or "?", t.get("title") or "?", fmt_dur(t.get("duration_s")))
+            album = (t.get("album") or "").strip()
+            if album:
+                line += " · " + album[:24]
+            lines.append(line[:190])
+        head = "A hand from the ship's sampler" if rolling else "Found these for “%s”" % shown
+        prices = "21 sats a song" + (", V4V songs 210 sats straight to the artist" if any(r[2] == "wavlake" for r in rows) else "")
+        content = "%s — reply to this note with a number:\n%s\n%s." % (head, "\n".join(lines), prices)
+        out = self.reply(ev, content, "results")
+        if out is None:
+            return "results-not-posted"
+        with self.lock:
+            self.results[out["id"]] = (rows, pk, now + ROW_TTL_S, shown)
+            self.origin[out["id"]] = (ev["id"], pk)       # nr_nostrquote: the note the on-air quote will point at
+        return "results"
+
+    def handle_help(self, ev):
+        pk = ev["pubkey"]
+        now = self.now()
+        with self.lock:
+            if now - self.helped.get(pk, 0.0) < HELP_GAP_S:
+                return "help-quiet"
+            self.helped[pk] = now
+        self.reply(ev, HELP, "help")
+        return "help"
+
+    def pick(self, ev, rid, content):
+        pk = ev["pubkey"]
+        now = self.now()
+        with self.lock:
+            rec = self.results.get(rid)
+        if not rec:
+            return "stale-list"
+        rows, owner, exp, shown = rec
+        if pk != owner:
+            return "not-owner"
+        m = re.fullmatch(r"\D*(\d{1,2})\D*", strip_mentions(content))
+        if not m or not 1 <= int(m.group(1)) <= len(rows):
+            with self.lock:
+                if now - self.last_search.get(pk, 0.0) < 5:
+                    return "bad-number-quiet"
+                self.last_search[pk] = now
+            self.reply(ev, "Reply with a number from 1 to %d." % len(rows), "number")
+            return "bad-number"
+        artist, title, src, guid, sats = rows[int(m.group(1)) - 1]
+        with self.lock:
+            open_inv = self.open.get(pk)
+            tracked = len(self.watch)
+        if open_inv and open_inv[1] > now:
+            self.reply(ev, "You already have an invoice open. Pay that one first.", "busy")
+            return "open-invoice"
+        np_key, q_keys, q_len, _b = self.queue_state()
+        key = "%s|%s" % (artist.lower(), title.lower())
+        if key == np_key or key in q_keys:
+            self.reply(ev, "%s — %s is already lined up. No sense paying twice." % (artist, title), "dup")
+            return "already-queued"
+        if q_len >= QUEUE_FULL_AT:
+            self.reply(ev, "The deck is full right now. Try again in a bit.", "full")
+            return "deck-full"
+        if tracked >= MAX_TRACKED:
+            self.reply(ev, "Too many open invoices right now. Try again in a few minutes.", "full")
+            return "watch-full"
+        if not self.live_fn():
+            log("[dry] would mint: %s — %s (%s) for %s" % (artist, title, src, self.npub_short(pk)))
+            with self.lock:
+                self.results.pop(rid, None)
+            return "dry-mint"
+        with self.lock:
+            cached = self.names.get(pk)
+        if cached is None:
+            name = nn.ann.clean(self.name_fn(pk) or "", 24)
+            if name and nn.ann.blocked(name, self.blocklist):
+                log("profile name withheld (blocklist) for %s" % self.npub_short(pk))
+                name = ""                                # a stranger's chosen name is never echoed unchecked (review finding)
+            with self.lock:
+                self.names[pk] = (name, now)
+        else:
+            name = cached[0]
+        # nr_at (2026-09-09, SF): "If a song is requested via telegram, the @ should be on telegram only,
+        # not on the other channels -- and visa versa." "via" tells the station where this came from, so a
+        # Nostr name never becomes a live @tag in a Telegram group, where that handle is someone else.
+        form = {"artist": artist, "title": title, "who": name or self.npub_short(pk), "via": "nostr"}
+        if src == "wavlake":
+            if not guid:
+                self.reply(ev, "That Wavlake track lost its id. Search again.", "err")
+                return "no-guid"
+            form["source"] = "wavlake"
+            form["guid"] = guid
+        code, body = api_post("/api/play", form)
+        if code == 409:
+            self.reply(ev, "A live sesh just started — the DJ has the deck. Nothing taken.", "sesh")
+            return "live-session"
+        if code == 404:
+            self.reply(ev, "That one slipped off the shelf. Search again.", "err")
+            return "not-found"
+        if code != 200 or not body.get("bolt11"):
+            self.reply(ev, "The Lightning rail did not answer. Nothing taken — try again in a minute.", "err")
+            return "rail-down"
+        ph = body["payment_hash"]
+        sats = int(body.get("sats") or sats)
+        content = ("⚡ %s — %s\nPay %d sats within 15 minutes and it joins the queue:\n\n%s\n\n"
+                   "Your app shows a Pay button for this; or copy it into your wallet. I check on my own." % (artist, title, sats, body["bolt11"]))
+        out = self.reply(ev, content, "invoice")
+        with self.lock:
+            self.results.pop(rid, None)
+            self.open[pk] = (ph, now + INVOICE_TTL_S)
+            self.pending[ph] = {"parent": out or ev, "requester": pk, "started": now, "src": src, "artist": artist, "title": title,
+                                "origin": self.origin.pop(rid, None)}
+            heapq.heappush(self.watch, (now + 3, ph))
+        if out is None:
+            notify("Nostr jukebox: an invoice was minted but the reply did not post (hash %s…). If it gets paid the song still queues." % ph[:12])
+        return "invoice"
+
+    def npub_short(self, pk):
+        n = nn.bech32_encode("npub", bytes.fromhex(pk))
+        return n[:9] + "…" + n[-4:]
+
+    # ---- the watcher
+    def check(self, ph):
+        """One status call for one invoice. True when finished with it."""
+        with self.lock:
+            rec = self.pending.get(ph)
+            if rec is None or ph in self.inflight:
+                return True if rec is None else False
+            self.inflight.add(ph)
+        try:
+            code, body = api_get("/api/play/status", timeout=STATUS_TIMEOUT, payment_hash=ph)
+        finally:
+            with self.lock:
+                self.inflight.discard(ph)
+        parent = rec["parent"]
+        if code == 404:
+            self.forget(ph)
+            self.reply(parent, "That invoice expired. If you did pay it, tell the station and we sort it out.", "expired")
+            return True
+        if code == 500:
+            notify("⚠️ NOSTR ZAP LANDED BUT NOT QUEUED — hash %s… requester %s. Refund or replay owed." % (ph[:16], self.npub_short(rec["requester"])))
+            self.reply(parent, "Your payment landed but the track failed to queue. The station has been told and will make it right.", "failed")
+            self.forget(ph)
+            return True
+        if code != 200:
+            return False
+        if body.get("queued"):
+            pos = ""
+            try:
+                _n, _q, q_len, _b = self.queue_state()
+                if q_len:
+                    pos = " You are #%d in the queue." % q_len
+            except Exception:
+                pass
+            self.reply(parent, "⚡ Paid and queued: %s — %s.%s\nListen: %s" % (rec["artist"], rec["title"], pos, SITE), "queued")
+            notify(("⚡ V4V QUEUED via nostr — a stranger's upload is going on air: " if rec["src"] == "wavlake" else "queued via nostr: ")
+                   + "%s - %s (%s)" % (rec["artist"], rec["title"], self.npub_short(rec["requester"])))
+            if rec.get("origin"):                       # nr_nostrquote: wait for it to air, then quote the play note
+                with self.lock:
+                    self.onair[ph] = {"origin": rec["origin"][0], "origin_pk": rec["origin"][1], "artist": rec["artist"],
+                                      "title": rec["title"], "queued_at": self.now(), "tries": 0}
+                    self.dirty = True
+            self.forget(ph)
+            return True
+        return False
+
+    def forget(self, ph):
+        with self.lock:
+            rec = self.pending.pop(ph, None)
+            if rec and self.open.get(rec["requester"], ("",))[0] == ph:
+                self.open.pop(rec["requester"], None)
+
+    def watcher_tick(self, max_checks=5):
+        """A few due invoices per tick, re-armed from the clock AFTER each call (a slow station must not collapse the
+        3/10/30 s ladder into back-to-back polling). Runs on its own thread in the service (review finding)."""
+        for _ in range(max_checks):
+            now = self.now()
+            with self.lock:
+                if not self.watch or self.watch[0][0] > now:
+                    return
+                due, ph = heapq.heappop(self.watch)
+                rec = self.pending.get(ph)
+            if rec is None:
+                continue
+            age = now - rec["started"]
+            if age > INVOICE_TTL_S + 120:
+                self.forget(ph)
+                self.reply(rec["parent"], "That invoice expired. If you did pay it, tell the station and we sort it out.", "expired")
+                continue
+            done = False
+            try:
+                done = self.check(ph)
+            except Exception as e:
+                log("status check error: %s" % e)
+            if not done:
+                gap = 3 if age < 60 else (10 if age < 300 else 30)
+                with self.lock:
+                    if ph in self.pending:
+                        heapq.heappush(self.watch, (self.now() + gap, ph))
+
+    def watcher(self, stop):
+        while not stop.is_set():
+            try:
+                self.watcher_tick()
+                self.quote_tick()
+            except Exception as e:
+                log("watcher error: %s" % e)
+            stop.wait(1)
+
+    # ---- nr_nostrquote (SF 2026-09-13): the on-air quote note, the X lane's twin
+    def quote_tick(self):
+        """Every 15 s while a paid song waits to air: when it is NOW PLAYING, quote the listener's own play note, once."""
+        now = self.now()
+        with self.lock:
+            waiting = bool(self.onair)
+        if not waiting or now < self.next_np:
+            return None
+        self.next_np = now + ONAIR_POLL_S
+        code, body = api_get("/api/nowplaying", timeout=8)
+        if code != 200:
+            return "api-down"
+        np_ = (body or {}).get("now_playing") or {}
+        if not np_.get("requested") or str(np_.get("note_via") or "") != "nostr":
+            return "not-ours"
+        key = ((np_.get("artist") or "").casefold(), (np_.get("title") or "").casefold())
+        with self.lock:
+            hits = sorted((float(v.get("queued_at") or 0), ph) for ph, v in self.onair.items()
+                          if ((v.get("artist") or "").casefold(), (v.get("title") or "").casefold()) == key)
+            if not hits:
+                return "not-ours"
+            ph = hits[0][1]
+            rec = self.onair[ph]
+        content, tags = compose_quote(np_, rec, self.blocklist)
+        if not content:
+            with self.lock:
+                self.onair.pop(ph, None)
+                self.dirty = True
+            return "nothing-to-say"
+        if not self.live_fn():
+            log("[dry] would quote %s: %s" % (rec["origin"][:12], content.replace("\n", " / ")))
+            with self.lock:
+                self.onair.pop(ph, None)
+                self.dirty = True
+            return "dry"
+        with self.lock:
+            rec.setdefault("created_at", int(now))           # a retry keeps the SAME event id: relays dedupe it
+        ev = nn.make_event(self.sk, content, tags, created_at=rec["created_at"])
+        with self.lock:
+            self.our_notes[ev["id"]] = now
+        res = self.publisher(ev, self.relays)
+        ok = [u for u, good, _m in res if good]
+        if ok:
+            with self.lock:
+                self.onair.pop(ph, None)
+                self.dirty = True
+            self.posted += 1
+            log("quoted %s -> %s on %d/%d relays: %s" % (rec["origin"][:12], ev["id"][:12], len(ok), len(res), content.splitlines()[0]))
+            if "\u201c" in content:
+                notify("Nostr quote %s carried a shoutout: %s" % (ev["id"][:12], content.splitlines()[0]))
+            return "quoted"
+        with self.lock:
+            rec["tries"] = int(rec.get("tries") or 0) + 1
+            gone = rec["tries"] >= 3
+            if gone:
+                self.onair.pop(ph, None)
+            self.dirty = True
+        log("quote note NOT accepted by any relay (try %d%s): %s" % (rec["tries"], ", giving up" if gone else "",
+                                                                      "; ".join("%s: %s" % (u, m) for u, _g, m in res)[:200]))
+        return "gave-up" if gone else "retry"
+
+    # ---- state on disk (only what must survive a restart: the seen set and the hourly budget)
+    def load_state(self):
+        try:
+            with open(STATE, encoding="utf-8") as fh:
+                st = json.load(fh)
+            now = self.now()
+            with self.lock:
+                self.seen = {k: float(v) for k, v in (st.get("seen") or {}).items() if now - float(v) < 86400}
+                self.stamps = [float(t) for t in (st.get("stamps") or []) if now - float(t) < 3600]
+                self.helped = {k: float(v) for k, v in (st.get("helped") or {}).items() if now - float(v) < HELP_GAP_S}
+                self.onair = {k: v for k, v in (st.get("onair") or {}).items()
+                              if isinstance(v, dict) and now - float(v.get("queued_at") or 0) < ONAIR_MAX_AGE_S}
+        except Exception:
+            pass
+
+    def save_state(self):
+        with self.lock:
+            st = {"seen": self.seen, "stamps": self.stamps, "helped": self.helped, "onair": self.onair}
+            self.dirty = False
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, STATE)
+
+
+def live_mode():
+    return os.path.exists(LIVE_FLAG) and not os.path.exists(OFF_FLAG)
+
+
+_stop = threading.Event()
+
+
+def _on_term(signum, frame):
+    _stop.set()
+
+
+def main():
+    global nn
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    try:
+        nn = load_nostr()
+    except Exception as e:
+        log("STOP: cannot load %s: %s" % (NOSTR_PATH, e))
+        return 3
+    sk = nn.keys()
+    if args == ["--check"]:
+        print("home: %s\nkey: %s\nLIVE: %s  OFF: %s\nrelays: %s\nblocklist: %d entries\nmax replies/hour: %d  V4V lane: %s\nstation: %s" % (
+            HOME, ("present -> " + nn.bech32_encode("npub", nn.pubkey(sk))) if sk else "MISSING",
+            os.path.exists(LIVE_FLAG), os.path.exists(OFF_FLAG), ", ".join(nn.load_relays()), len(nn.ann.load_blocklist()),
+            MAX_REPLIES_PER_HOUR, "on" if V4V_ENABLED else "off", API))
+        code, body = api_get("/api/nowplaying", timeout=8)
+        print("station answers: %s" % ("yes" if code == 200 else "NO (%s)" % code))
+        return 0
+    if args:
+        print(__doc__)
+        return 64
+    if not sk:
+        log("STOP: no key (HOME/nostr.env); run nr-nostr-keys.py first")
+        return 2
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    try:
+        import fcntl
+        lk = open(os.path.join(HOME, ".jukebox.lock"), "w")
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        globals()["_LOCK"] = lk
+    except ImportError:
+        pass
+    except OSError:
+        log("STOP: another nr-nostr-jukebox is running (the service?).")
+        return 65
+    relays = nn.load_relays()
+    bot = Jukebox(sk, relays, live_mode)
+    bot.load_state()
+    log("I am %s; %d relays; %s" % (bot.npub, len(relays),
+                                    "LIVE (replying and minting)" if live_mode() else "DRY (reading only; touch %s to go live)" % LIVE_FLAG))
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    inbox = queue.Queue()
+    threads = [Relay(u, bot.pk, inbox, _stop) for u in relays]
+    for t in threads:
+        t.start()
+    threading.Thread(target=bot.watcher, args=(_stop,), daemon=True, name="watcher").start()
+    last_gc = last_save = time.time()
+    while not _stop.is_set():
+        try:
+            url, ev = inbox.get(timeout=1)
+        except queue.Empty:
+            url, ev = None, None
+        try:
+            if ev is not None:
+                r = bot.handle(ev)
+                if r not in ("seen", "bad", "own", "stale", "thread-noise"):
+                    log("%s from %s via %s" % (r, bot.npub_short(ev.get("pubkey", "0" * 64)) if _HEX64.fullmatch(ev.get("pubkey", "")) else "?", url))
+        except Exception as e:
+            log("loop error: %s" % e)
+        now = time.time()
+        if now - last_gc > 30:
+            bot.gc()
+            last_gc = now
+        if bot.dirty and now - last_save > 10:
+            try:
+                bot.save_state()
+            except Exception as e:
+                log("could not write the state file: %s" % e)
+            last_save = now
+    try:
+        bot.save_state()
+    except Exception:
+        pass
+    log("stopping (signal); state saved")
+    return 0
+
+
+# ---------------------------------------------------------------- self-test (offline: a fake relay + a fake station on the loopback)
+def selftest():
+    global nn, API, STATE, LIVE_FLAG, OFF_FLAG
+    import tempfile, http.server, socketserver
+    d = tempfile.mkdtemp(prefix="nr-jukebox-test-")
+    STATE = os.path.join(d, "state.json")
+    LIVE_FLAG = os.path.join(d, "jukebox.LIVE")
+    OFF_FLAG = os.path.join(d, "jukebox.OFF")
+    nn = load_nostr()
+    fails = []
+
+    def check(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    # -- the fake station
+    calls = []
+    st_state = {"status": {"paid": False, "queued": False}, "status_code": 200, "queue": [], "live": False}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _j(self, code, obj):
+            raw = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            calls.append(("GET", u.path, qs))
+            if u.path == "/api/search":
+                q = (qs.get("q") or [""])[0].lower()
+                if (qs.get("src") or [""])[0] == "wavlake":
+                    return self._j(200, {"results": [{"artist": "Ainsley Costello", "title": "Cherry Bomb", "source": "wavlake", "guid": "g-1", "sats": 210}] if "cherry" in q else []})
+                if "daft" in q:
+                    return self._j(200, {"results": [{"artist": "Daft Punk", "title": "One More Time", "album": "Discovery", "duration_s": 320},
+                                                     {"artist": "Daft Punk", "title": "Around the World", "duration_s": 429}]})
+                return self._j(200, {"results": []})
+            if u.path == "/api/sample":
+                return self._j(200, {"results": [{"artist": "Bonobo", "title": "Kiara"}]})
+            if u.path == "/api/livesplit":
+                return self._j(200, {"live": st_state["live"], "dj": "DJ Test"})
+            if u.path == "/api/nowplaying":
+                return self._j(200, {"now_playing": st_state.get("np") or {"artist": "Nero", "title": "Promises"}, "queue": st_state["queue"]})
+            if u.path == "/api/play/status":
+                if st_state["status_code"] != 200:
+                    return self._j(st_state["status_code"], {"error": "x"})
+                return self._j(200, st_state["status"])
+            return self._j(404, {"error": "nf"})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(n).decode()
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/api/admin/note":
+                calls.append(("NOTE", u.path, json.loads(raw)))
+                return self._j(200, {"ok": True})
+            form = urllib.parse.parse_qs(raw)
+            calls.append(("POST", u.path, form))
+            if u.path == "/api/play":
+                if st_state["live"]:
+                    return self._j(409, {"error": "sesh"})
+                sats = 210 if (form.get("source") or [""])[0] == "wavlake" else 21
+                return self._j(200, {"payment_hash": "ab" * 32, "bolt11": "lnbc210n1testinvoice" + "q" * 200, "sats": sats})
+            return self._j(404, {})
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    API = "http://127.0.0.1:%d" % srv.server_address[1]
+
+    # -- keys and people
+    bot_sk = secrets.token_bytes(32)
+    alice_sk = secrets.token_bytes(32)
+    bob_sk = secrets.token_bytes(32)
+    carol_sk = secrets.token_bytes(32)
+    bot_pk = nn.pubkey(bot_sk).hex()
+    bot_npub = nn.bech32_encode("npub", bytes.fromhex(bot_pk))
+    posted = []
+
+    def fake_publish(ev, relays):
+        posted.append(ev)
+        return [(u, True, "") for u in relays]
+
+    live = {"on": True}
+    now = {"t": 1_800_000_000.0}
+    bot = Jukebox(bot_sk, ["ws://127.0.0.1:1"], lambda: live["on"], now_fn=lambda: now["t"], publisher=fake_publish, name_fn=lambda pk: "Alice")
+
+    def note(sk, content, tags=None, when=None):
+        return nn.make_event(sk, content, tags or [["p", bot_pk]], created_at=int(when if when is not None else now["t"]))
+
+    def reply_to(sk, parent, content):
+        return note(sk, content, thread_tags(parent))
+
+    # 1 help on a bare mention, once an hour
+    r1 = bot.handle(note(alice_sk, "hello nostr:" + bot_npub))
+    check("a bare mention gets the help note", r1 == "help" and posted and "play <artist or song>" in posted[-1]["content"])
+    check("the help note is a NIP-10 reply with root + p tags", posted[-1]["tags"][0][:1] == ["e"] and posted[-1]["tags"][0][3] == "root" and ["p", nn.pubkey(alice_sk).hex()] in posted[-1]["tags"])
+    n0 = len(posted)
+    check("a second bare mention within the hour is silent", bot.handle(note(alice_sk, "nostr:" + bot_npub + " ??")) == "help-quiet" and len(posted) == n0)
+    # 2 play -> results
+    r = bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft punk"))
+    check("play gives a numbered list", r == "results" and "1. Daft Punk — One More Time · 5:20 · Discovery" in posted[-1]["content"] and "2. Daft Punk — Around the World" in posted[-1]["content"])
+    results_ev = posted[-1]
+    check("the list is remembered under its note id", results_ev["id"] in bot.results)
+    # 3 cooldown
+    n0 = len(posted)
+    check("a second search within 20 s is dropped silently", bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft")) == "cooldown" and len(posted) == n0)
+    now["t"] += 30
+    # 4 a stranger's number is ignored; a bad number gets one hint
+    check("another person's number is ignored", bot.handle(reply_to(bob_sk, results_ev, "1")) == "not-owner")
+    r = bot.handle(reply_to(alice_sk, results_ev, "9"))
+    check("a number out of range is answered once", r == "bad-number" and "from 1 to 2" in posted[-1]["content"])
+    # 5 the pick -> invoice
+    r = bot.handle(reply_to(alice_sk, results_ev, "1"))
+    inv_ev = posted[-1]
+    play_calls = [c for c in calls if c[0] == "POST" and c[1] == "/api/play"]
+    check("the number mints an invoice with the exact names and the profile name", r == "invoice" and play_calls
+          and play_calls[-1][2]["artist"] == ["Daft Punk"] and play_calls[-1][2]["title"] == ["One More Time"] and play_calls[-1][2]["who"] == ["Alice"])
+    check("the invoice reply carries the bolt11 and threads under the number", "lnbc210n1testinvoice" in inv_ev["content"] and ["e", results_ev["id"], "", "root"] not in inv_ev["tags"]
+          and any(t[0] == "e" and t[3] == "reply" for t in inv_ev["tags"]))
+    check("the list is spent and the invoice is open", results_ev["id"] not in bot.results and bot.open.get(nn.pubkey(alice_sk).hex(), ("",))[0] == "ab" * 32)
+    # 6 a second play while the invoice is open
+    now["t"] += 30
+    r = bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft punk"))
+    check("a new search while an invoice is open is refused with a word", r == "open-invoice" and "already have an invoice open" in posted[-1]["content"])
+    # 7 the watcher: not paid, then queued
+    now["t"] += 5
+    bot.watcher_tick()
+    check("unpaid: no reply, re-armed", bot.watch and bot.watch[0][1] == "ab" * 32 and "queued" not in posted[-1]["content"])
+    st_state["status"] = {"paid": True, "queued": True, "message": "Queued"}
+    st_state["queue"] = [{"artist": "Daft Punk", "title": "One More Time"}]
+    now["t"] += 5
+    n0 = len(posted)
+    bot.watcher_tick()
+    notes = [c for c in calls if c[0] == "NOTE"]
+    check("queued: the receipt replies under the invoice note and SF gets a line", len(posted) == n0 + 1 and "Paid and queued" in posted[-1]["content"] and "#1" in posted[-1]["content"]
+          and any(t[0] == "e" and t[1] == inv_ev["id"] for t in posted[-1]["tags"]) and notes and "queued via nostr" in notes[-1][2]["text"])
+    check("the invoice is closed after payment", "ab" * 32 not in bot.pending and nn.pubkey(alice_sk).hex() not in bot.open)
+    # 7b nr_nostrquote: the on-air quote note
+    alice_pk = nn.pubkey(alice_sk).hex()
+    oid = [t[1] for t in results_ev["tags"] if t[0] == "e" and len(t) >= 4 and t[3] == "root"][0]
+    check("quote: the queued song is remembered with the listener's own play note", any(r.get("origin") == oid and r.get("origin_pk") == alice_pk for r in bot.onair.values()))
+    n0 = len(posted)
+    bot.next_np = 0
+    bot.quote_tick()
+    check("quote: while it only waits in the queue, nothing is posted", len(posted) == n0 and bot.onair)
+    st_state["np"] = {"artist": "Daft Punk", "title": "One More Time", "requested": True, "req_id": "rq1", "note_via": "nostr", "who": "Alice"}
+    bot.next_np = 0
+    r = bot.quote_tick()
+    q = posted[-1] if len(posted) == n0 + 1 else {}
+    check("quote: on air, ONE quote note with a q tag to the play note, the listener p-tagged", r == "quoted" and ["q", oid, "", alice_pk] in q.get("tags", []) and ["p", alice_pk] in q.get("tags", []))
+    check("quote: SF's wording and a nostr:note1 reference to the play note", q.get("content", "").startswith("Now playing on NoderunnersRadio.com\U0001F3A7 Daft Punk \u2014 One More Time.")
+          and ("nostr:" + nn.bech32_encode("note", bytes.fromhex(oid))) in q.get("content", ""))
+    check("quote: the note is signed by the bot", nn.schnorr_verify(bytes.fromhex(q["id"]), bytes.fromhex(q["pubkey"]), bytes.fromhex(q["sig"])) and q["pubkey"] == bot_pk)
+    bot.next_np = 0
+    bot.quote_tick()
+    check("quote: the same song still on air is not quoted twice", len(posted) == n0 + 1 and not bot.onair)
+    bot.onair["dd" * 32] = {"origin": "cc" * 32, "origin_pk": nn.pubkey(bob_sk).hex(), "artist": "Nero", "title": "Promises", "queued_at": now["t"], "tries": 0}
+    st_state["np"] = {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "rq3", "note_via": "telegram"}
+    bot.next_np = 0
+    check("quote: a song of the same name from another lane is not ours", bot.quote_tick() == "not-ours" and "dd" * 32 in bot.onair and len(posted) == n0 + 1)
+    live["on"] = False
+    st_state["np"] = {"artist": "Nero", "title": "Promises", "requested": True, "req_id": "rq2", "note_via": "nostr"}
+    bot.next_np = 0
+    check("quote: DRY logs and posts nothing", bot.quote_tick() == "dry" and len(posted) == n0 + 1 and not bot.onair)
+    live["on"] = True
+    bot.onair["ef" * 32] = {"origin": "cc" * 32, "origin_pk": nn.pubkey(bob_sk).hex(), "artist": "Nero", "title": "Promises", "queued_at": now["t"], "tries": 0}
+    ids = []
+    real_pub = bot.publisher
+
+    def refuse(ev, relays):
+        ids.append(ev["id"])
+        return [(u, False, "nope") for u in relays]
+    bot.publisher = refuse
+    res_ = []
+    for _i in range(3):
+        now["t"] += 20
+        bot.next_np = 0
+        res_.append(bot.quote_tick())
+    bot.publisher = real_pub
+    check("quote: no relay accepts -> retried with the SAME event id, then given up", res_ == ["retry", "retry", "gave-up"] and len(set(ids)) == 1 and not bot.onair)
+    st_state["np"] = None
+    # 8 expiry (404) and the failed-queue path (500)
+    st_state["queue"] = []
+    now["t"] += 60
+    bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft"))
+    bot.handle(reply_to(alice_sk, posted[-1], "2"))
+    st_state["status_code"] = 404
+    now["t"] += 5
+    bot.watcher_tick()
+    check("an expired invoice gets one note and is dropped", "expired" in posted[-1]["content"] and not bot.pending)
+    st_state["status_code"] = 500
+    now["t"] += 60
+    bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft"))
+    bot.handle(reply_to(alice_sk, posted[-1], "1"))
+    now["t"] += 5
+    bot.watcher_tick()
+    check("paid-but-not-queued tells SF and the listener", "ZAP LANDED BUT NOT QUEUED" in [c for c in calls if c[0] == "NOTE"][-1][2]["text"] and "station has been told" in posted[-1]["content"])
+    st_state["status_code"] = 200
+    st_state["status"] = {"paid": False, "queued": False}
+    # 9 blocked query, no results, live session, queue/now
+    now["t"] += 60
+    r = bot.handle(note(alice_sk, "nostr:" + bot_npub + " play kanker song"))
+    check("a blocked query is answered without the echo", r == "blocked" and "Nothing aboard for that" in posted[-1]["content"] and "kanker" not in posted[-1]["content"])
+    now["t"] += 60
+    r = bot.handle(note(alice_sk, "nostr:" + bot_npub + " play nothing here"))
+    check("no results is said plainly", r == "no-results" and "Nothing aboard for “nothing here”" in posted[-1]["content"])
+    check("alice has spent her per-person chatter hour by now", bot.budget_left(nn.pubkey(alice_sk).hex()) <= 0)
+    st_state["live"] = True
+    now["t"] += 60
+    r = bot.handle(note(carol_sk, "nostr:" + bot_npub + " play daft"))
+    check("a live sesh closes the jukebox", r == "live-session" and "live sesh" in posted[-1]["content"])
+    n0 = len(posted)
+    r = bot.handle(note(carol_sk, "nostr:" + bot_npub + " play daft again"))
+    check("a refusal arms the cooldown, so it cannot be repeated for free", r == "cooldown" and len(posted) == n0)
+    st_state["live"] = False
+    now["t"] += 60
+    check("queue", bot.handle(note(carol_sk, "nostr:" + bot_npub + " queue")) == "queue" and "Nothing lined up" in posted[-1]["content"])
+    now["t"] += 60
+    check("now", bot.handle(note(carol_sk, "nostr:" + bot_npub + " now")) == "now" and "Nero — Promises" in posted[-1]["content"])
+    # 10 events that must be ignored
+    check("a forged signature is ignored", bot.handle(dict(note(alice_sk, "nostr:" + bot_npub + " play daft"), sig="00" * 64)) == "bad")
+    check("an old event is ignored", bot.handle(note(alice_sk, "nostr:" + bot_npub + " play daft", when=now["t"] - 600)) == "stale")
+    check("our own note is ignored", bot.handle(note(bot_sk, "hi")) == "own")
+    gina_sk = secrets.token_bytes(32)
+    e1 = note(gina_sk, "nostr:" + bot_npub + " play daft", when=now["t"] + 100)
+    check("a replayed event is seen once", bot.handle(e1) == "results" and bot.handle(e1) == "seen")
+    stranger_thread = nn.make_event(bob_sk, "talking about music", [["e", "cc" * 32, "", "root"], ["p", bot_pk]], created_at=int(now["t"]))
+    check("a thread reply that only carries our p tag is ignored", bot.handle(stranger_thread) == "thread-noise")
+    # 11 the V4V lane rides along when it is on
+    global V4V_ENABLED
+    V4V_ENABLED = True
+    now["t"] += 60
+    r = bot.handle(note(bob_sk, "nostr:" + bot_npub + " play cherry bomb"))
+    check("a V4V row shows its lane and price", r == "results" and "1. V4V Ainsley Costello — Cherry Bomb" in posted[-1]["content"] and "210 sats" in posted[-1]["content"])
+    bot.handle(reply_to(bob_sk, posted[-1], "1"))
+    pc = [c for c in calls if c[0] == "POST" and c[1] == "/api/play"][-1][2]
+    check("the V4V pick sends source + guid and gets 210 sats", pc.get("source") == ["wavlake"] and pc.get("guid") == ["g-1"] and "Pay 210 sats" in posted[-1]["content"])
+    V4V_ENABLED = False
+    # 12 DRY mode: nothing is posted, nothing is minted
+    live["on"] = False
+    n0 = len(posted)
+    nplay = len([c for c in calls if c[0] == "POST" and c[1] == "/api/play"])
+    now["t"] += 60
+    dave_sk = secrets.token_bytes(32)
+    r = bot.handle(note(dave_sk, "nostr:" + bot_npub + " play daft"))
+    rid = sorted(bot.results.items(), key=lambda kv: kv[1][2])[-1][0]
+    r2 = bot.handle(reply_to(dave_sk, {"id": rid, "pubkey": nn.pubkey(dave_sk).hex(), "tags": []}, "1"))
+    check("DRY: a list is composed but not posted, and a pick mints nothing", r == "results" and len(posted) == n0 and r2 == "dry-mint"
+          and len([c for c in calls if c[0] == "POST" and c[1] == "/api/play"]) == nplay)
+    live["on"] = True
+    # 13 the hourly budget: chatter stops, the money path never does (review finding)
+    bot.stamps = [now["t"]] * MAX_REPLIES_PER_HOUR
+    n0 = len(posted)
+    now["t"] += 60
+    check("over budget: chatter is quiet, and SF is told once", bot.handle(note(bob_sk, "nostr:" + bot_npub + " queue")) == "queue" and len(posted) == n0
+          and "gone quiet" in [c for c in calls if c[0] == "NOTE"][-1][2]["text"])
+    erin_sk = secrets.token_bytes(32)
+    erin_pk = nn.pubkey(erin_sk).hex()
+    parent = note(erin_sk, "nostr:" + bot_npub + " play daft")
+    bot.results["ee" * 32] = ([("Daft Punk", "One More Time", "library", "", 21)], erin_pk, now["t"] + 600, "daft")
+    st_state["status"] = {"paid": False, "queued": False}
+    r = bot.handle(reply_to(erin_sk, {"id": "ee" * 32, "pubkey": erin_pk, "tags": [["p", bot_pk]]}, "1"))
+    check("over budget: an invoice is still minted AND still posted", r == "invoice" and len(posted) == n0 + 1 and "Pay 21 sats" in posted[-1]["content"])
+    inv2 = posted[-1]
+    check("the invoice note p-tags the requester", ["p", erin_pk] in inv2["tags"] and ["p", bot_pk] not in inv2["tags"])
+    st_state["status"] = {"paid": True, "queued": True, "message": "Queued"}
+    now["t"] += 5
+    bot.watcher_tick()
+    check("over budget: the receipt still goes out and p-tags the payer, not the bot",
+          "Paid and queued" in posted[-1]["content"] and ["p", erin_pk] in posted[-1]["tags"] and ["p", bot_pk] not in posted[-1]["tags"])
+    st_state["status"] = {"paid": False, "queued": False}
+    bot.stamps = []
+    bot.chatter = {}
+    # 13b the per-person chatter cap
+    frank_sk = secrets.token_bytes(32)
+    frank_pk = nn.pubkey(frank_sk).hex()
+    for i in range(PERSON_REPLIES_PER_HOUR):
+        now["t"] += 30
+        bot.handle(note(frank_sk, "nostr:" + bot_npub + " play nothing here %d" % i))
+    n0 = len(posted)
+    now["t"] += 30
+    check("one key cannot spend more than its own hour", bot.handle(note(frank_sk, "nostr:" + bot_npub + " play nothing here again")) == "no-results"
+          and len(posted) == n0 and bot.budget_left(frank_pk) <= 0 and bot.budget_left(nn.pubkey(bob_sk).hex()) > 0)
+    bot.chatter = {}
+    bot.stamps = []
+    # 14 mentions and commands
+    npro = nn.bech32_encode("nprofile", bytes([0, 32]) + bytes.fromhex(bot_pk))
+    hint = b"wss://relay.damus.io"
+    npro_hint = nn.bech32_encode("nprofile", bytes([0, 32]) + bytes.fromhex(bot_pk) + bytes([1, len(hint)]) + hint)   # encode has no 90-char cap
+    check("an nprofile mention counts", mentions("hey nostr:" + npro + " play x", bot_pk) and not mentions("nostr:" + nn.bech32_encode("npub", secrets.token_bytes(32)), bot_pk))
+    check("an nprofile WITH a relay hint counts (over 90 chars, review finding)", len(npro_hint) > 90 and mentions("hey nostr:" + npro_hint + " play x", bot_pk))
+    check("commands parse", parse_cmd("nostr:" + bot_npub + " /Play: Bonobo Kiara") == ("play", "Bonobo Kiara") and parse_cmd("Queue?") == ("queue", "")
+          and parse_cmd("shuffle") == ("play", "random") and parse_cmd("what is this") == ("help", "") and parse_cmd("play") == ("help", ""))
+    # 15 the state file round trip
+    bot.onair["ab" * 31 + "cd"] = {"origin": "cc" * 32, "origin_pk": bot_pk, "artist": "A", "title": "T", "queued_at": now["t"], "tries": 0}
+    bot.save_state()
+    b2 = Jukebox(bot_sk, [], lambda: True, now_fn=lambda: now["t"], publisher=fake_publish)
+    b2.load_state()
+    check("the seen set survives a restart", e1["id"] in b2.seen)
+    check("quote: a song waiting to air survives a restart", ("ab" * 31 + "cd") in b2.onair)
+    # 16 a real websocket subscription against a fake relay on the loopback
+    srv2 = socket.socket()
+    srv2.bind(("127.0.0.1", 0))
+    srv2.listen(2)
+    port = srv2.getsockname()[1]
+    got = queue.Queue()
+    stop = threading.Event()
+    scripted = note(alice_sk, "nostr:" + bot_npub + " play daft", when=now["t"])
+
+    def sframe(payload, op=1):
+        n = len(payload)
+        head = bytes([0x80 | op]) + (bytes([n]) if n < 126 else bytes([126]) + n.to_bytes(2, "big"))
+        return head + payload
+
+    def serve():
+        c, _a = srv2.accept()
+        c.settimeout(10)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += c.recv(4096)
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+        key = re.search(r"Sec-WebSocket-Key: (\S+)", head).group(1)
+        acc = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        c.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % acc).encode())
+        rd = nn._Reader(c, buf.split(b"\r\n\r\n", 1)[1])
+        op, data = rd.frame()
+        msg = json.loads(data.decode())
+        if msg[0] == "REQ" and msg[2].get("#p") == [bot_pk]:
+            c.sendall(sframe(json.dumps(["EVENT", msg[1], scripted]).encode()))
+            c.sendall(sframe(json.dumps(["EOSE", msg[1]]).encode()))
+        time.sleep(1.5)
+        c.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    rt = Relay("ws://127.0.0.1:%d" % port, bot_pk, got, stop)
+    rt.start()
+    try:
+        url, ev = got.get(timeout=8)
+        check("the subscription delivers the relay's event", ev["id"] == scripted["id"] and url.endswith(str(port)))
+    except queue.Empty:
+        check("the subscription delivers the relay's event", False)
+    stop.set()
+    srv.shutdown()
+    print("\nSELFTEST %s (%d failed)" % ("PASSED" if not fails else "FAILED", len(fails)))
+    return 0 if not fails else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

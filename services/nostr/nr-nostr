@@ -1,0 +1,957 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-nostr -- the Nostr twin of nr-announcer: posts every paid jukebox request as a Nostr note from the Jukebox
+Lightning Bot identity, as it goes on air. Nostr is free, so the note carries the station link. Stdlib only:
+BIP-340 Schnorr signing, NIP-19 bech32 and a small WebSocket client live in this file. No new software on the ship.
+
+HOW IT WORKS
+  Every 10 s it reads the station's own public /api/nowplaying. A track with requested=true and a new req_id is
+  a paid request going on air. One note per request, sent to every relay in the list; one relay saying OK is a post.
+  The words come from the SAME rules as the X announcer (this program imports /usr/local/bin/nr-announcer for
+  clean(), the blocklist and the message rules), plus a second line with the station link. When the station hands
+  over the Wavlake artist's npub, the note mentions the artist (nostr:npub...) and tags them, so they see it.
+  Every note that carried a message, and every withheld message, is shown to SF in Telegram (admin-notes channel).
+
+KEYS
+  /home/sf/.config/nr-nostr/nostr.env holds NOSTR_NSEC=... (600, owner sf), written by nr-nostr-keys.py through a
+  masked prompt. The key never appears in a log, a journal line, --check output or chat. --check prints the npub.
+
+SWITCHES (files in /home/sf/.config/nr-nostr, no restart needed)
+  LIVE      exists -> posts for real.   Absent -> DRY: logs "[dry] would post: ..." and nothing leaves the box.
+  OFF       exists -> idles.            relays.txt  EVERY relay to send to, one per line (the installer writes the four
+            public ones; a line in this file REPLACES the built-in list, so keep them when adding your own).
+  The blocklist is the announcer's: /home/sf/.config/nr-announcer/blocklist.txt.
+
+LIMITS
+  MAX_PER_HOUR (default 20). A note no relay accepts is retried next cycle, three times, then given up with one
+  Telegram line. Relay trouble reaches SF ONCE per 6 h.
+
+RUN  (systemd: nr-nostr.service, User=sf)      nr-nostr
+     nr-nostr --check      config status (prints the npub, never the key)      nr-nostr --once   one poll cycle
+     nr-nostr --selftest   offline: BIP-340 vectors, bech32, event id, WebSocket framing against a fake relay
+"""
+import os, sys, re, json, time, socket, ssl, struct, hashlib, secrets, base64, signal, importlib.util, importlib.machinery
+import urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
+
+HOME = os.environ.get("NR_NOSTR_HOME", os.path.expanduser("~/.config/nr-nostr"))
+ANN_PATH = os.environ.get("NR_ANNOUNCER_PATH", "/usr/local/bin/nr-announcer")
+API = os.environ.get("NR_API_BASE", "http://127.0.0.1:7100").rstrip("/")
+POLL_S = int(os.environ.get("NR_NOSTR_POLL_S", "10"))
+MAX_PER_HOUR = int(os.environ.get("NR_NOSTR_MAX_PER_HOUR", "20"))
+SITE = "https://noderunnersradio.com"
+HEAD = "Now playing on NoderunnersRadio.com\U0001F3A7 "     # SF 2026-09-13
+DEFAULT_RELAYS = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net", "wss://relay.snort.social"]
+RELAY_TIMEOUT_S = 12
+ALERT_GAP_S = 6 * 3600
+STATE = os.path.join(HOME, "state.json")
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " nr-nostr: " + msg, flush=True)
+
+
+# ---------------------------------------------------------------- the announcer's text rules (one set of rules, two outputs)
+def load_announcer():
+    sys.dont_write_bytecode = True          # never drop a .pyc beside /usr/local/bin/nr-announcer
+    loader = importlib.machinery.SourceFileLoader("nr_announcer", ANN_PATH)
+    spec = importlib.util.spec_from_loader("nr_announcer", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    for name in ("clean", "load_blocklist", "blocked"):
+        if not callable(getattr(mod, name, None)):
+            raise RuntimeError("%s lacks %s()" % (ANN_PATH, name))
+    return mod
+
+
+ann = None
+
+
+# ---------------------------------------------------------------- secp256k1 + BIP-340 Schnorr (pure Python; a few ms per signature)
+_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+      0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    x1, y1 = a
+    x2, y2 = b
+    if x1 == x2 and (y1 + y2) % _P == 0:
+        return None
+    if x1 == x2:
+        lam = (3 * x1 * x1 * pow(2 * y1, _P - 2, _P)) % _P
+    else:
+        lam = ((y2 - y1) * pow((x2 - x1) % _P, _P - 2, _P)) % _P
+    x3 = (lam * lam - x1 - x2) % _P
+    return (x3, (lam * (x1 - x3) - y1) % _P)
+
+
+def _mul(pt, n):
+    r = None
+    while n:
+        if n & 1:
+            r = _add(r, pt)
+        pt = _add(pt, pt)
+        n >>= 1
+    return r
+
+
+def _tagged(tag, *chunks):
+    h = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(h + h + b"".join(chunks)).digest()
+
+
+def _lift_x(x):
+    if x >= _P:
+        return None
+    y_sq = (pow(x, 3, _P) + 7) % _P
+    y = pow(y_sq, (_P + 1) // 4, _P)
+    if pow(y, 2, _P) != y_sq:
+        return None
+    return (x, y if y % 2 == 0 else _P - y)
+
+
+def pubkey(seckey):
+    """32-byte secret key -> 32-byte x-only public key (BIP-340)."""
+    d = int.from_bytes(seckey, "big")
+    if not 1 <= d <= _N - 1:
+        raise ValueError("secret key out of range")
+    return _mul(_G, d)[0].to_bytes(32, "big")
+
+
+def schnorr_verify(msg, pk, sig):
+    if len(pk) != 32 or len(sig) != 64:
+        return False
+    pt = _lift_x(int.from_bytes(pk, "big"))
+    r = int.from_bytes(sig[:32], "big")
+    s = int.from_bytes(sig[32:], "big")
+    if pt is None or r >= _P or s >= _N:
+        return False
+    e = int.from_bytes(_tagged("BIP0340/challenge", sig[:32], pk, msg), "big") % _N
+    rr = _add(_mul(_G, s), _mul(pt, _N - e))
+    return rr is not None and rr[1] % 2 == 0 and rr[0] == r
+
+
+def schnorr_sign(msg, seckey, aux):
+    d0 = int.from_bytes(seckey, "big")
+    if not 1 <= d0 <= _N - 1:
+        raise ValueError("secret key out of range")
+    if len(aux) != 32:
+        raise ValueError("aux must be 32 bytes")
+    pt = _mul(_G, d0)
+    d = d0 if pt[1] % 2 == 0 else _N - d0
+    t = (d ^ int.from_bytes(_tagged("BIP0340/aux", aux), "big")).to_bytes(32, "big")
+    px = pt[0].to_bytes(32, "big")
+    k0 = int.from_bytes(_tagged("BIP0340/nonce", t, px, msg), "big") % _N
+    if k0 == 0:
+        raise RuntimeError("nonce is zero; try again")
+    rpt = _mul(_G, k0)
+    k = k0 if rpt[1] % 2 == 0 else _N - k0
+    rx = rpt[0].to_bytes(32, "big")
+    e = int.from_bytes(_tagged("BIP0340/challenge", rx, px, msg), "big") % _N
+    sig = rx + ((k + e * d) % _N).to_bytes(32, "big")
+    if not schnorr_verify(msg, px, sig):
+        raise RuntimeError("the signature did not verify")
+    return sig
+
+
+# ---------------------------------------------------------------- NIP-19 bech32 (npub / nsec)
+_B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _polymod(values):
+    gen = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for v in values:
+        b = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ v
+        for i in range(5):
+            if (b >> i) & 1:
+                chk ^= gen[i]
+    return chk
+
+
+def _hrp_expand(hrp):
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convertbits(data, frombits, tobits, pad):
+    acc = bits = 0
+    out = []
+    maxv = (1 << tobits) - 1
+    for v in data:
+        if v < 0 or v >> frombits:
+            raise ValueError("bad value")
+        acc = (acc << frombits) | v
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            out.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            out.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        raise ValueError("bad padding")
+    return out
+
+
+def bech32_decode(s):
+    s = str(s or "").strip()
+    if s != s.lower() and s != s.upper():
+        raise ValueError("mixed case")
+    s = s.lower()
+    pos = s.rfind("1")
+    if pos < 1 or pos + 7 > len(s) or len(s) > 90:
+        raise ValueError("not bech32")
+    hrp, data = s[:pos], [_B32.find(c) for c in s[pos + 1:]]
+    if -1 in data or _polymod(_hrp_expand(hrp) + data) != 1:
+        raise ValueError("bad checksum")
+    return hrp, bytes(_convertbits(data[:-6], 5, 8, False))
+
+
+def bech32_encode(hrp, raw):
+    data = _convertbits(list(raw), 8, 5, True)
+    pm = _polymod(_hrp_expand(hrp) + data + [0] * 6) ^ 1
+    chk = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + "1" + "".join(_B32[d] for d in data + chk)
+
+
+def parse_secret(text):
+    """nsec1... or 64 hex chars -> 32 bytes. Raises on anything else."""
+    t = str(text or "").strip()
+    if t.lower().startswith("nsec1"):
+        hrp, raw = bech32_decode(t)
+        if hrp != "nsec" or len(raw) != 32:
+            raise ValueError("not an nsec")
+        return _in_range(raw)
+    if re.fullmatch(r"[0-9a-fA-F]{64}", t):
+        return _in_range(bytes.fromhex(t))
+    raise ValueError("not an nsec and not 64 hex characters")
+
+
+def _in_range(raw):
+    if not 1 <= int.from_bytes(raw, "big") < _N:
+        raise ValueError("secret key out of range")
+    return raw
+
+
+def keys():
+    """The secret key from the environment or HOME/nostr.env; None when absent. Never logged."""
+    raw = os.environ.get("NOSTR_NSEC", "")
+    if not raw:
+        try:
+            with open(os.path.join(HOME, "nostr.env"), encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("NOSTR_NSEC=") and not line.startswith("#"):
+                        raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    if not raw:
+        return None
+    try:
+        return parse_secret(raw)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- NIP-01 event
+def make_event(seckey, content, tags, created_at=None, aux=None):
+    pk = pubkey(seckey).hex()
+    created_at = int(created_at if created_at is not None else time.time())
+    ser = json.dumps([0, pk, created_at, 1, tags, content], separators=(",", ":"), ensure_ascii=False)
+    eid = hashlib.sha256(ser.encode("utf-8")).digest()
+    sig = schnorr_sign(eid, seckey, aux if aux is not None else secrets.token_bytes(32))
+    return {"id": eid.hex(), "pubkey": pk, "created_at": created_at, "kind": 1, "tags": tags, "content": content,
+            "sig": sig.hex()}
+
+
+# ---------------------------------------------------------------- a small WebSocket client (RFC 6455, client side only)
+def _frame(payload, opcode=1):
+    mask = secrets.token_bytes(4)
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 65536:
+        head += bytes([0x80 | 126]) + struct.pack(">H", n)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+class _Reader:
+    def __init__(self, sock, buf=b""):
+        self.s, self.buf = sock, buf
+
+    def take(self, n):
+        while len(self.buf) < n:
+            c = self.s.recv(65536)
+            if not c:
+                raise OSError("the relay closed the connection")
+            self.buf += c
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _one(self):
+        b0, b1 = self.take(2)
+        fin, op, masked, n = b0 & 0x80, b0 & 0x0F, b1 & 0x80, b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", self.take(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", self.take(8))[0]
+        if n > (1 << 20):
+            raise OSError("frame too big")
+        mask = self.take(4) if masked else b""
+        data = self.take(n)
+        if masked:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return bool(fin), op, data
+
+    def frame(self):
+        """One WHOLE message: (opcode, payload). A relay may split a message over a first frame and continuation
+        frames (opcode 0), and may slip a ping between the pieces. Pings are answered here and pongs dropped, so a
+        caller always sees a complete message; a close frame is handed up as (8, payload)."""
+        data = b""
+        first = None
+        while True:
+            fin, op, part = self._one()
+            if op == 9:                      # ping: answer it and keep waiting for the rest
+                try:
+                    self.s.sendall(_frame(part, 10))
+                except Exception:
+                    pass
+                continue
+            if op == 10:                     # pong: nothing to do
+                continue
+            if op == 8:                      # close
+                return 8, part
+            if op in (1, 2):
+                if first is not None:
+                    raise OSError("a new message started while one was still open")
+                first = op
+            elif op == 0:
+                if first is None:
+                    raise OSError("a continuation frame with no message open")
+            else:
+                raise OSError("unknown websocket opcode %d" % op)
+            data += part
+            if len(data) > (1 << 20):
+                raise OSError("message too big")
+            if fin:
+                return first, data
+
+
+def relay_send(url, event, timeout=RELAY_TIMEOUT_S):
+    """Open the relay, send ["EVENT", event], wait for ["OK", id, true|false, message]. Returns (ok, message)."""
+    m = re.fullmatch(r"(wss?)://([^/:\s]+)(?::(\d+))?(/\S*)?", url.strip())
+    if not m:
+        raise ValueError("bad relay url")
+    scheme, host, port, path = m.group(1), m.group(2), int(m.group(3) or (443 if m.group(1) == "wss" else 80)), m.group(4) or "/"
+    raw = socket.create_connection((host, port), timeout=timeout)
+    s = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if scheme == "wss" else raw
+    s.settimeout(timeout)
+    deadline = time.time() + timeout
+    try:
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        hosthdr = host if port == (443 if scheme == "wss" else 80) else "%s:%d" % (host, port)
+        s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                   "Sec-WebSocket-Version: 13\r\nUser-Agent: nr-nostr/1\r\n\r\n" % (path, hosthdr, key)).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            c = s.recv(4096)
+            if not c:
+                raise OSError("handshake: the relay closed the connection")
+            resp += c
+            if len(resp) > 65536:
+                raise OSError("handshake: reply too long")
+        head, rest = resp.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise OSError("handshake refused: " + head.split(b"\r\n", 1)[0].decode("latin-1")[:80])
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if accept.encode() not in head:
+            raise OSError("handshake: wrong accept key")
+        s.sendall(_frame(json.dumps(["EVENT", event], separators=(",", ":"), ensure_ascii=False).encode("utf-8")))
+        rd = _Reader(s, rest)
+        notice = ""
+        while time.time() < deadline:
+            try:
+                op, data = rd.frame()
+            except socket.timeout:
+                break
+            if op == 8:
+                raise OSError("the relay closed: " + data[2:80].decode("utf-8", "replace"))
+            if op != 1:                      # pings and pongs never reach here; the reader answers them
+                continue
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            if isinstance(msg, list) and msg and msg[0] == "OK" and len(msg) >= 3 and msg[1] == event["id"]:
+                return bool(msg[2]), str(msg[3] if len(msg) > 3 else "")
+            if isinstance(msg, list) and msg and msg[0] == "NOTICE" and len(msg) > 1:
+                notice = str(msg[1])[:120]
+        raise OSError("no OK within %d s%s" % (timeout, (": " + notice) if notice else ""))
+    finally:
+        try:
+            s.sendall(_frame(b"\x03\xe8", 8))
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def load_relays():
+    out = []
+    try:
+        with open(os.path.join(HOME, "relays.txt"), encoding="utf-8") as fh:
+            for line in fh:
+                u = line.split("#", 1)[0].strip()
+                if u.startswith("wss://") or u.startswith("ws://"):
+                    out.append(u)
+    except OSError:
+        pass
+    return out or list(DEFAULT_RELAYS)
+
+
+def publish(event, relays):
+    """Send to every relay at once. Returns a list of (relay, ok, message)."""
+    def one(u):
+        try:
+            ok, msg = relay_send(u, event)
+            return (u, ok, msg)
+        except Exception as e:
+            return (u, False, str(e)[:120])
+    with ThreadPoolExecutor(max_workers=max(1, len(relays))) as ex:
+        return list(ex.map(one, relays))
+
+
+# ---------------------------------------------------------------- notes to SF
+def notify(text):
+    try:
+        data = json.dumps({"src": "nostr", "text": text[:600]}).encode()
+        req = urllib.request.Request(API + "/api/admin/note", data=data, headers={"Content-Type": "application/json", "User-Agent": "nr-nostr/1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log("could not hand the note to the station API: %s" % e)
+        return False
+
+
+def alert(st, kind, text):
+    now = time.time()
+    if now - float(st["alerts"].get(kind, 0)) < ALERT_GAP_S:
+        return
+    st["alerts"][kind] = now
+    log("ALERT %s: %s" % (kind, text))
+    notify(text)
+
+
+# ---------------------------------------------------------------- the note
+def compose(np, blocklist, quiet=False):
+    """(content, tags) for one paid request, or (None, None). Words by the announcer's rules; Nostr may carry the link.
+    quiet=True on a retry: the same withheld message must not reach SF's Telegram again."""
+    artist = ann.clean(np.get("artist"), 80, tracknum=True)
+    title = ann.clean(np.get("title"), 120, tracknum=True)
+    if title.casefold() == "unknown track":
+        title = ""
+    if not artist and not title:
+        return None, None
+    who = ann.clean(np.get("who"), 24)
+    note = ann.clean(np.get("note"), 80)
+    if note and ann.blocked(note, blocklist):
+        log("message withheld (blocklist): " + note)
+        if not quiet:
+            notify("Nostr: message withheld by the blocklist (the song still posts): " + note)
+        note = ""
+    tags = [["t", "noderunnersradio"], ["r", SITE]]
+    tail = ""
+    npub = str(np.get("artist_npub") or "").strip()
+    if npub.lower().startswith("npub1"):
+        try:
+            hrp, raw = bech32_decode(npub)
+            if hrp == "npub" and len(raw) == 32:
+                tail = "nostr:%s on Wavlake." % npub.lower()
+                tags.append(["p", raw.hex()])
+        except Exception:
+            pass
+    if not tail and str(np.get("lane") or "") == "v4v":
+        tail = "Via Wavlake."
+    song = "%s \u2014 %s" % (artist, title) if artist and title else (artist or title)
+    content = HEAD + song + ("" if song[-1:] in ".!?\u2026" else ".")      # SF's wording, 2026-09-13
+    if tail:
+        content += " " + tail
+    if note:
+        content += " With shoutout: \u201c%s\u201d" % note
+    return content, tags
+
+
+# ---------------------------------------------------------------- state
+def _try_rec(st, rid):
+    v = st["tries"].get(rid)
+    return v if isinstance(v, list) and len(v) == 2 else None
+
+
+def _try_n(st, rid):
+    r = _try_rec(st, rid)
+    return int(r[0]) if r else 0
+
+
+def _try_at(st, rid, now):
+    """The created_at of this request's first try; today's clock when there was none."""
+    r = _try_rec(st, rid)
+    return int(r[1]) if r else int(now)
+
+
+def on_start(st):
+    st["backoff_until"] = 0
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+        if isinstance(st, dict):
+            for k, v in (("seen", {}), ("stamps", []), ("alerts", {}), ("tries", {})):
+                st.setdefault(k, v)
+            return st
+    except Exception:
+        pass
+    return {"seen": {}, "stamps": [], "alerts": {}, "tries": {}, "backoff_until": 0}
+
+
+def save_state(st):
+    now = time.time()
+    st["seen"] = {k: v for k, v in st["seen"].items() if now - float(v) < 86400}
+    st["stamps"] = [t for t in st["stamps"] if now - t < 3600]
+    st["tries"] = {k: v for k, v in st["tries"].items() if k not in st["seen"]}
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    tmp = STATE + ".new"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, STATE)
+
+
+def api_get(path, timeout=8):
+    with urllib.request.urlopen(API + path, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+# ---------------------------------------------------------------- one cycle
+def cycle(st, sender=publish, now_fn=time.time, getter=api_get, relays=None):
+    now = now_fn()
+    if os.path.exists(os.path.join(HOME, "OFF")):
+        return "off"
+    try:
+        d = getter("/api/nowplaying")
+    except Exception as e:
+        return "api-down: %s" % e
+    np = (d or {}).get("now_playing") or {}
+    rid = str(np.get("req_id") or "")
+    if not np.get("requested") or not rid:
+        return "not-a-request"
+    if rid in st["seen"]:
+        return "seen"
+    if str(np.get("lane") or "") == "gift":
+        st["seen"][rid] = now
+        return "gift-skipped"
+    # nr_nostrquote (SF 2026-09-13): a song paid through the Nostr jukebox is announced by that bot as a quote note of the
+    # listener's own "play" note. The station sets note_via "nostr" only for a request from the box itself.
+    if str(np.get("note_via") or "") == "nostr":
+        st["seen"][rid] = now
+        log("Nostr-lane song, left to the Nostr jukebox's quote note: %s \u2014 %s" % (np.get("artist") or "", np.get("title") or ""))
+        return "nostr-lane"
+    if now < float(st.get("backoff_until") or 0):
+        return "backoff"
+    content, tags = compose(np, ann.load_blocklist(), quiet=rid in st["tries"])
+    if not content:
+        st["seen"][rid] = now
+        return "nothing-to-say"
+    if len([t for t in st["stamps"] if now - t < 3600]) >= MAX_PER_HOUR:
+        st["seen"][rid] = now
+        log("cap: %d notes in the last hour -- skipped: %s" % (MAX_PER_HOUR, content.splitlines()[0]))
+        return "cap"
+    if not os.path.exists(os.path.join(HOME, "LIVE")):
+        st["seen"][rid] = now
+        log("[dry] would post: " + content.replace("\n", " | "))
+        return "dry"
+    sk = keys()
+    if not sk:
+        alert(st, "keys", "Nostr announcer: no usable key in nostr.env -- not posting.")
+        st["backoff_until"] = now + 1800
+        return "no-keys"
+    # the same request keeps the created_at of its first try, so a retry has the SAME event id: a relay that
+    # already stored it answers "duplicate" instead of keeping a second note.
+    ev = make_event(sk, content, tags, created_at=_try_at(st, rid, now))
+    results = sender(ev, relays or load_relays())
+    good = [u for u, ok, _ in results if ok]
+    if good:
+        st["seen"][rid] = now
+        st["stamps"].append(now)
+        st["tries"].pop(rid, None)
+        log("posted %s to %d/%d relays: %s" % (ev["id"][:12], len(good), len(results), content.replace("\n", " | ")))
+        for u, ok, msg in results:
+            if not ok:
+                log("  relay refused: %s -- %s" % (u, msg))
+        if "“" in content:
+            notify("Nostr note %s carried a message: %s" % (ev["id"][:12], content.splitlines()[0]))
+        return "posted"
+    tries = _try_n(st, rid) + 1
+    st["tries"][rid] = [tries, _try_at(st, rid, now)]
+    detail = "; ".join("%s: %s" % (u.replace("wss://", ""), msg) for u, _, msg in results)[:300]
+    if tries >= 3:
+        st["seen"][rid] = now
+        alert(st, "relays", "Nostr announcer: no relay accepted a note after 3 tries (%s). Giving up on this request." % detail)
+        return "gave-up"
+    st["backoff_until"] = now + 120
+    log("no relay accepted (try %d): %s" % (tries, detail))
+    return "error"
+
+
+_stop = False
+
+
+def _on_term(signum, frame):
+    global _stop
+    _stop = True
+
+
+def main():
+    global ann
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    try:
+        ann = load_announcer()
+    except Exception as e:
+        log("STOP: cannot load the announcer's text rules from %s: %s" % (ANN_PATH, e))
+        return 3
+    if args == ["--check"]:
+        sk = keys()
+        st = load_state()
+        print("home: %s\nkey: %s\nLIVE: %s  OFF: %s\nrelays: %s\nblocklist: %d entries (from %s)\nmax/hour: %d  poll: %d s" % (
+            HOME, ("present -> " + bech32_encode("npub", pubkey(sk))) if sk else "MISSING",
+            os.path.exists(os.path.join(HOME, "LIVE")), os.path.exists(os.path.join(HOME, "OFF")), ", ".join(load_relays()),
+            len(ann.load_blocklist()), ann.HOME, MAX_PER_HOUR, POLL_S))
+        print("state: %d seen (24 h), %d notes in the last hour, backoff %s" % (
+            len(st["seen"]), len([t for t in st["stamps"] if time.time() - t < 3600]),
+            "yes" if time.time() < float(st.get("backoff_until") or 0) else "no"))
+        return 0
+    if args not in ([], ["--once"]):
+        print(__doc__)
+        return 64
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    lock = os.path.join(HOME, ".lock")
+    try:
+        import fcntl
+        _lk = open(lock, "w")
+        fcntl.flock(_lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        globals()["_LOCK"] = _lk                     # held for the life of the process
+    except ImportError:
+        pass                                          # not Linux (the self-test runs on the PC too)
+    except OSError:
+        log("STOP: another nr-nostr is running and owns the state file (the service?). Use --check, or stop the service first.")
+        return 65
+    st = load_state()
+    on_start(st)
+    try:
+        save_state(st)
+    except Exception as e:
+        log("could not write the state file: %s" % e)
+    log("watching %s every %d s -- %s" % (API, POLL_S, "LIVE (posting to Nostr)" if os.path.exists(os.path.join(HOME, "LIVE"))
+                                            else "DRY (nothing leaves the box; touch %s/LIVE to go live)" % HOME))
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    last_down = False
+    while True:
+        if _stop:
+            try:
+                save_state(st)
+            except Exception as e:
+                log("could not write the state file: %s" % e)
+            log("stopping (signal); state saved")
+            return 0
+        try:
+            r = cycle(st)
+            down = r.startswith("api-down")
+            if down != last_down:
+                log(r if down else "station API reachable again")
+            last_down = down
+            if r not in ("not-a-request", "seen", "off", "backoff") and not down:
+                save_state(st)
+            if args == ["--once"]:
+                print(r)
+                return 0
+        except Exception as e:
+            log("cycle error: %s" % e)
+        for _ in range(POLL_S):
+            if _stop:
+                break
+            time.sleep(1)
+
+
+# ---------------------------------------------------------------- self-test (offline)
+def selftest():
+    global HOME, STATE, API, ann
+    import tempfile, threading, shutil, atexit, csv
+    d = tempfile.mkdtemp(prefix="nr-nostr-test-")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    HOME = d
+    STATE = os.path.join(d, "state.json")
+    API = "http://127.0.0.1:9"
+    fails = []
+
+    def check(name, cond):
+        print(("PASS " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    # BIP-340 vectors (bitcoin/bips bip-0340/test-vectors.csv), from the file next to this program or an env path
+    here = os.path.dirname(os.path.abspath(__file__))
+    vec = os.environ.get("NR_BIP340_VECTORS") or next((p for p in (os.path.join(here, "bip340-test-vectors.csv"),
+                                                                    "/usr/local/share/nr-nostr/bip340-test-vectors.csv") if os.path.exists(p)), "")
+    if vec:
+        n_sign = n_ver = 0
+        with open(vec, encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                pk, msg, sig = bytes.fromhex(row["public key"]), bytes.fromhex(row["message"]), bytes.fromhex(row["signature"])
+                want = row["verification result"].strip().upper() == "TRUE"
+                ok = schnorr_verify(msg, pk, sig) == want
+                n_ver += ok
+                if not ok:
+                    check("BIP-340 verify vector %s (%s)" % (row["index"], row["comment"][:40]), False)
+                if row["secret key"]:
+                    sk, aux = bytes.fromhex(row["secret key"]), bytes.fromhex(row["aux_rand"])
+                    got = pubkey(sk) == pk and schnorr_sign(msg, sk, aux) == sig
+                    n_sign += got
+                    if not got:
+                        check("BIP-340 sign vector %s" % row["index"], False)
+        check("BIP-340: all vectors verify as expected (%d of 19) and every signing vector reproduces (%d of 8)" % (n_ver, n_sign), n_ver == 19 and n_sign == 8)
+    else:
+        check("BIP-340 vectors file present", False)
+    sk = bytes.fromhex("B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF")
+    pk = pubkey(sk)
+    check("pubkey of vector 1", pk.hex().upper() == "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659")
+    sig = schnorr_sign(b"\x01" * 32, sk, secrets.token_bytes(32))
+    check("sign/verify round trip; a flipped byte fails", schnorr_verify(b"\x01" * 32, pk, sig) and not schnorr_verify(b"\x02" * 32, pk, sig))
+    # bech32
+    npub = "npub1xkpztf7z7q7p5rcfdu2lt3yv6zqw3cegk9pcnkcp29kjy6pcx5hss0whm0"
+    hrp, raw = bech32_decode(npub)
+    check("npub decodes to 32 bytes and re-encodes to itself", hrp == "npub" and len(raw) == 32 and bech32_encode("npub", raw) == npub)
+    nsec = bech32_encode("nsec", sk)
+    check("nsec round trip", nsec.startswith("nsec1") and parse_secret(nsec) == sk and parse_secret(sk.hex()) == sk)
+    bad = False
+    try:
+        bech32_decode(npub[:-1] + ("q" if npub[-1] != "q" else "p"))
+    except ValueError:
+        bad = True
+    check("a wrong checksum is refused", bad)
+    check("garbage is not a key", all(_raises(parse_secret, x) for x in ("", "hello", "npub1" + npub[5:], "0" * 63)))
+    # event
+    ev = make_event(sk, "hi", [["t", "x"]], created_at=1700000000, aux=b"\x00" * 32)
+    ser = json.dumps([0, ev["pubkey"], 1700000000, 1, [["t", "x"]], "hi"], separators=(",", ":"), ensure_ascii=False)
+    check("event id is the sha256 of the NIP-01 serialization", ev["id"] == hashlib.sha256(ser.encode()).hexdigest())
+    check("event signature verifies for the event id", schnorr_verify(bytes.fromhex(ev["id"]), bytes.fromhex(ev["pubkey"]), bytes.fromhex(ev["sig"])))
+    ev2 = make_event(sk, "café “quotes” \\ \" \n tab\t", [], created_at=1700000000, aux=b"\x00" * 32)
+    check("non-ASCII content is serialized raw (not escaped) per NIP-01", ev2["id"] == hashlib.sha256(json.dumps(
+        [0, ev2["pubkey"], 1700000000, 1, [], ev2["content"]], separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest())
+    # WebSocket framing against a fake relay
+    got = {}
+
+    def fake_relay(srv, behave):
+        conn, _ = srv.accept()
+        conn.settimeout(5)
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += conn.recv(4096)
+        key = re.search(rb"Sec-WebSocket-Key: (\S+)", req).group(1).decode()
+        acc = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % acc).encode())
+        rd = _Reader(conn)
+        op, data = rd.frame()
+        got["op"], got["data"] = op, data
+        msg = json.loads(data.decode("utf-8"))
+        eid = msg[1]["id"]
+
+        def send(obj):
+            payload = json.dumps(obj).encode()
+            conn.sendall(bytes([0x81]) + (bytes([len(payload)]) if len(payload) < 126 else bytes([126]) + struct.pack(">H", len(payload))) + payload)
+        if behave == "ok":
+            conn.sendall(bytes([0x89, 2]) + b"hi")          # a ping first; the client must pong and keep waiting
+            send(["NOTICE", "welcome"])
+            send(["OK", eid, True, ""])
+        elif behave == "refuse":
+            send(["OK", eid, False, "blocked: rate limit"])
+        elif behave == "silent":
+            time.sleep(3)
+        try:
+            rd.frame()                                       # the client's close frame
+        except Exception:
+            pass
+        conn.close()
+
+    def serve(behave):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        srv.settimeout(10)
+        th = threading.Thread(target=fake_relay, args=(srv, behave), daemon=True)
+        th.start()
+        return "ws://127.0.0.1:%d/" % srv.getsockname()[1], th
+    u, th = serve("ok")
+    ok, msg = relay_send(u, ev, timeout=6)
+    th.join(5)
+    check("fake relay: masked EVENT frame received, ping answered, NOTICE skipped, OK returned", ok and got.get("op") == 1 and json.loads(got["data"])[0] == "EVENT")
+    u, th = serve("refuse")
+    ok, msg = relay_send(u, ev, timeout=6)
+    th.join(5)
+    check("fake relay: a refusal comes back as (False, reason)", ok is False and "rate limit" in msg)
+    u, th = serve("silent")
+    err = ""
+    try:
+        relay_send(u, ev, timeout=2)
+    except OSError as e:
+        err = str(e)
+    th.join(6)
+    check("fake relay: silence ends in a timeout error, not a hang", "no OK" in err)
+    u1, t1 = serve("ok")
+    u2, t2 = serve("refuse")
+    res = publish(ev, [u1, u2, "ws://127.0.0.1:1/"])
+    t1.join(5)
+    t2.join(5)
+    check("publish: one OK out of three counts, failures are reported", [r[1] for r in res] == [True, False, False])
+    # the announcer's rules + the note
+    try:
+        ann = load_announcer()
+        check("announcer text rules loaded from %s" % ANN_PATH, True)
+    except Exception as e:
+        check("announcer text rules loaded (%s)" % e, False)
+        print("RESULT: %d failed" % len(fails))
+        return 1
+    os.makedirs(os.path.join(d, "ann"), exist_ok=True)
+    ann.HOME = os.path.join(d, "ann")
+    with open(os.path.join(ann.HOME, "blocklist.txt"), "w", encoding="utf-8") as fh:
+        fh.write("badword\n")
+    bl = ann.load_blocklist()
+    c, t = compose({"artist": "Bent Fabric", "title": "Jukebox", "who": "leplebroyale", "note": "Hello Nostr!", "lane": "paid"}, bl)
+    check("note text: SF's wording, no requester, the shoutout, the r tag", c == HEAD + "Bent Fabric \u2014 Jukebox. With shoutout: \u201cHello Nostr!\u201d" and ["t", "noderunnersradio"] in t and ["r", SITE] in t)
+    c, t = compose({"artist": "A", "title": "T", "note": "you badword", "lane": "paid"}, bl)
+    check("blocklist withholds the message on Nostr too", "“" not in c)
+    c, t = compose({"artist": "Ainsley Costello", "title": "Cherry Blossom", "lane": "v4v", "artist_npub": npub}, bl)
+    check("artist npub -> mention + p tag", ("nostr:" + npub) in c and ["p", raw.hex()] in t)
+    c, t = compose({"artist": "X", "title": "Y", "lane": "v4v", "artist_npub": "npub1garbage"}, bl)
+    check("a bad npub is ignored, 'Via Wavlake' instead", "Via Wavlake." in c and not any(x[0] == "p" for x in t))
+    check("nothing to say", compose({"artist": "", "title": "Unknown track", "lane": "paid"}, bl) == (None, None))
+    # state machine with a fake sender
+    sent = []
+
+    def sender_ok(ev, relays):
+        sent.append(ev)
+        return [(relays[0], True, "")]
+
+    def sender_fail(ev, relays):
+        return [(u, False, "nope") for u in relays]
+    os.environ["NOSTR_NSEC"] = nsec
+    st = load_state()
+    np1 = {"now_playing": {"artist": "A", "title": "T", "requested": True, "req_id": "r1", "lane": "paid"}}
+    check("dry mode logs, marks seen, sends nothing", cycle(st, sender_ok, getter=lambda p: np1) == "dry" and "r1" in st["seen"] and not sent)
+    open(os.path.join(d, "LIVE"), "w").close()
+    np2 = {"now_playing": {"artist": "A", "title": "T2", "requested": True, "req_id": "r2", "lane": "paid", "who": "W", "note": "hey"}}
+    check("live: signs and sends once", cycle(st, sender_ok, getter=lambda p: np2, relays=["ws://x"]) == "posted" and len(sent) == 1
+          and schnorr_verify(bytes.fromhex(sent[0]["id"]), bytes.fromhex(sent[0]["pubkey"]), bytes.fromhex(sent[0]["sig"])) and sent[0]["pubkey"] == pk.hex())
+    check("same req_id again: seen", cycle(st, sender_ok, getter=lambda p: np2) == "seen" and len(sent) == 1)
+    np3 = {"now_playing": {"artist": "A", "title": "T3", "requested": True, "req_id": "r3", "lane": "paid"}}
+    r = [cycle(st, sender_fail, getter=lambda p: np3, relays=["ws://x"], now_fn=lambda: time.time() + i * 200) for i in range(3)]
+    check("no relay accepts: two retries, then give up and mark seen", r == ["error", "error", "gave-up"] and "r3" in st["seen"])
+    st2 = {"seen": {}, "stamps": [], "alerts": {}, "tries": {}, "backoff_until": 0}
+    ids = []
+
+    def sender_capture(ev, relays):
+        ids.append(ev["id"])
+        return [(relays[0], False, "no OK within 12 s")]
+    for i in range(2):
+        cycle(st2, sender_capture, getter=lambda p: {"now_playing": {"artist": "A", "title": "T6", "requested": True, "req_id": "r6", "lane": "paid"}},
+              relays=["ws://x"], now_fn=lambda: time.time() + i * 300)
+    check("a retry re-sends the SAME event id (relays dedupe it)", len(ids) == 2 and ids[0] == ids[1])
+    notes = []
+    global notify
+    _n0 = notify
+    notify = lambda t: (notes.append(t), True)[1]
+    st3 = {"seen": {}, "stamps": [], "alerts": {}, "tries": {}, "backoff_until": 0}
+    with open(os.path.join(ann.HOME, "blocklist.txt"), "w", encoding="utf-8") as fh:
+        fh.write("badword\n")
+    npw = {"now_playing": {"artist": "A", "title": "T7", "requested": True, "req_id": "r7", "lane": "paid", "note": "a badword here"}}
+    for i in range(3):
+        cycle(st3, sender_capture, getter=lambda p: npw, relays=["ws://x"], now_fn=lambda: time.time() + i * 300)
+    check("a withheld message reaches SF once, not once per try", sum(1 for n in notes if "withheld" in n) == 1)
+    notify = _n0
+    frames = []
+
+    def fragmented(srv):
+        conn, _ = srv.accept(); conn.settimeout(5)
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += conn.recv(4096)
+        k = re.search(rb"Sec-WebSocket-Key: (\S+)", req).group(1).decode()
+        acc = base64.b64encode(hashlib.sha1((k + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % acc).encode())
+        rd = _Reader(conn)
+        eid = json.loads(rd.frame()[1].decode())[1]["id"]
+        payload = json.dumps(["OK", eid, True, ""]).encode()
+        a, b = payload[:9], payload[9:]
+        conn.sendall(bytes([0x01, len(a)]) + a)              # first frame, FIN clear
+        conn.sendall(bytes([0x89, 2]) + b"hi")               # a ping in the middle
+        conn.sendall(bytes([0x80, len(b)]) + b)              # continuation, FIN set
+        try:
+            rd.frame()
+        except Exception:
+            pass
+        conn.close()
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1); srv.settimeout(10)
+    th = threading.Thread(target=fragmented, args=(srv,), daemon=True); th.start()
+    ok, msg = relay_send("ws://127.0.0.1:%d/" % srv.getsockname()[1], ev, timeout=6)
+    th.join(5)
+    check("fake relay: an OK split over two frames (with a ping between) is read", ok is True)
+    check("a key out of range is refused", _raises(parse_secret, "00" * 32) and _raises(parse_secret, "%064x" % _N))
+    npg = {"now_playing": {"artist": "A", "title": "T4", "requested": True, "req_id": "r4", "lane": "gift"}}
+    check("gift lane skipped", cycle(st, sender_ok, getter=lambda p: npg, now_fn=lambda: time.time() + 900) == "gift-skipped")
+    npn = {"now_playing": {"artist": "A", "title": "N1", "requested": True, "req_id": "rn", "lane": "paid", "note_via": "nostr"}}
+    n_sent = len(sent)
+    check("a Nostr-jukebox song is left to the jukebox bot's quote note", cycle(st, sender_ok, getter=lambda p: npn, now_fn=lambda: time.time() + 950) == "nostr-lane" and "rn" in st["seen"] and len(sent) == n_sent)
+    del os.environ["NOSTR_NSEC"]
+    np5 = {"now_playing": {"artist": "A", "title": "T5", "requested": True, "req_id": "r5", "lane": "paid"}}
+    check("no key: alert once, back off, not marked seen", cycle(st, sender_ok, getter=lambda p: np5, now_fn=lambda: time.time() + 1000) == "no-keys" and "r5" not in st["seen"] and st["alerts"].get("keys"))
+    open(os.path.join(d, "OFF"), "w").close()
+    check("OFF file idles", cycle(st, sender_ok, getter=lambda p: np5) == "off")
+    os.remove(os.path.join(d, "OFF"))
+    save_state(st)
+    st2 = load_state()
+    check("state survives a save/load", st2["seen"].keys() == st["seen"].keys())
+    print("RESULT: %d failed" % len(fails))
+    return 1 if fails else 0
+
+
+def _raises(fn, x):
+    try:
+        fn(x)
+        return False
+    except Exception:
+        return True
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
