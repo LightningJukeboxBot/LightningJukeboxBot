@@ -33,7 +33,9 @@ Listeners pay one invoice per song. There are no listener accounts or balances t
 The [manifesto](https://noderunnersradio.com/manifesto) sets the course:
 
 - **A real FM/AM broadcaster** that quietly transmits the state of the Bitcoin network alongside the music — so the
-  timechain reaches people even when the internet does not.
+  timechain reaches people even when the internet does not. The sun has its moods: the Carrington event of 1859
+  set telegraph lines sparking, and a storm of that size will come again one day. A radio wave needs no one's
+  servers. Just in case.
 - **Musicians hashing their work to the timechain** as proof of creation: a verifiable timestamp that the work existed,
   made by its maker, growing into an organic replacement for legacy copyright.
 - **The split flips in the artists' favour** as the station matures: 21% to the radio, 79% to the DJs and to the
