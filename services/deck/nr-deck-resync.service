@@ -1,0 +1,22 @@
+[Unit]
+Description=Noderunners Radio - put the rotation back on the right card after a liquidsoap restart
+Documentation=file:/usr/local/bin/nr-deck-resync
+After=liquidsoap.service
+# a captain's playlist on air (rotation.override) = the deck is not ours; skip silently
+ConditionPathExists=!/var/lib/jukebox/rotation.override
+
+[Service]
+Type=oneshot
+User=sf
+Group=sf
+ExecStart=/usr/local/bin/nr-deck-resync
+# the guard waits <=60 s for the socket and bounds the deal at 300 s; this is the hard ceiling
+TimeoutStartSec=420
+# same hardening as nr-shuffle.service -- it does the same job on the same files
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+# NO EnvironmentFile here, on purpose: this unit must never see the icecast password

@@ -1,0 +1,13 @@
+[Unit]
+Description=Noderunners Radio - every 5 min: does the rotation need a resync after a liquidsoap restart?
+Documentation=file:/usr/local/bin/nr-deck-resync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+# a missed run must never fire a catch-up burst at boot
+Persistent=false
+
+[Install]
+WantedBy=timers.target

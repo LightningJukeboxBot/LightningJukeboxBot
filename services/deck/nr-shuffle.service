@@ -1,0 +1,16 @@
+[Unit]
+Description=Reshuffle the Noderunners rotation from the full library
+After=network.target
+
+[Service]
+Type=oneshot
+User=sf
+Group=sf
+ExecStart=/usr/local/bin/nr-shuffle
+# It only ever reads the full list and replaces one playlist file.
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes

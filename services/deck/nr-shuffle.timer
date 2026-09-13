@@ -1,0 +1,16 @@
+[Unit]
+Description=Reshuffle the Noderunners rotation from the full library
+Documentation=file:/usr/local/bin/nr-shuffle
+
+[Timer]
+# Every six hours. Each run advances the cursor by exactly what aired and deals
+# the next slice of the deck, so no track repeats until every one has played.
+# The window holds about two days of audio, so six hours leaves a wide margin --
+# the stream can never run past the end of what it has been dealt.
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
