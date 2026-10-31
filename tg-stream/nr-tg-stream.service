@@ -1,0 +1,14 @@
+[Unit]
+Description=Noderunners Radio - Telegram group live-stream push (same program, second door)
+After=network-online.target owncast.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radio
+ExecStart=/usr/local/bin/nr-tg-stream.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
