@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""nr-lengthscan (2026-09-28) -- STEP 1 of "clean lengths": measure the REAL length of every song whose length in the
+index looks wrong. READ-ONLY on the music and on library.db; it only writes its own results.
+
+Why (SF 2026-09-28, "this needs fixing"): some MP3s carry no length header and the scanner guessed. Sepultura
+"One Man Army" (8.8 MB) is indexed at 36:43 -- its size says 32 kbps -- so its price is far too high. The same guess can
+also come out too SHORT (a mix sold for 21 sats), and 1,435 songs have no length at all.
+
+Which songs (picked from /var/lib/jukebox/library.db, read-only):
+  1. MP3 whose size and indexed length imply under 64 kbps  (length probably too LONG  -> overpriced)
+  2. MP3 whose size and indexed length imply over 340 kbps  (length maybe too SHORT -> underpriced; big cover art
+     also lands here, those simply come out right)
+  3. any song with no length in the index
+How: ffmpeg reads each file to the end WITHOUT decoding (-c copy) and reports the exact running time.
+Gentle: nice 19 + idle disk priority; it never reads a disk the music move is copying at that moment -- it does the
+other disks first and waits for that one.
+
+RUN (SF's hand, root):   sudo python3 /tmp/nr-lengthscan.py            (dry run: counts only)
+                         sudo python3 /tmp/nr-lengthscan.py --go       (starts in the background)
+WATCH (anyone):          python3 /tmp/nr-lengthscan.py --status
+PAUSE (root):            sudo python3 /tmp/nr-lengthscan.py --stop     (--go again continues where it stopped)
+Results: /var/lib/jukebox/lengthscan/measure.jsonl (one line per song). Nothing is changed in the index: that is
+step 2, after SF has seen the numbers."""
+import json, os, shutil, sqlite3, subprocess, sys, time
+
+DB = "/var/lib/jukebox/library.db"
+OUT_DIR = "/var/lib/jukebox/lengthscan"
+OUT = OUT_DIR + "/measure.jsonl"
+LOG = OUT_DIR + "/scan.log"
+STOP = OUT_DIR + "/stop"
+MOVE_STATE = "/var/lib/nr-music-move/state.json"
+UNIT = "nr-lengthscan"
+BIN = "/usr/local/bin/nr-lengthscan"
+BUSY = ("copy", "verify", "delta", "switch", "prove")
+A = sys.argv[1:]
+
+def run(cmd, t=60):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+
+def say(m):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + m
+    print(line, flush=True)
+    try:
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+def disk_of(path):
+    p = path.split("/")
+    return p[2] if len(p) > 3 and p[1] == "mnt" else "?"
+
+def pick():
+    """The songs to measure: (path, indexed length, size, reason)."""
+    con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+    rows = con.execute("SELECT path, duration_s, size FROM tracks").fetchall()
+    con.close()
+    todo = []
+    for path, d, size in rows:
+        if not path:
+            continue
+        try:
+            d = float(d or 0)
+        except (TypeError, ValueError):
+            d = 0.0
+        size = int(size or 0)
+        if d <= 0:
+            todo.append((path, d, size, "no-length"))
+        elif path.lower().endswith(".mp3") and size > 0:
+            kbps = size * 8 / d / 1000
+            if kbps < 64:
+                todo.append((path, d, size, "low-kbps"))
+            elif kbps > 340:
+                todo.append((path, d, size, "high-kbps"))
+    return todo
+
+def done_paths():
+    seen = set()
+    try:
+        with open(OUT, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    seen.add(json.loads(line)["path"])
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    return seen
+
+def busy_disks():
+    """Disks the music move is reading or switching right now -- only while that job actually runs."""
+    if run(["systemctl", "is-active", "nr-music-move"]).stdout.strip() != "active":
+        return set()
+    try:
+        st = json.load(open(MOVE_STATE))
+    except Exception:
+        return set()
+    return {n for n, d in (st.get("disks") or {}).items() if d.get("phase") in BUSY}
+
+def measure(path):
+    """Exact running time by reading the whole file without decoding. Returns (seconds, error)."""
+    if not os.path.exists(path):
+        return None, "missing"
+    try:
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1", "-i", path,
+                            "-map", "0:a:0", "-c", "copy", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=900, errors="replace")
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    us = 0
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition("=")
+        if k in ("out_time_us", "out_time_ms"):
+            try:
+                us = max(us, int(v))
+            except ValueError:
+                pass
+    if us <= 0:
+        return None, (r.stderr.strip().splitlines() or ["no running time"])[-1][:200]
+    return round(us / 1e6, 2), None
+
+def status():
+    todo = pick()
+    res = {}
+    try:
+        with open(OUT, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line); res[d["path"]] = d
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    want = {t[0]: t for t in todo}
+    got = [res[p] for p in want if p in res]
+    left = [t for p, t in want.items() if p not in res]
+    wrong = [d for d in got if d.get("real") and (d.get("idx") or 0) > 0
+             and abs(d["real"] - d["idx"]) > max(5, 0.05 * d["real"])]
+    too_long = [d for d in wrong if (d.get("idx") or 0) > d["real"]]
+    too_short = [d for d in wrong if 0 < (d.get("idx") or 0) < d["real"]]
+    no_len = [d for d in got if (d.get("idx") or 0) <= 0 and d.get("real")]
+    errs = [d for d in got if d.get("err")]
+    print("nr-lengthscan -- songs to measure: %d; measured: %d; left: %d" % (len(want), len(got), len(left)))
+    by = {}
+    for t in left:
+        by[disk_of(t[0])] = by.get(disk_of(t[0]), 0) + 1
+    if by:
+        print("  left per disk: " + ", ".join("%s %d" % kv for kv in sorted(by.items())))
+    print("  WRONG length in the index: %d  (listed too long: %d, too short: %d)" % (len(wrong), len(too_long), len(too_short)))
+    print("  had no length, now measured: %d" % len(no_len))
+    print("  could not be read: %d" % len(errs))
+    print("  really over 30 min among the measured: %d" % sum(1 for d in got if (d.get("real") or 0) > 1800))
+    for d in sorted(too_long, key=lambda d: d["real"] - d["idx"])[:3]:
+        print("    e.g. index %d s, real %d s  %s" % (d["idx"], d["real"], d["path"][-80:]))
+    print("service: " + (run(["systemctl", "is-active", UNIT]).stdout.strip() or "?"))
+
+def main_loop():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    try:
+        os.remove(STOP)
+    except FileNotFoundError:
+        pass
+    todo = pick()
+    seen = done_paths()
+    left = [t for t in todo if t[0] not in seen]
+    say("start: %d songs picked, %d already measured, %d to go" % (len(todo), len(todo) - len(left), len(left)))
+    n = 0
+    while left:
+        busy = busy_disks()
+        ready = [t for t in left if disk_of(t[0]) not in busy]
+        if not ready:
+            say("waiting: the rest (%d) sits on %s, which the music move is copying -- next look in 10 min"
+                % (len(left), ", ".join(sorted(busy))))
+            for _ in range(60):
+                if os.path.exists(STOP):
+                    say("stopped (stop file)"); return
+                time.sleep(10)
+            continue
+        for t in ready[:200]:
+            if os.path.exists(STOP):
+                say("stopped (stop file) after %d this run" % n); return
+            path, idx, size, why = t
+            real, err = measure(path)
+            rec = {"path": path, "idx": idx, "size": size, "why": why, "real": real, "err": err,
+                   "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            with open(OUT, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+            if n % 500 == 0:
+                say("measured %d this run" % n)
+        done_now = {t[0] for t in ready[:200]}
+        left = [t for t in left if t[0] not in done_now]
+    say("DONE: %d measured this run. See: python3 %s --status" % (n, BIN))
+
+if A == ["--status"]:
+    status(); sys.exit(0)
+if A == ["--run"]:
+    main_loop(); sys.exit(0)
+if os.geteuid() != 0:
+    print("STOP: run me with sudo (or --status without)."); sys.exit(1)
+if A == ["--stop"]:
+    os.makedirs(OUT_DIR, exist_ok=True)
+    open(STOP, "w").close()
+    run(["systemctl", "stop", UNIT])
+    print("Stopped. --go continues where it stopped."); sys.exit(0)
+if A not in ([], ["--go"]):
+    print(__doc__); sys.exit(1)
+
+todo = pick()
+seen = done_paths()
+kinds = {}
+for t in todo:
+    kinds[t[3]] = kinds.get(t[3], 0) + 1
+per = {}
+for t in todo:
+    if t[0] not in seen:
+        per[disk_of(t[0])] = per.get(disk_of(t[0]), 0) + 1
+print("nr-lengthscan  %s" % ("LIVE RUN (--go)" if A == ["--go"] else "DRY RUN"))
+print("songs to measure: %d  (%s)" % (len(todo), ", ".join("%s %d" % kv for kv in sorted(kinds.items()))))
+print("already measured: %d" % len([t for t in todo if t[0] in seen]))
+print("to go, per disk: " + ", ".join("%s %d" % kv for kv in sorted(per.items())))
+print("the music move is busy on: " + (", ".join(sorted(busy_disks())) or "nothing") + "  (those wait)")
+if not shutil.which("ffmpeg"):
+    print("STOP: ffmpeg is missing."); sys.exit(2)
+if A != ["--go"]:
+    print("\nDRY RUN OK. Nothing written. To start:  sudo python3 %s --go" % sys.argv[0]); sys.exit(0)
+if run(["systemctl", "is-active", UNIT]).stdout.strip() == "active":
+    print("It is already running. Watch:  python3 %s --status" % sys.argv[0]); sys.exit(0)
+os.makedirs(OUT_DIR, exist_ok=True); os.chmod(OUT_DIR, 0o755)
+src = os.path.abspath(sys.argv[0])
+if src != BIN:
+    shutil.copyfile(src, BIN + ".tmp"); os.chmod(BIN + ".tmp", 0o755); os.replace(BIN + ".tmp", BIN)
+r = run(["systemd-run", "--unit=" + UNIT, "--description=Noderunners: measure the real length of suspicious songs",
+         "--property=Nice=19", "--property=IOSchedulingClass=idle", "--property=UMask=0022",
+         "/usr/bin/python3", BIN, "--run"])
+if r.returncode != 0:
+    print("STOP: could not start: " + r.stderr[-300:]); sys.exit(3)
+print("STARTED in the background. You can close this terminal. Watch:  python3 %s --status" % sys.argv[0])

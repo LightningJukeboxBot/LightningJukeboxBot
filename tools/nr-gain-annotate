@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# nr-gain-annotate -- stamp m3u lines with their measured volume note.
+#
+# stdin:  one file path per line (the dealt rotation window)
+# stdout: the same lines; a line whose track gains.db knows AND which is louder
+#         than the -14 LUFS target becomes:
+#             annotate:replay_gain="-4.0 dB":/original/path
+#         everything else passes through UNCHANGED (bare).
+#
+# LAWS (SF, ratified 2026-08-26): attenuate only -- the note is always negative;
+# clamp at -18 dB; unmeasured tracks stay untouched; the FILES are never touched.
+# nr_rotfree (2026-10-29, SF): a CC & Public Domain song (/srv/music/free_music/...) in the rotation also gets its
+# artist + title from free.db -- many 78s files carry no tags, and the screen would show a bare file name.
+# Same escaping as liquidsoap_control._annotate; "#{" neutralised (liquidsoap's interpolation).
+# THIS PIPE MUST NEVER FAIL: any error -> the line passes through bare, exit 0.
+import os, sys, sqlite3
+
+DB = os.environ.get("NR_GAINS_DB", "/var/lib/jukebox/gains.db")
+FREE_DB = os.environ.get("NR_FREE_DB", "/var/lib/jukebox/free.db")
+FREE_ROOT = "/srv/music/free_music/"
+
+def _val(v):
+    s = str(v or "").replace("#{", "# {").replace("\\", "\\\\").replace('"', '\\"')
+    return "".join(ch for ch in s if ord(ch) >= 32 and ord(ch) != 127)[:200]
+
+def _free_names(fcur, p):
+    try:
+        r = fcur.execute("SELECT artist, title FROM tracks WHERE path=?", (p,)).fetchone()
+    except Exception:
+        return []
+    if not r:
+        return []
+    return ['%s="%s"' % (k, _val(v)) for k, v in (("artist", r[0]), ("title", r[1])) if v]
+TARGET = -14.0
+FLOOR = -18.0
+
+def main():
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+        cur = db.cursor()
+    except Exception:
+        for line in sys.stdin:
+            sys.stdout.write(line)
+        return
+    try:
+        fcur = sqlite3.connect("file:%s?mode=ro" % FREE_DB, uri=True).cursor()
+    except Exception:
+        fcur = None
+    for line in sys.stdin:
+        raw = line.rstrip("\n")
+        out = raw
+        p = raw.strip()
+        if p and not p.startswith("#") and not p.startswith("annotate:"):
+            notes = _free_names(fcur, p) if (fcur is not None and p.startswith(FREE_ROOT)) else []
+            if notes:
+                out = "annotate:%s:%s" % (",".join(notes), raw)
+            try:
+                row = cur.execute("SELECT lufs FROM gains WHERE path=? AND rc=0",
+                                  (p,)).fetchone()
+                if row and row[0] is not None:
+                    g = TARGET - float(row[0])
+                    if g < -0.05:
+                        if g < FLOOR:
+                            g = FLOOR
+                        out = 'annotate:%s:%s' % (",".join(['replay_gain="%.1f dB"' % g] + notes), raw)
+            except Exception:
+                pass
+        sys.stdout.write(out + "\n")
+
+try:
+    main()
+except Exception:
+    try:
+        sys.stdout.write(sys.stdin.read())
+    except Exception:
+        pass

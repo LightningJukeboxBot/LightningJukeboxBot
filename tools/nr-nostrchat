@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-nostrchat -- collects the Nostr live chat of the station's zap.stream page for the chat panel on the website.
+SF 2026-10-03: "Can we integrate nostr chat into the chat panel on the main page of the radio?" -> plan agreed ->
+preview: "Looks good".
+
+WHAT IT READS
+  The station's live event is kind 30311 by the announcer key, d-tag "noderunners-radio" (the zap.stream page). Every
+  20 s this program asks a few public relays for (a) live-chat messages, kind 1311, and (b) zap receipts, kind 9735,
+  that point at that event (#a tag). Read-only: it never posts, it holds no key.
+WHAT IT KEEPS
+  Every event is checked: the id is the hash of its content and the BIP-340 signature is valid (a relay cannot slip
+  in a fake), and it really points at our event. Then: the announcer's blocklist (a hit = the message is dropped),
+  text only, links replaced by "[link]", control characters out, at most 280 characters, at most 5 messages per
+  author per minute. A name comes from the author's own profile (kind 0), cleaned; else a short npub.
+  Result: /var/lib/jukebox/nostrchat.json (the newest 100), read by the station API (/api/chat/recent?src=all).
+  The captain's existing chat ban list (redis chat:banned) also drops Nostr names and npubs, at read time in the API.
+SWITCH  /srv/jukebox/config/nr-nostrchat/OFF exists -> idles (the panel keeps showing what it had).
+RUN  (systemd: nr-nostrchat.service, User=jukebox)    nr-nostrchat --once    one poll, then a summary
+     nr-nostrchat --selftest   offline: signature check, zap amounts, text cleaning, rate limit, blocklist
+Uses nr-nostr's own BIP-340 + WebSocket code (/usr/local/bin/nr-nostr) and nr-announcer's blocklist: one set of rules.
+"""
+import os, sys, re, json, time, socket, ssl, hashlib, base64, secrets, signal, unicodedata, importlib.util, importlib.machinery
+HOME = os.environ.get("NR_NOSTRCHAT_HOME", os.path.expanduser("~/.config/nr-nostrchat"))
+OUT = os.environ.get("NR_NOSTRCHAT_OUT", "/var/lib/jukebox/nostrchat.json")
+NAMES = os.environ.get("NR_NOSTRCHAT_NAMES", "/var/lib/jukebox/nostrchat-names.json")
+NOSTR_PATH = os.environ.get("NR_NOSTR_PATH", "/usr/local/bin/nr-nostr")
+ANN_PATH = os.environ.get("NR_ANNOUNCER_PATH", "/usr/local/bin/nr-announcer")
+RELAYS = ["wss://nos.lol", "wss://relay.primal.net", "wss://relay.snort.social", "wss://relay.zap.stream", "wss://relay.damus.io"]
+POLL_S, KEEP, FIRST_DAYS, TIMEOUT_S = 20, 100, 7, 15
+MAX_LEN, PER_MIN = 280, 5
+_URL = re.compile(r"(https?://\S+|www\.\S+|lnurl1[0-9a-z]+|lnbc[0-9a-z]+)", re.I)
+_MENTION = re.compile(r"nostr:(npub1|nprofile1|note1|nevent1|naddr1)([0-9a-z]+)", re.I)
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + " nr-nostrchat: " + msg, flush=True)
+
+
+def _load(name, path):
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+nostr = ann = None
+A_TAG = ""
+# nr_chatquiet: the jukebox bot posts in the chat with this key; its lines never go to the panel
+JUKEBOX_PK = os.environ.get("NR_NOSTRCHAT_JUKEBOX_PK", "358225a7c2f03c1a0f096f15f5c48cd080e8e328b14389db01516d226838352f")
+
+# nr_chatquiet (2026-10-24): the ONE rule for "is this chat line a jukebox command?" -- the bot answers exactly these lines and
+# the chat collector keeps exactly these lines out of the chat panel. Seen live: "Play us a song!" is chat, not a search.
+# SF 2026-10-24: "just do what TG does... /play forward slash before the word" -- a chat command needs the slash.
+_CHAT_EXACT = re.compile(r"(?i)^/(random|shuffle|queue|q|now|np|nowplaying|history|played|listen|tune|faq|help)(@\w+)?[\s?!.]*$")
+_CHAT_PLAY = re.compile(r"(?is)^/(play|request|add)(@\w+)?\b[\s:,-]+(.+)$")
+
+
+def chat_is_command(t):
+    t = (t or "").strip()
+    if _CHAT_EXACT.match(t):
+        return True
+    m = _CHAT_PLAY.match(t)
+    if not m:
+        return False
+    q = re.sub(r"[\s!?.]+$", "", m.group(3).split("|")[0]).strip()
+    return len(q) >= 1
+
+
+def chat_is_pick(t):
+    return re.fullmatch(r"#?\d{1,2}[.!)]?", (t or "").strip()) is not None
+
+
+def setup():
+    global nostr, ann, A_TAG
+    nostr = _load("nr_nostr_lib", NOSTR_PATH)
+    ann = _load("nr_announcer_lib", ANN_PATH)
+    A_TAG = os.environ.get("NR_NOSTRCHAT_A", "")
+    if not A_TAG:
+        raise SystemExit("STOP: NR_NOSTRCHAT_A (the live event's a-tag) is not set; the unit file sets it")
+
+
+# ---------------------------------------------------------------- relays (read-only subscription, short-lived)
+def relay_req(url, filters, timeout=TIMEOUT_S):
+    """Open the relay, send REQ, collect EVENTs until EOSE (or the timeout), close. Returns a list of events."""
+    m = re.fullmatch(r"(wss?)://([^/:\s]+)(?::(\d+))?(/\S*)?", url.strip())
+    if not m:
+        raise ValueError("bad relay url")
+    scheme, host, port, path = m.group(1), m.group(2), int(m.group(3) or (443 if m.group(1) == "wss" else 80)), m.group(4) or "/"
+    raw = socket.create_connection((host, port), timeout=timeout)
+    s = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if scheme == "wss" else raw
+    s.settimeout(timeout)
+    deadline = time.time() + timeout
+    out = []
+    try:
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        hosthdr = host if port == (443 if scheme == "wss" else 80) else "%s:%d" % (host, port)
+        s.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                   "Sec-WebSocket-Version: 13\r\nUser-Agent: nr-nostrchat/1\r\n\r\n" % (path, hosthdr, key)).encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            c = s.recv(4096)
+            if not c:
+                raise OSError("handshake: the relay closed the connection")
+            resp += c
+            if len(resp) > 65536:
+                raise OSError("handshake: reply too long")
+        head, rest = resp.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise OSError("handshake refused: " + head.split(b"\r\n", 1)[0].decode("latin-1")[:80])
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if accept.encode() not in head:
+            raise OSError("handshake: wrong accept key")
+        sub = "c" + secrets.token_hex(4)
+        s.sendall(nostr._frame(json.dumps(["REQ", sub] + filters, separators=(",", ":")).encode("utf-8")))
+        rd = nostr._Reader(s, rest)
+        while time.time() < deadline:
+            try:
+                op, data = rd.frame()
+            except socket.timeout:
+                break
+            if op == 8:
+                break
+            if op != 1:
+                continue
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            if isinstance(msg, list) and len(msg) >= 3 and msg[0] == "EVENT" and msg[1] == sub and isinstance(msg[2], dict):
+                out.append(msg[2])
+                if len(out) > 2000:
+                    break
+            elif isinstance(msg, list) and msg and msg[0] in ("EOSE", "CLOSED"):
+                break
+        try:
+            s.sendall(nostr._frame(json.dumps(["CLOSE", sub]).encode()))
+        except Exception:
+            pass
+        return out
+    finally:
+        try:
+            s.sendall(nostr._frame(b"\x03\xe8", 8))
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- checks and cleaning
+def valid(ev):
+    """True if the event's id is the NIP-01 hash of its content and its BIP-340 signature verifies."""
+    try:
+        ser = json.dumps([0, ev["pubkey"], ev["created_at"], ev["kind"], ev["tags"], ev["content"]],
+                         separators=(",", ":"), ensure_ascii=False)
+        if hashlib.sha256(ser.encode("utf-8")).hexdigest() != ev["id"]:
+            return False
+        return nostr.schnorr_verify(bytes.fromhex(ev["id"]), bytes.fromhex(ev["pubkey"]), bytes.fromhex(ev["sig"]))
+    except Exception:
+        return False
+
+
+def points_at_us(ev):
+    return any(isinstance(t, list) and len(t) >= 2 and t[0] == "a" and t[1] == A_TAG for t in ev.get("tags", []))
+
+
+def short_npub(pk_hex):
+    try:
+        n = nostr.bech32_encode("npub", bytes.fromhex(pk_hex))
+        return n[:10] + "…" + n[-4:]
+    except Exception:
+        return pk_hex[:8] + "…"
+
+
+def clean_text(s):
+    s = unicodedata.normalize("NFKC", str(s or ""))
+    s = "".join(ch if (ch.isprintable() or ch == " ") else " " for ch in s)
+    s = _MENTION.sub(lambda m: m.group(1)[:-1] + "…", s)          # "nostr:npub1abc..." -> "npub…" (a mention, shown short)
+    s = _URL.sub("[link]", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:MAX_LEN] + ("…" if len(s) > MAX_LEN else "")
+
+
+def clean_name(s):
+    s = unicodedata.normalize("NFKC", str(s or ""))
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = _URL.sub("", s)
+    s = re.sub(r"[@#＠＃]+", "", s)
+    return re.sub(r"\s+", " ", s).strip()[:24]
+
+
+def zap_sats(bolt11):
+    """Amount of a BOLT11 invoice in sats, from its human-readable part (lnbc<amount><multiplier>)."""
+    m = re.match(r"^ln(?:bc|tb|bcrt)(\d+)([munp]?)1", (bolt11 or "").lower())
+    if not m:
+        return 0
+    amount, mult = int(m.group(1)), m.group(2)
+    btc = {"": 1, "m": 1e-3, "u": 1e-6, "n": 1e-9, "p": 1e-12}[mult] * amount
+    return int(round(btc * 1e8))
+
+
+def tag(ev, name):
+    for t in ev.get("tags", []):
+        if isinstance(t, list) and len(t) >= 2 and t[0] == name:
+            return t[1]
+    return ""
+
+
+def to_entry(ev, names, blocklist):
+    """A chat-panel row for one checked event, or None (blocked / empty / not ours)."""
+    if ev.get("kind") == 1311:
+        text = clean_text(ev.get("content"))
+        who = ev["pubkey"]
+        if not text or re.fullmatch(r"(\[link\][\s.,!?]*)+", text):
+            return None                      # empty, or nothing but links: the commonest spam (seen on our page 2026-10-02)
+        if who == JUKEBOX_PK or chat_is_command(text) or chat_is_pick(text):
+            return None                      # nr_chatquiet: jukebox traffic (the bot, a command, a pick) stays out of the panel
+        kind, sats = "chat", 0
+    elif ev.get("kind") == 9735:
+        try:
+            req = json.loads(tag(ev, "description") or "{}")
+        except Exception:
+            return None
+        sats = zap_sats(tag(ev, "bolt11"))
+        if sats <= 0:
+            return None
+        who = str(req.get("pubkey") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", who):
+            who = ""
+        text, kind = clean_text(req.get("content")), "zap"
+    else:
+        return None
+    if text and ann.blocked(text, blocklist):
+        log("blocked by the blocklist (dropped): %s" % text[:80])
+        return None
+    name = (names.get(who) or [""])[0] if who else ""
+    npub = short_npub(who) if who else ""
+    return {"id": ev["id"], "src": "nostr", "kind": kind, "sats": sats, "username": clean_name(name) or npub or "someone",
+            "npub": npub, "pubkey": who, "text": text, "date": int(ev.get("created_at") or 0)}
+
+
+# ---------------------------------------------------------------- state
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def save_json(path, obj):
+    tmp = path + ".new"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def rate_ok(entries, entry):
+    """At most PER_MIN messages per author in any minute (zaps always pass: they cost the sender sats)."""
+    if entry["kind"] == "zap" or not entry["pubkey"]:
+        return True
+    near = [e for e in entries if e.get("pubkey") == entry["pubkey"] and e.get("kind") == "chat" and abs(e["date"] - entry["date"]) < 60]
+    return len(near) < PER_MIN
+
+
+def fetch_names(pubkeys, names, relays):
+    """Profiles (kind 0) for authors we have no fresh name for (once a day per author)."""
+    now = time.time()
+    want = [p for p in pubkeys if p and (p not in names or now - names[p][1] > 86400)]
+    if not want:
+        return False
+    got = {}
+    for url in relays[:3]:
+        try:
+            for ev in relay_req(url, [{"kinds": [0], "authors": want[:100]}]):
+                if ev.get("kind") == 0 and ev.get("pubkey") in want and valid(ev):
+                    if ev["pubkey"] not in got or ev["created_at"] > got[ev["pubkey"]][0]:
+                        try:
+                            meta = json.loads(ev.get("content") or "{}")
+                        except Exception:
+                            meta = {}
+                        got[ev["pubkey"]] = (ev["created_at"], meta.get("display_name") or meta.get("name") or "")
+        except Exception:
+            continue
+    for p in want:
+        names[p] = [clean_name(got.get(p, (0, ""))[1]), now]
+    return True
+
+
+def cycle(state, relays=RELAYS, req=None):
+    """One poll. Returns (new_count, relays_ok)."""
+    req = req or relay_req
+    entries = state["messages"]
+    have = {e["id"] for e in entries}
+    since = max([e["date"] for e in entries] + [int(time.time()) - FIRST_DAYS * 86400]) - 300
+    flt = [{"kinds": [1311, 9735], "#a": [A_TAG], "since": since, "limit": 500}]
+    raw, ok = {}, 0
+    for url in relays:
+        try:
+            for ev in req(url, flt):
+                # only a CHECKED copy is kept, and the first good one wins: a relay that sends a forged copy with the
+                # same id must never push out the genuine message (the self-test caught exactly that)
+                if (isinstance(ev, dict) and ev.get("id") and ev["id"] not in have and ev["id"] not in raw
+                        and points_at_us(ev) and valid(ev)):
+                    raw[ev["id"]] = ev
+            ok += 1
+        except Exception:
+            continue
+    fresh = list(raw.values())
+    if not fresh:
+        return 0, ok
+    names = load_json(NAMES, {})
+    authors = set()
+    for ev in fresh:
+        if ev.get("kind") == 1311:
+            authors.add(ev["pubkey"])
+        else:
+            try:
+                authors.add(str(json.loads(tag(ev, "description") or "{}").get("pubkey") or ""))
+            except Exception:
+                pass
+    if fetch_names(sorted(a for a in authors if re.fullmatch(r"[0-9a-f]{64}", a or "")), names, relays):
+        save_json(NAMES, names)
+    blocklist = ann.load_blocklist()
+    n = 0
+    for ev in sorted(fresh, key=lambda e: e.get("created_at", 0)):
+        e = to_entry(ev, names, blocklist)
+        if e and rate_ok(entries, e):
+            entries.append(e)
+            n += 1
+    entries.sort(key=lambda e: e["date"])
+    state["messages"] = entries[-KEEP:]
+    return n, ok
+
+
+_stop = False
+
+
+def _on_term(signum, frame):
+    global _stop
+    _stop = True
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    setup()
+    state = load_json(OUT, {"messages": []})
+    state.setdefault("messages", [])
+    if args == ["--once"]:
+        n, ok = cycle(state)
+        state["updated"] = int(time.time())
+        save_json(OUT, state)
+        print("relays answered: %d of %d; new messages: %d; kept: %d (chat %d, zaps %d)" % (
+            ok, len(RELAYS), n, len(state["messages"]), sum(1 for e in state["messages"] if e["kind"] == "chat"),
+            sum(1 for e in state["messages"] if e["kind"] == "zap")))
+        return 0
+    if args:
+        print(__doc__)
+        return 64
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    log("watching %d relays every %d s for %s" % (len(RELAYS), POLL_S, A_TAG.split(":")[0] + ":…:" + A_TAG.split(":")[-1]))
+    down = False
+    while not _stop:
+        if not os.path.exists(os.path.join(HOME, "OFF")):
+            try:
+                n, ok = cycle(state)
+                state["updated"] = int(time.time())
+                save_json(OUT, state)
+                if n:
+                    log("%d new message(s) on the live chat" % n)
+                if (ok == 0) != down:
+                    down = ok == 0
+                    log("no relay answers" if down else "relays answer again")
+            except Exception as e:
+                log("cycle error: %s" % e)
+        for _ in range(POLL_S):
+            if _stop:
+                break
+            time.sleep(1)
+    log("stopping (signal)")
+    return 0
+
+
+# ---------------------------------------------------------------- self-test (offline)
+def selftest():
+    global OUT, NAMES, A_TAG, nostr, ann
+    import tempfile, shutil, atexit
+    d = tempfile.mkdtemp(prefix="nr-nostrchat-test-")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    OUT, NAMES = os.path.join(d, "chat.json"), os.path.join(d, "names.json")
+    nostr = _load("nr_nostr_lib", NOSTR_PATH)
+    ann = _load("nr_announcer_lib", ANN_PATH)
+    ann.HOME = d
+    with open(os.path.join(d, "blocklist.txt"), "w", encoding="utf-8") as fh:
+        fh.write("badword\n")
+    sk = bytes.fromhex("B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF")   # BIP-340 test vector 1
+    pk = nostr.pubkey(sk).hex()
+    A_TAG = "30311:%s:noderunners-radio" % ("ab" * 32)
+    fails = []
+
+    def check(name, cond):
+        print(("PASS " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    now = int(time.time())
+    def mk(kind, content, tags, t):          # nr-nostr's make_event writes kind 1 only; the chat is 1311, zaps 9734/9735
+        ser = json.dumps([0, pk, t, kind, tags, content], separators=(",", ":"), ensure_ascii=False)
+        eid = hashlib.sha256(ser.encode("utf-8")).digest()
+        sig = nostr.schnorr_sign(eid, sk, secrets.token_bytes(32))
+        return {"id": eid.hex(), "pubkey": pk, "created_at": t, "kind": kind, "tags": tags, "content": content, "sig": sig.hex()}
+    def chat(text, t, tags=None):
+        return mk(1311, text, tags if tags is not None else [["a", A_TAG, "", "root"]], t)
+    e1 = chat("gm from zap.stream", now - 50)
+    check("a signed chat message verifies", valid(e1) and points_at_us(e1))
+    bad = dict(e1); bad["content"] = "changed"
+    check("a changed message fails the id check", not valid(bad))
+    forged = dict(e1); forged["sig"] = "00" * 64
+    check("a forged signature fails", not valid(forged))
+    other = chat("not for us", now - 40, [["a", "30311:%s:other" % ("cd" * 32)]])
+    check("a message for another event is not ours", not points_at_us(other))
+    check("zap amounts: lnbc10u = 1,000 sats, lnbc2500n = 250, lnbc1m = 100,000, lnbc21u = 2,100",
+          zap_sats("lnbc10u1xyz") == 1000 and zap_sats("lnbc2500n1xyz") == 250 and zap_sats("lnbc1m1p") == 100000 and zap_sats("lnbc21u1q") == 2100)
+    check("text: links become [link], mentions short, no control chars",
+          clean_text("hi https://evil.example/x and nostr:npub1abcdefgh\x07 lnbc10u1zz") == "hi [link] and npub… [link]")
+    check("names: no @, no links, at most 24 characters", clean_name("@pleb https://x.y " + "z" * 40) == "pleb " + "z" * 19)
+    zreq = mk(9734, "keep it running!", [["a", A_TAG]], now - 30)
+    zap = mk(9735, "", [["a", A_TAG], ["bolt11", "lnbc10u1fake"], ["description", json.dumps(zreq)]], now - 20)
+    state = {"messages": []}
+    def fake_req(url, flt):
+        return [e1, other, zap, chat("this has a badword in it", now - 10), forged, chat("https://spam.example/x", now - 8)]
+    global fetch_names
+    real_fetch = fetch_names
+    fetch_names = lambda pubkeys, names, relays: (names.update({p: ["pleb dj", time.time()] for p in pubkeys}) or True)
+    n, ok = cycle(state, relays=["wss://a.test", "wss://b.test"], req=fake_req)
+    msgs = state["messages"]
+    check("one poll: chat + zap kept, other event / blocked / forged / link-only dropped", n == 2 and ok == 2 and [m["kind"] for m in msgs] == ["chat", "zap"])
+    check("the zap row: 1,000 sats, the sender's name, the message", msgs[1]["sats"] == 1000 and msgs[1]["username"] == "pleb dj" and msgs[1]["text"] == "keep it running!")
+    check("rows carry src nostr, a name from the profile and a short npub", all(m["src"] == "nostr" and m["username"] == "pleb dj" and m["npub"].startswith("npub1") for m in msgs))
+    n2, _ = cycle(state, relays=["wss://a.test"], req=fake_req)
+    check("the same events again: nothing new", n2 == 0 and len(state["messages"]) == 2)
+    flood = [chat("spam %d" % i, now - 5 + i % 3) for i in range(9)]
+    n3, _ = cycle(state, relays=["wss://a.test"], req=lambda u, f: flood)
+    check("rate limit: at most 5 messages per author per minute", sum(1 for m in state["messages"] if m["text"].startswith("spam")) == 4)
+    fetch_names = real_fetch
+    save_json(OUT, state)
+    check("the file is written and reads back", load_json(OUT, {})["messages"][0]["id"] == e1["id"])
+    # nr_chatquiet
+    global JUKEBOX_PK
+    names0 = {pk: ["pleb dj", time.time()]}
+    check("chatquiet: a jukebox command stays out of the panel", to_entry(chat("/play daft punk", now), names0, []) is None
+          and to_entry(chat("/now", now), names0, []) is None and to_entry(chat("2.", now), names0, []) is None)
+    check("chatquiet: chat without the slash stays IN", to_entry(chat("Play us a song!", now), names0, []) is not None
+          and to_entry(chat("play daft punk", now), names0, []) is not None
+          and to_entry(chat("now that's a tune", now), names0, []) is not None and to_entry(chat("gm", now), names0, []) is not None)
+    old_pk, JUKEBOX_PK = JUKEBOX_PK, pk
+    check("chatquiet: the bot's own lines stay out (its key)", to_entry(chat("Now playing on NoderunnersRadio.com Daft Punk", now), names0, []) is None)
+    JUKEBOX_PK = old_pk
+    check("chatquiet: zaps still pass", to_entry(zap, names0, []) is not None)
+    print("%d checks failed" % len(fails) if fails else "ALL PASS")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

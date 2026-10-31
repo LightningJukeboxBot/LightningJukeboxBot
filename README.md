@@ -30,7 +30,7 @@ A tip is a gift to the station, never a payment for music. Every sat helps keep 
 | `bridge/` | The video feed: ffmpeg + the overlay painters (card, chat, clock, ticker) |
 | `liquidsoap/noderunners.liq` | The radio's Liquidsoap script: rotation, requests, the captain's queue, jingles, live DJs |
 | `tg-stream/` | The Telegram live-stream relay |
-| `tools/` | Small helpers (full-text index build, socket push) |
+| `tools/` | The station's helper programs: the X and Nostr announcers and jukebox bots (`nr-announcer`, `nr-nostr`, `nr-xjukebox`, `nr-nostr-jukebox`, `nr-radio`), the zap.stream listing and chat (`nr-nostr-live`, `nr-nostrchat`), the rotation deal (`nr-shuffle`, `nr-deck-resync`), pepper (`nr-pepper-deck`), station IDs (`nr-jingle`), loudness and file quality (`nr-gain-measure`, `nr-gain-annotate`, `nr-bitrate-measure`, `nr-lengthscan`), plus the full-text index build and a socket push |
 | `web_assets/` | Images and scripts of the original bot's web pages |
 
 ## Before you run it
@@ -41,7 +41,7 @@ A tip is a gift to the station, never a payment for music. Every sat helps keep 
 
 ## Not in this repository
 
-The station's environment files and keys, its databases and play logs, the music itself, the server's other helper programs (`nr-*` tools: a later round), the website (see [noderunnersradio-site](https://github.com/artdesignbySF/noderunnersradio-site)) and anything personal.
+The station's environment files and keys, its databases and play logs, the music itself, the helpers that handle keys, backups, the home network or security updates, the chat's scam filter, the website (see [noderunnersradio-site](https://github.com/artdesignbySF/noderunnersradio-site)) and anything personal.
 
 ## Links
 

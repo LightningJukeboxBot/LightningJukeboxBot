@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-jingle (2026-09-09) -- one station ID an hour, and nothing else.
+
+A one-shot run, fired by nr-jingle.timer every five minutes. It hands ONE jingle to liquidsoap's
+"jingle" request queue when all of these are true, and does nothing at all otherwise:
+
+  1  /var/lib/jukebox/jingle.OFF does not exist
+  2  no live session is open (redis db 2, key livesession:pool -- the same gate every other tool uses)
+  3  at least NR_JINGLE_GAP_S seconds have passed since the last one was handed over AND since the last one
+     went on air (nr_jinglegap 2026-10-20, read from the play log) (default 3300 = 55 minutes, so the
+     five-minute timer lands it about once an hour, drifting a few minutes each time)
+     -- EXCEPT while the captain's mood queue is running. That queue sits above this one and always has
+     its next track ready, so no jingle reaches the air until the mood session ends, and the one already
+     waiting goes out at the first boundary after it. That is on purpose: a curated set is not interrupted.
+  4  liquidsoap has the jingle queue and the queue is EMPTY (one waiting jingle is never joined by a second)
+  5  the file it picked is still on disk
+
+It picks from a shuffled bag: every jingle plays once before any plays twice. Number 18 is held out --
+that one belongs to the start of a live session (SF, 2026-09-09). Set NR_JINGLE_RESERVED="" to put it in
+the hourly pool as well.
+
+What it does NOT do, by construction: it never touches the rotation window, the deck cursor, the deal, the
+play count, the library index, gains.db, or any other queue. It never restarts anything. A jingle waits its
+turn BELOW paid requests and below the captain's mood queue, and liquidsoap only switches between tracks, so
+it can never cut a song short.
+
+The play-log row it produces reads rights_class "station" and source "jingle" (stamped in the liquidsoap
+config, so anything in that queue is stamped whatever pushed it). The deal counts only "rotation" rows, so
+the deck cannot drift; the BUMA generator skips "station" rows, so a station ID never enters a royalty file
+while the row itself stays in the record forever.
+
+DRY by default: without /var/lib/jukebox/jingle.LIVE it picks, logs "[dry] would push ...", advances its own
+schedule and pushes nothing. That way a day of dry running proves the cadence before anything airs.
+
+  nr-jingle              one cycle (what the timer runs)
+  nr-jingle --check      say what it would do right now; touches no state, pushes nothing
+  nr-jingle --selftest   offline tests; no socket, no redis, no files outside a temp folder
+"""
+import os, sys, json, time, socket, random, subprocess, tempfile
+
+M3U = os.environ.get("NR_JINGLE_M3U", "/var/lib/jukebox/jingles.m3u")
+SOCK = os.environ.get("NR_JINGLE_SOCK", "/var/run/liquidsoap/noderunners.sock")
+STATE = os.environ.get("NR_JINGLE_STATE", "/var/lib/jukebox/jingle-state.json")
+LIVE = os.environ.get("NR_JINGLE_LIVE", "/var/lib/jukebox/jingle.LIVE")
+OFF = os.environ.get("NR_JINGLE_OFF", "/var/lib/jukebox/jingle.OFF")
+GAP_S = int(os.environ.get("NR_JINGLE_GAP_S", "3300"))
+PLAYLOG = os.environ.get("NR_JINGLE_PLAYLOG", "/var/log/liquidsoap/playlog.tsv")   # nr_jinglegap
+RESERVED = {int(n) for n in (os.environ.get("NR_JINGLE_RESERVED", "18") or "").replace(",", " ").split()}
+QUEUE = "jingle"
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + "nr-jingle: " + str(msg), flush=True)
+
+
+# ---------------------------------------------------------------- the liquidsoap socket
+def send(cmd, timeout=5.0, path=None):
+    """One command to liquidsoap's server socket; the reply up to its END line."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path or SOCK)
+        s.sendall((cmd + "\n").encode("utf-8"))
+        buf = b""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\nEND\r\n" in buf or b"\nEND\n" in buf or buf.strip().endswith(b"END"):
+                break
+            if len(buf) > (1 << 20):
+                raise OSError("reply too long")
+        return buf.decode("utf-8", "replace")
+    finally:
+        try:
+            s.sendall(b"quit\n")
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def ask(cmd, sender=None):
+    """The reply body as a list of lines. A reply without END, or an ERROR line, raises."""
+    raw = (sender or send)(cmd) or ""
+    lines = [l.strip() for l in raw.replace("\r", "").splitlines()]
+    if "END" not in lines:
+        raise RuntimeError("incomplete reply to %r" % cmd)
+    body = [l for l in lines if l and l not in ("END", "Bye!")]
+    if body and body[0].upper().startswith("ERROR"):
+        raise RuntimeError(body[0])
+    return body
+
+
+# ---------------------------------------------------------------- the pool and the bag
+def number_of(path):
+    """The jingle number from a file name like nrfm-jingle-18.mp3, or None."""
+    base = os.path.basename(path)
+    digits = "".join(c for c in os.path.splitext(base)[0].split("-")[-1] if c.isdigit())
+    return int(digits) if digits else None
+
+
+def pool():
+    """Every playable jingle in the pool file, minus the reserved numbers, in file order."""
+    out = []
+    with open(M3U, encoding="utf-8") as fh:
+        for line in fh:
+            p = line.strip()
+            if not p or p.startswith("#"):
+                continue
+            n = number_of(p)
+            if n is not None and n in RESERVED:
+                continue
+            out.append(p)
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+        return {"last_at": float(st.get("last_at") or 0), "bag": list(st.get("bag") or []),
+                "played": int(st.get("played") or 0), "rounds": int(st.get("rounds") or 0)}
+    except Exception:
+        return {"last_at": 0.0, "bag": [], "played": 0, "rounds": 0}
+
+
+def save_state(st):
+    d = os.path.dirname(STATE) or "."
+    fd, tmp = tempfile.mkstemp(prefix="jingle-state.", suffix=".new", dir=d)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, STATE)
+
+
+def remember(st):
+    """Write the state and say whether it stuck. Nothing is pushed unless it did."""
+    try:
+        save_state(st)
+        return True
+    except Exception as e:
+        log("could not write %s (%s); pushing nothing, because a push nobody remembers is a push that repeats"
+            % (STATE, str(e)[:80]))
+        return False
+
+
+def draw(st, rng=random):
+    """The next jingle: from the bag, refilled and reshuffled when it runs out. None when the pool is empty.
+    Files that vanished from the pool or from disk are dropped as they come up."""
+    live_pool = pool()
+    if not live_pool:
+        return None
+    known = set(live_pool)
+    while True:
+        st["bag"] = [p for p in st["bag"] if p in known]
+        if not st["bag"]:
+            bag = list(live_pool)
+            rng.shuffle(bag)
+            st["bag"] = bag
+            st["rounds"] += 1
+        pick = st["bag"].pop()
+        if os.path.exists(pick):
+            return pick
+        log("gone from disk, skipped: %s" % pick)
+        known.discard(pick)
+        if not known:
+            return None
+
+
+# ---------------------------------------------------------------- the gates
+def live_session(runner=None):
+    """True when a live session is open. An unreadable redis is treated as OPEN: never talk over a DJ."""
+    try:
+        r = (runner or subprocess.run)(["redis-cli", "-n", "2", "EXISTS", "livesession:pool"],
+                                       capture_output=True, text=True, timeout=10)
+        out = (r.stdout or "").strip()
+    except Exception as e:
+        log("redis did not answer (%s); assuming a live session is on" % str(e)[:60])
+        return True
+    if out not in ("0", "1"):
+        log("redis answered %r; assuming a live session is on" % out[:40])
+        return True
+    return out == "1"
+
+
+def last_played(path=None, tail=400000):
+    """nr_jinglegap (2026-10-20): the time the last jingle went ON AIR, from the tail of the play log (about ten days of
+    rows). 0.0 = none found, or no readable log. A jingle that waited two days behind a mood session is counted from
+    the moment it actually played, so the next one cannot follow it within minutes."""
+    path = PLAYLOG if path is None else path
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - tail))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return 0.0
+    import datetime
+    for line in reversed(lines):
+        p = line.split("\t")
+        if len(p) > 2 and p[1] == "play" and p[2] == "jingle":
+            try:
+                return datetime.datetime.fromisoformat(p[0].strip()).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def cycle(now=None, sender=None, runner=None, rng=random, dry=None):
+    """One run. Returns a short word saying what happened; every word is a log line the timer keeps."""
+    now = time.time() if now is None else now
+    dry = (not os.path.exists(LIVE)) if dry is None else dry
+    if os.path.exists(OFF):
+        return "off"
+    if not os.path.exists(M3U):
+        log("no pool file at %s" % M3U)
+        return "no-pool"
+    if live_session(runner):
+        return "live-session"
+    st = load_state()
+    if st["last_at"] > now + 60:
+        # A clock that sits in the future silences the feeder for ever, and "too-soon" is never logged,
+        # so it would do it in total silence (review finding). Treat it as unset and say so out loud.
+        log("the last-push time is %.0f min in the FUTURE (clock change, or a hand-edited state file); "
+            "treating it as unset" % ((st["last_at"] - now) / 60.0))
+        st["last_at"] = 0.0
+    waited = now - st["last_at"]
+    if waited < GAP_S:
+        return "too-soon"
+    aired = last_played()                                  # nr_jinglegap: and the last one ON AIR
+    if aired > now + 60:
+        log("the last jingle in the play log is %.0f min in the FUTURE (clock change?); ignoring it" % ((aired - now) / 60.0))
+    elif aired and now - aired < GAP_S:
+        return "too-soon"
+    try:
+        queued = ask("%s.queue" % QUEUE, sender)
+    except Exception as e:
+        log("liquidsoap has no %s queue yet (%s)" % (QUEUE, str(e)[:80]))
+        return "no-queue"
+    if " ".join(queued).split():
+        return "queue-busy"
+    pick = draw(st, rng)
+    if pick is None:
+        log("the pool is empty")
+        return "no-pool"
+    if dry:
+        st["last_at"] = now
+        if not remember(st):
+            return "state-failed"
+        log("[dry] would push %s" % pick)
+        return "dry"
+    # The clock is written BEFORE the push, deliberately (review finding). Everything after this line can
+    # fail with the jingle already sitting in liquidsoap's queue: a lost reply, a reply that is not a
+    # request id, a full disk. Writing the clock afterwards makes the worst case a jingle every five or ten
+    # minutes, which is the one failure a listener would actually hear. Writing it first makes the worst
+    # case one missed jingle, which nobody notices. And a state file that will not write stops the push
+    # altogether, because a push nobody remembers is a push that repeats.
+    st["last_at"] = now
+    st["played"] += 1
+    if not remember(st):
+        return "state-failed"
+    try:
+        body = ask("%s.push %s" % (QUEUE, pick), sender)
+    except Exception as e:
+        log("push failed (%s); the clock is already set, so nothing repeats -- one jingle is skipped" % str(e)[:100])
+        return "push-failed"
+    rid = (body[0] if body else "").strip()
+    if not rid.isdigit():
+        log("liquidsoap did not answer with a request id (%r); it may still have taken the jingle, "
+            "so this hour is skipped rather than pushed twice" % (body[:1] or ""))
+        return "push-failed"
+    log("pushed %s (request %s, %d in the bag left, round %d, %.0f min since the last one)"
+        % (os.path.basename(pick), rid, len(st["bag"]), st["rounds"], waited / 60.0))
+    return "pushed"
+
+
+def check():
+    st = load_state()
+    try:
+        p = pool()
+    except Exception as e:
+        p = []
+        print("pool file unreadable: %s" % e)
+    print("pool file: %s (%d playable, reserved %s)" % (M3U, len(p), sorted(RESERVED) or "none"))
+    print("mode: %s" % ("LIVE (pushes for real)" if os.path.exists(LIVE) else "DRY (pushes nothing; touch %s to go live)" % LIVE))
+    print("paused: %s" % ("yes -- %s exists" % OFF if os.path.exists(OFF) else "no"))
+    print("gap: %d s (%.0f min); last push %s" % (GAP_S, GAP_S / 60.0,
+          time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(st["last_at"])) if st["last_at"] else "never"))
+    aired = last_played()                                                        # nr_jinglegap
+    print("last on air: %s (play log %s)" % (time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(aired)) if aired else "none found", PLAYLOG))
+    print("bag: %d left of this round; %d pushed in all; %d rounds" % (len(st["bag"]), st["played"], st["rounds"]))
+    try:
+        q = ask("%s.queue" % QUEUE)
+        print("liquidsoap: the %s queue answers, %d waiting" % (QUEUE, len(" ".join(q).split())))
+    except Exception as e:
+        print("liquidsoap: no %s queue (%s)" % (QUEUE, str(e)[:80]))
+    print("live session: %s" % ("YES -- it would stay quiet" if live_session() else "no"))
+    return 0
+
+
+# ---------------------------------------------------------------- offline tests
+def selftest():
+    global M3U, STATE, LIVE, OFF, GAP_S, RESERVED, PLAYLOG
+    d = tempfile.mkdtemp(prefix="nr-jingle-test-")
+    M3U = os.path.join(d, "jingles.m3u")
+    STATE = os.path.join(d, "state.json")
+    LIVE = os.path.join(d, "jingle.LIVE")
+    OFF = os.path.join(d, "jingle.OFF")
+    PLAYLOG = os.path.join(d, "playlog.tsv")              # nr_jinglegap: none yet, so the older tests are unchanged
+    GAP_S = 3300
+    RESERVED = {18}
+    fails = []
+
+    def check_(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    names = ["nrfm-jingle-%02d.mp3" % n for n in list(range(1, 17)) + [18, 19, 20, 21]]
+    paths = []
+    for n in names:
+        p = os.path.join(d, n)
+        open(p, "wb").write(b"\xff\xfb" + b"\0" * 64)
+        paths.append(p)
+    open(M3U, "w", encoding="utf-8").write("\n".join(paths) + "\n")
+
+    replies = []
+    pushed = []
+
+    def sender(cmd):
+        replies.append(cmd)
+        if cmd.startswith("jingle.push "):
+            pushed.append(cmd.split(" ", 1)[1])
+            return "31\nEND\n"
+        if cmd == "jingle.queue":
+            return sender.queue + "\nEND\n"
+        return "ERROR: unknown command\nEND\n"
+    sender.queue = ""
+
+    def no_sesh(cmd, **kw):
+        class R:
+            stdout = "0"
+        return R()
+
+    def sesh(cmd, **kw):
+        class R:
+            stdout = "1"
+        return R()
+
+    class Rng:
+        def shuffle(self, x):
+            x.reverse()
+    rng = Rng()
+    now = 1_800_000_000.0
+
+    check_("18 is held out of the pool", len(pool()) == 19 and not any(p.endswith("-18.mp3") for p in pool()))
+    check_("a first run in DRY pushes nothing but sets the clock",
+           cycle(now, sender, no_sesh, rng, dry=True) == "dry" and not pushed and load_state()["last_at"] == now)
+    check_("a second run inside the gap does nothing", cycle(now + 60, sender, no_sesh, rng, dry=True) == "too-soon")
+    check_("after the gap it goes again", cycle(now + GAP_S + 1, sender, no_sesh, rng, dry=True) == "dry")
+    open(LIVE, "w").close()
+    clock = [now + GAP_S + 1]
+    def later():
+        clock[0] += GAP_S + 1
+        return clock[0]
+    r = cycle(later(), sender, no_sesh, rng)
+    check_("LIVE pushes one jingle and records it", r == "pushed" and len(pushed) == 1
+           and pushed[0].startswith(d) and load_state()["played"] == 1)
+    check_("the push carries a bare path, no annotate", ":" not in os.path.basename(pushed[0]))
+    sender.queue = "31"
+    check_("a jingle already waiting stops a second one", cycle(later(), sender, no_sesh, rng) == "queue-busy" and len(pushed) == 1)
+    sender.queue = ""
+    check_("a live session stops it", cycle(later(), sender, sesh, rng) == "live-session" and len(pushed) == 1)
+    open(OFF, "w").close()
+    check_("the OFF flag stops it", cycle(later(), sender, no_sesh, rng) == "off" and len(pushed) == 1)
+    os.unlink(OFF)
+
+    def broken(cmd):
+        return "ERROR: unknown command\nEND\n"
+    check_("no jingle queue in liquidsoap: it stops, quietly", cycle(later(), broken, no_sesh, rng) == "no-queue" and len(pushed) == 1)
+
+    def silent(cmd):
+        return ""
+    check_("a socket that answers nothing is not taken for an empty queue",
+           cycle(later(), silent, no_sesh, rng) == "no-queue" and len(pushed) == 1)
+
+    def bad_rid(cmd):
+        if cmd == "jingle.queue":
+            return "\nEND\n"
+        return "no such request\nEND\n"
+    t_bad = later()
+    check_("a push with no request id SKIPS the hour instead of repeating it",
+           cycle(t_bad, bad_rid, no_sesh, rng) == "push-failed" and load_state()["last_at"] == t_bad)
+    n_before = len(pushed)
+    check_("and the tick right after it stays quiet",
+           cycle(t_bad + 60, sender, no_sesh, rng) == "too-soon" and len(pushed) == n_before)
+
+    # a state file that will not write must stop the push: a push nobody remembers is a push that repeats
+    real_save = save_state
+    def boom(_st):
+        raise OSError("disk full")
+    globals()["save_state"] = boom
+    check_("a state file that will not write stops the push",
+           cycle(later(), sender, no_sesh, rng) == "state-failed" and len(pushed) == n_before)
+    globals()["save_state"] = real_save
+
+    # a clock in the future must be cleared, not obeyed for ever
+    stt = load_state()
+    stt["last_at"] = clock[0] + 86400
+    save_state(stt)
+    check_("a clock in the future is cleared, not obeyed",
+           cycle(later(), sender, no_sesh, rng) == "pushed" and len(pushed) == n_before + 1)
+
+    def dead_redis(cmd, **kw):
+        raise OSError("no redis")
+    check_("an unreadable redis is treated as a live session", cycle(later(), sender, dead_redis, rng) == "live-session")
+
+    # the whole bag empties before anything repeats
+    save_state({"last_at": 0.0, "bag": [], "played": 0, "rounds": 0})
+    pushed.clear()
+    t = clock[0]
+    for i in range(19):
+        t += GAP_S + 1
+        cycle(t, sender, no_sesh, rng)
+    check_("all 19 play once before any plays twice", len(pushed) == 19 and len(set(pushed)) == 19)
+    t += GAP_S + 1
+    cycle(t, sender, no_sesh, rng)
+    check_("the 20th starts a new round", len(pushed) == 20 and load_state()["rounds"] == 2)
+
+    # a file that disappeared is skipped, not pushed
+    st = load_state()
+    victim = st["bag"][-1]
+    os.unlink(victim)
+    t += GAP_S + 1
+    cycle(t, sender, no_sesh, rng)
+    check_("a jingle missing from disk is skipped", pushed[-1] != victim and len(pushed) == 21)
+
+    # a pool file that shrinks does not strand the bag
+    open(M3U, "w", encoding="utf-8").write("\n".join(paths[:3]) + "\n")
+    t += GAP_S + 1
+    r = cycle(t, sender, no_sesh, rng)
+    check_("a shrunken pool file is honoured at once", r == "pushed" and pushed[-1] in paths[:3])
+
+    # the reserved set can be opened up
+    RESERVED = set()
+    open(M3U, "w", encoding="utf-8").write("\n".join(paths) + "\n")
+    check_("clearing the reserve puts 18 back in the pool", len(pool()) == 20 and any(p.endswith("-18.mp3") for p in pool()))
+    RESERVED = {18}
+
+    check_("the number is read from the file name", number_of("/x/nrfm-jingle-18.mp3") == 18
+           and number_of("/x/nrfm-jingle-07.mp3") == 7 and number_of("/x/whatever.mp3") is None)
+
+    if hasattr(socket, "AF_UNIX"):
+        sp = os.path.join(d, "s.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sp)
+        srv.listen(1)
+        got = []
+
+        def serve():
+            c, _ = srv.accept()
+            c.settimeout(5)
+            got.append(c.recv(4096).decode())
+            c.sendall(b"42\r\nEND\r\n")
+            time.sleep(0.2)
+            c.close()
+        import threading
+        threading.Thread(target=serve, daemon=True).start()
+        body = ask("jingle.push /tmp/x.mp3", lambda cmd: send(cmd, path=sp))
+        check_("a real unix socket round trip works", body == ["42"] and got and got[0].startswith("jingle.push"))
+        srv.close()
+    else:
+        print("ok   (skipped: this machine has no unix sockets)")
+
+    # nr_jinglegap (2026-10-20): SF heard two jingles 4 minutes apart. One had waited two days behind a mood session;
+    # the next push followed at once, because the hour counted from the push only.
+    def air(*ts, junk=False):
+        with open(PLAYLOG, "wb") as fh:
+            if junk:
+                fh.write(b"\xff\xfe not a row \x00\n")
+            for x in ts:
+                fh.write(("%s\tplay\tjingle\tstation\tTruuus's\tNRFM Jingle 12\n" % time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(x))).encode())
+                fh.write(("%s\tplay\tmood\tcollecting_society\tA\tB\n" % time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(x + 240))).encode())
+    if os.path.exists(OFF):
+        os.unlink(OFF)
+    sender.queue = ""
+    t += 10 * GAP_S
+    save_state(dict(load_state(), last_at=t - 2 * 86400))   # the last PUSH: two days ago (it waited behind a mood session)
+    air(t - 240, junk=True)                                  # ... and it went on air 4 minutes ago
+    check_("nr_jinglegap: the play log time is read right", abs(last_played() - (t - 240)) < 1.5)
+    check_("nr_jinglegap: pushed two days ago, ON AIR 4 min ago -> too soon (SF's 10:42 + 10:46)", cycle(t, sender, no_sesh, rng, dry=True) == "too-soon")
+    t = t - 240 + GAP_S + 1
+    check_("nr_jinglegap: a full gap after it aired -> it goes", cycle(t, sender, no_sesh, rng, dry=True) == "dry")
+    t += GAP_S + 1
+    air(t + 3600)
+    check_("nr_jinglegap: a play-log time in the future is ignored", cycle(t, sender, no_sesh, rng, dry=True) == "dry")
+    t += GAP_S + 1
+    os.unlink(PLAYLOG)
+    check_("nr_jinglegap: no play log -> the old rule alone", last_played() == 0.0 and cycle(t, sender, no_sesh, rng, dry=True) == "dry")
+    t += GAP_S + 1
+    with open(PLAYLOG, "wb") as fh:
+        fh.write(b"2026-10-20T10:46:26+00:00\tplay\trotation\tcollecting_society\tA\tB\n")
+    check_("nr_jinglegap: a play log without jingles -> the old rule alone", last_played() == 0.0 and cycle(t, sender, no_sesh, rng, dry=True) == "dry")
+    t += GAP_S + 1
+    save_state(dict(load_state(), last_at=t - 4 * 3600))
+    air(t - 7200, t - 600)
+    check_("nr_jinglegap: the LAST jingle in the log counts", cycle(t, sender, no_sesh, rng, dry=True) == "too-soon")
+
+    print("\nSELFTEST %s (%d failed)" % ("PASSED" if not fails else "FAILED", len(fails)))
+    return 0 if not fails else 1
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    if args == ["--check"]:
+        return check()
+    if args not in ([], ["--once"]):
+        print(__doc__)
+        return 64
+    try:
+        r = cycle()
+    except Exception as e:
+        log("cycle error: %s" % e)
+        return 1
+    if r not in ("too-soon", "off", "live-session", "queue-busy"):
+        log("result: %s" % r)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

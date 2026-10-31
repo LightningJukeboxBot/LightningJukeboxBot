@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-pepper-deck (2026-10-31) -- deals the PEPPER deck: songs from the jukebox library that are NOT in the steady rotation.
+
+SF, 2026-10-30/31: "I do want stuff that is not in that steady rotation playlist to be 'peppered in'" -- one song after
+every 4 rotation songs (the console sets the number), so the captain learns the rest of the ship.
+His rules, all here:
+  1  Source: EVERYTHING in the jukebox library (library.db) that is not in the steady rotation pool, and not another copy
+     of a rotation song. Friends' and gifted collections included.
+  2  Length: up to 8 minutes (short ones welcome).
+  3  No interviews, skits or spoken word.
+  4  Loudness measured (gains.db), always -- an unmeasured song waits for the nightly scan.
+  5  One copy per song: the biggest file (the best copy as a rule).
+  6  No repeat until the whole deck has played: a song that has peppered once (pepper.db 'played') or that the captain
+     marked "Not again" (pepper.db 'never') is never dealt again.
+  7  Christmas songs go in their own pile; library_api only draws from it 20-30 December.
+Also left out: expelled songs (blocklist.txt).
+
+Writes /var/lib/jukebox/pepper-deck.db by building a new file and swapping it in (library_api reads it; the swap is
+atomic). pepper.db (played / never) belongs to library_api; this program only reads it.
+Runs as sf: nightly via nr-pepper-deck.timer (after the loudness scan), so new songs and new measurements join.
+
+nr-pepper-deck            build the deck            nr-pepper-deck --count    numbers only, writes nothing
+"""
+import os, re, sys, time, random, sqlite3, unicodedata
+
+JB = os.environ.get("NR_JUKEBOX_DIR", "/var/lib/jukebox")
+POOL = os.path.join(JB, "rotation-full.m3u")
+LIB = os.path.join(JB, "library.db")
+GAINS = os.path.join(JB, "gains.db")
+BLOCK = os.path.join(JB, "blocklist.txt")
+STATE = os.path.join(JB, "pepper.db")
+DECK = os.path.join(JB, "pepper-deck.db")
+MAX_S = 480
+SPEECH = re.compile(r"(?i)\b(interview|skit|commentary|voice ?memo|spoken|acapella|a cappella|karaoke)\b")
+XMAS = re.compile(r"(?i)christmas|x-?mas\b|kerst|weihnacht|\bno[eë]l\b|navidad|jingle bells?|santa claus|silent night|"
+                  r"stille nacht|rudolph|sleigh|mistletoe|let it snow|white christmas|feliz navidad")
+
+
+def log(m):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + "pepper-deck: " + str(m), flush=True)
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def song_key(artist, title, path):
+    a, t = norm(artist), norm(title)
+    return "%s\x00%s" % (a, t) if t else "path\x00" + path
+
+
+def lines(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return {l.strip() for l in fh if l.strip() and not l.startswith("#")}
+    except OSError:
+        return set()
+
+
+def state_sets():
+    """(played keys, never keys) from library_api's pepper.db; empty when it does not exist yet."""
+    if not os.path.exists(STATE):
+        return set(), set()
+    con = sqlite3.connect("file:%s?mode=ro" % STATE, uri=True)
+    try:
+        played = {r[0] for r in con.execute("SELECT key FROM played")}
+        never = {r[0] for r in con.execute("SELECT key FROM never")}
+    except sqlite3.Error:
+        played, never = set(), set()
+    con.close()
+    return played, never
+
+
+def collect():
+    pool = lines(POOL)
+    if len(pool) < 1000:
+        raise SystemExit("STOP: the rotation pool has only %d songs -- refusing to deal a pepper deck from that." % len(pool))
+    block = lines(BLOCK)
+    played, never = state_sets()
+    lib = sqlite3.connect("file:%s?mode=ro" % LIB, uri=True)
+    pool_keys = set()
+    for p, a, t in lib.execute("SELECT path, artist, title FROM tracks"):
+        if p in pool:
+            pool_keys.add(song_key(a, t, p))
+    g = sqlite3.connect("file:%s?mode=ro" % GAINS, uri=True)
+    measured = {r[0] for r in g.execute("SELECT path FROM gains WHERE rc=0")}
+    g.close()
+    n = {"library": 0, "in the rotation": 0, "another copy of a rotation song": 0, "over 8 min / no length": 0,
+         "speech": 0, "not measured yet": 0, "expelled": 0, "peppered before": 0, "not again": 0, "extra copy": 0}
+    best = {}
+    for p, a, t, al, d, size in lib.execute("SELECT path, artist, title, album, duration_s, size FROM tracks"):
+        n["library"] += 1
+        k = song_key(a, t, p)
+        if p in pool:
+            n["in the rotation"] += 1; continue
+        if k in pool_keys:
+            n["another copy of a rotation song"] += 1; continue
+        if not d or d > MAX_S:
+            n["over 8 min / no length"] += 1; continue
+        if SPEECH.search(t or ""):
+            n["speech"] += 1; continue
+        if p in block:
+            n["expelled"] += 1; continue
+        if p not in measured:
+            n["not measured yet"] += 1; continue
+        if k in never:
+            n["not again"] += 1; continue
+        if k in played:
+            n["peppered before"] += 1; continue
+        xmas = bool(XMAS.search("%s %s" % (t or "", al or "")))
+        old = best.get(k)
+        if old:
+            n["extra copy"] += 1
+            if (size or 0) <= (old[5] or 0):
+                continue
+        best[k] = (p, a or "", t or "", int(d), xmas, size or 0)
+    lib.close()
+    return best, n
+
+
+def build():
+    t0 = time.time()
+    best, n = collect()
+    rows = list(best.items())
+    random.SystemRandom().shuffle(rows)
+    deck = [(k, v) for k, v in rows if not v[4]]
+    xmas = [(k, v) for k, v in rows if v[4]]
+    if len(deck) < 1000:
+        raise SystemExit("STOP: only %d songs would be dealt -- something upstream is wrong; the old deck stays." % len(deck))
+    tmp = DECK + ".new"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    con = sqlite3.connect(tmp)
+    con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+    for pile in ("deck", "xmas"):
+        con.execute("CREATE TABLE %s (pos INTEGER PRIMARY KEY, key TEXT, path TEXT, artist TEXT, title TEXT, dur INTEGER)" % pile)
+    con.executemany("INSERT INTO deck VALUES (?,?,?,?,?,?)", [(i, k, v[0], v[1], v[2], v[3]) for i, (k, v) in enumerate(deck)])
+    con.executemany("INSERT INTO xmas VALUES (?,?,?,?,?,?)", [(i, k, v[0], v[1], v[2], v[3]) for i, (k, v) in enumerate(xmas)])
+    deck_id = "%d-%d" % (int(time.time()), len(deck))
+    con.executemany("INSERT INTO meta VALUES (?,?)", [("id", deck_id), ("built", str(int(time.time()))),
+                                                        ("size", str(len(deck))), ("xmas", str(len(xmas)))])
+    con.commit()
+    con.close()
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, DECK)
+    for k, v in n.items():
+        log("%-34s %8d" % (k, v))
+    log("DEALT: %d songs in the deck, %d in the Christmas pile (id %s) in %.0f s" % (len(deck), len(xmas), deck_id, time.time() - t0))
+    return 0
+
+
+def main():
+    if sys.argv[1:] == ["--count"]:
+        best, n = collect()
+        for k, v in n.items():
+            print("%-34s %8d" % (k, v))
+        print("%-34s %8d  (+ %d Christmas)" % ("would be dealt", sum(1 for v in best.values() if not v[4]),
+                                              sum(1 for v in best.values() if v[4])))
+        return 0
+    if sys.argv[1:]:
+        print(__doc__)
+        return 64
+    return build()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-gain-measure.py -- STEP 1 of ReplayGain, the measuring half. READ-ONLY BY DESIGN.
+
+WHAT IT DOES. Plays each track through ffmpeg's EBU R128 loudness meter and writes ONE
+ROW per track (integrated loudness in LUFS + true peak) into its own little database:
+
+    /var/lib/jukebox/gains.db        (sqlite, brand new -- touches NOTHING else)
+
+It never writes into a music file, never touches library.db, never talks to liquidsoap.
+The stream cannot notice it exists. Stopping it any moment loses nothing: every finished
+track is already saved, and the next run resumes where it left off.
+
+WHAT IT MEASURES FIRST. --pool (default) = the background rotation (rotation-full.m3u,
+~10.8k tracks): SF's own selection, done in hours. --all = every track in library.db
+(683k): the weeks-long background trickle, for later.
+
+THROTTLED. nice 19 + idle io + a sleep between files (--sleep, default 1.0 s). To stop
+it dead at any moment:   touch /var/lib/jukebox/gainscan.stop
+(or: sudo systemctl stop nr-gainscan  when started the systemd way below)
+
+RUN (SF's hand -- must run as a user who can READ the music, e.g. sf):
+    sudo -u sf python3 /tmp/nr-gain-measure.py                # DRY RUN: counts only
+    sudo systemd-run --unit=nr-gainscan --nice=19 \
+         -p IOSchedulingClass=idle -p User=jukebox \
+         python3 /tmp/nr-gain-measure.py --pool --go          # start in the background
+WATCH:   cat /var/lib/jukebox/gainscan.status
+         sudo journalctl -u nr-gainscan -n 5 --no-pager
+STOP:    sudo systemctl stop nr-gainscan     (safe at ANY moment; resumes later)
+"""
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+FULL = "/var/lib/jukebox/rotation-full.m3u"
+LIBRARY = "/var/lib/jukebox/library.db"
+GAINS = "/var/lib/jukebox/gains.db"
+STOP = "/var/lib/jukebox/gainscan.stop"
+STATUS = "/var/lib/jukebox/gainscan.status"
+PER_FILE_TIMEOUT = 300          # a corrupt file must never wedge the scan
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--pool", action="store_true", help="measure the rotation pool (default)")
+ap.add_argument("--all", action="store_true", help="measure EVERY track in library.db (weeks; run after --pool)")
+ap.add_argument("--limit", type=int, default=0, help="stop after N files this run (0 = no limit)")
+ap.add_argument("--sleep", type=float, default=1.0, help="pause between files, seconds")
+ap.add_argument("--go", action="store_true", help="actually measure (otherwise: dry run, counts only)")
+A = ap.parse_args()
+
+
+def say(m):
+    print(m, flush=True)
+
+
+def status(m):
+    try:
+        with open(STATUS, "w", encoding="utf-8") as fh:
+            fh.write(m + "\n")
+    except OSError:
+        pass
+
+
+def targets():
+    if A.all:
+        con = sqlite3.connect("file:%s?mode=ro" % LIBRARY, uri=True)
+        try:
+            return [p for (p,) in con.execute("SELECT path FROM tracks")]
+        finally:
+            con.close()
+    try:
+        with open(FULL, encoding="utf-8", errors="replace") as fh:
+            return [l.rstrip("\n") for l in fh if l.strip()]
+    except OSError as e:
+        say("STOP: cannot read %s: %s" % (FULL, e))
+        sys.exit(2)
+
+
+# ffmpeg's ebur128 summary block, from stderr:
+#   Integrated loudness:
+#     I:         -14.5 LUFS
+#   ...
+#   True peak:
+#     Peak:       -0.3 dBFS
+RX_I = re.compile(r"^\s*I:\s*(-?[\d.]+|-inf)\s+LUFS\s*$", re.M)
+RX_P = re.compile(r"^\s*Peak:\s*(-?[\d.]+|-inf)\s+dBFS\s*$", re.M)
+
+
+def measure(path):
+    """One file -> (lufs, true_peak_db, rc). Read-only: ffmpeg decodes to the null sink."""
+    cmd = ["ffmpeg", "-nostats", "-hide_banner", "-nostdin",
+           "-i", path, "-map", "a:0",
+           "-filter:a", "ebur128=peak=true", "-f", "null", os.devnull]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           errors="replace", timeout=PER_FILE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, None, -2
+    except OSError:
+        return None, None, -3
+    mi = RX_I.findall(r.stderr)
+    mp = RX_P.findall(r.stderr)
+    if not mi:
+        return None, None, (r.returncode or -1)
+    lufs = None if mi[-1] == "-inf" else float(mi[-1])
+    peak = None if (not mp or mp[-1] == "-inf") else float(mp[-1])
+    return lufs, peak, r.returncode
+
+
+def main():
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        say("STOP: no ffmpeg on PATH. Tell Claude -- nothing was measured.")
+        sys.exit(2)
+    want = targets()
+    con = sqlite3.connect(GAINS)
+    con.execute("""CREATE TABLE IF NOT EXISTS gains(
+        path TEXT PRIMARY KEY, lufs REAL, true_peak_db REAL,
+        rc INT, measured_at INT)""")
+    con.commit()
+    have = {p for (p,) in con.execute("SELECT path FROM gains")}
+    todo = [p for p in want if p not in have]
+    say("nr-gain-measure  %s" % ("LIVE (--go)" if A.go else "DRY RUN"))
+    say("  source    : %s" % ("library.db (EVERYTHING)" if A.all else FULL))
+    say("  targets   : %d   already measured: %d   to do: %d"
+        % (len(want), len(want) - len(todo), len(todo)))
+    say("  rough time: %.1f h at ~2 s/track (throttled; stop any time, resumes)"
+        % (len(todo) * 2.0 / 3600))
+    if not A.go:
+        say("\nDRY RUN. Nothing measured. Add --go (via systemd-run, see the header).")
+        return
+    if os.path.exists(STOP):
+        say("STOP file already present (%s) -- remove it first:  rm %s" % (STOP, STOP))
+        sys.exit(2)
+    done = errs = 0
+    t0 = time.time()
+    for path in todo:
+        if os.path.exists(STOP):
+            say("stop file seen -- halting cleanly after %d files." % done)
+            break
+        if A.limit and done >= A.limit:
+            say("--limit %d reached." % A.limit)
+            break
+        if not os.path.exists(path):
+            lufs = peak = None
+            rc = -4
+        else:
+            lufs, peak, rc = measure(path)
+        if rc != 0:
+            errs += 1
+        con.execute("INSERT OR REPLACE INTO gains VALUES (?,?,?,?,?)",
+                    (path, lufs, peak, rc, int(time.time())))
+        con.commit()                       # one row per file: a kill loses nothing
+        done += 1
+        if done % 25 == 0 or done == len(todo):
+            rate = done / max(time.time() - t0, 1)
+            left_h = (len(todo) - done) / max(rate, 0.01) / 3600
+            line = ("measured %d/%d  (%d unreadable)  ~%.1f h left"
+                    % (done, len(todo), errs, left_h))
+            say(line)
+            status(line + "  [" + time.strftime("%Y-%m-%d %H:%M:%S") + "]")
+        if A.sleep > 0:
+            time.sleep(A.sleep)
+    line = "DONE this run: %d measured, %d unreadable, %d remaining." % (
+        done, errs, len(todo) - done)
+    say(line)
+    status(line + "  [" + time.strftime("%Y-%m-%d %H:%M:%S") + "]")
+    con.close()
+
+
+if __name__ == "__main__":
+    main()

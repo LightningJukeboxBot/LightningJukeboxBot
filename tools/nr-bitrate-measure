@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-bitrate-measure -- what each music FILE really is: codec, lossless or not, real audio bitrate, sample rate,
+bit depth. READ-ONLY on the music. SF (2026-10-14): "build the bitrate measurer and make sure it runs on the server
+and starts scanning our library so we can do this properly" -- "this" = always play the best copy of a song.
+
+WHY. The request fix (nr_bestcopy) guesses quality from size / length. Cover art stored inside a file inflates that
+guess, and it cannot see a 24-bit master or ALAC inside an .m4a. This reads each file's own header (mutagen, the
+library scan_library.py uses): no decoding, a few KB per file, so the whole library takes hours, not weeks.
+
+WRITES ONE THING: /var/lib/jukebox/quality.db (its own sqlite file). Never a music file, never library.db.
+  quality(path PK, size, mtime, codec, lossless, kbps, bitrate_mode, sample_rate, bits, channels, length_s, rc, measured_at)
+  rc 0 = measured; -4 = file missing on disk; -5 = not an audio file mutagen knows; -6 = unreadable (error)
+  size + mtime are library.db's own values: a file is measured again only when its library row changes.
+
+ORDER. The rotation pool first (rotation-full.m3u, ~11k), then every library row in index order (folder by folder).
+THROTTLED. Run it as the service (nice 19, idle I/O) and it gives way to everything; plus --sleep between files.
+PAUSE: touch /var/lib/jukebox/bitscan.stop    RESUME: rm it (next timer tick, or: sudo systemctl start nr-bitscan)
+WATCH: cat /var/lib/jukebox/bitscan.status    REPORT: nr-bitrate-measure --report
+RUN BY HAND (as sf):  .../venv/bin/python3 nr-bitrate-measure            dry run: counts + 12 sample files
+                      .../venv/bin/python3 nr-bitrate-measure --go       measure
+"""
+import argparse
+import os
+import sqlite3
+import sys
+import time
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--go", action="store_true", help="measure (otherwise: dry run, counts + a few samples, writes nothing)")
+ap.add_argument("--report", action="store_true", help="print what quality.db knows so far, then exit")
+ap.add_argument("--limit", type=int, default=0, help="stop after N files this run (0 = no limit)")
+ap.add_argument("--sleep", type=float, default=0.02, help="pause between files, seconds")
+ap.add_argument("--retry-missing", action="store_true", help="measure again rows that were missing (rc -4)")
+ap.add_argument("--library", default="/var/lib/jukebox/library.db")
+ap.add_argument("--pool-file", default="/var/lib/jukebox/rotation-full.m3u")
+ap.add_argument("--db", default="/var/lib/jukebox/quality.db")
+ap.add_argument("--stop", default="/var/lib/jukebox/bitscan.stop")
+ap.add_argument("--status", default="/var/lib/jukebox/bitscan.status")
+A = ap.parse_args()
+
+CHUNK = 5000          # library rows per short read (never a long-held read lock on library.db)
+COMMIT_EVERY = 200    # a kill loses at most this many cheap measurements
+
+
+def say(m):
+    print(m, flush=True)
+
+
+def status(m):
+    try:
+        with open(A.status, "w", encoding="utf-8") as fh:
+            fh.write(m + "  [" + time.strftime("%Y-%m-%d %H:%M:%S") + "]\n")
+    except OSError:
+        pass
+
+
+SCHEMA = """CREATE TABLE IF NOT EXISTS quality(
+    path TEXT PRIMARY KEY, size INT, mtime INT, codec TEXT, lossless INT, kbps REAL, bitrate_mode TEXT,
+    sample_rate INT, bits INT, channels INT, length_s REAL, rc INT, measured_at INT)"""
+
+LOSSLESS_TYPES = {"FLAC", "WAVE", "AIFF", "WavPack", "MonkeysAudio", "TrueAudio", "OptimFROG", "DSF", "DSDIFF"}
+NAMES = {"MP3": "mp3", "EasyMP3": "mp3", "FLAC": "flac", "WAVE": "wav", "AIFF": "aiff", "OggVorbis": "vorbis",
+         "OggOpus": "opus", "OggFLAC": "flac", "OggSpeex": "speex", "OggTheora": "theora", "AAC": "aac", "AC3": "ac3",
+         "ASF": "wma", "WavPack": "wavpack", "MonkeysAudio": "ape", "TrueAudio": "tta", "OptimFROG": "ofr",
+         "Musepack": "musepack", "DSF": "dsf", "DSDIFF": "dff", "SMF": "midi"}
+
+
+def measure(path):
+    """One file -> dict for the quality row. Reads the header only; never writes."""
+    from mutagen import File as MFile
+    if not os.path.isfile(path):
+        return {"rc": -4}
+    try:
+        f = MFile(path)
+    except Exception:
+        return {"rc": -6}
+    if f is None or getattr(f, "info", None) is None:
+        return {"rc": -5}
+    info = f.info
+    kind = type(f).__name__
+    codec = NAMES.get(kind, kind.lower())
+    lossless = 1 if (kind in LOSSLESS_TYPES or kind == "OggFLAC") else 0
+    if kind in ("MP4", "EasyMP4"):
+        c = (getattr(info, "codec", "") or "").lower()
+        codec = "alac" if c == "alac" else ("aac" if c.startswith("mp4a") else (c or "mp4"))
+        lossless = 1 if c == "alac" else 0
+    if kind == "ASF":
+        cn = (getattr(info, "codec_name", "") or "")
+        if "lossless" in cn.lower():
+            codec, lossless = "wma-lossless", 1
+    length = float(getattr(info, "length", 0) or 0)
+    bps = int(getattr(info, "bitrate", 0) or 0)
+    if bps <= 0 and length > 0:                     # opus and friends: no header bitrate -> the file's own average
+        try:
+            bps = int(os.path.getsize(path) * 8 / length)
+        except OSError:
+            bps = 0
+    mode = getattr(info, "bitrate_mode", None)      # MP3 only: CBR / VBR / ABR / UNKNOWN
+    mode = str(mode).split(".")[-1] if mode is not None else None
+    return {"rc": 0, "codec": codec, "lossless": lossless, "kbps": round(bps / 1000.0, 1) if bps else None,
+            "bitrate_mode": mode, "sample_rate": int(getattr(info, "sample_rate", 0) or 0) or None,
+            "bits": int(getattr(info, "bits_per_sample", 0) or 0) or None,
+            "channels": int(getattr(info, "channels", 0) or 0) or None, "length_s": round(length, 2) if length else None}
+
+
+def pool_paths():
+    try:
+        with open(A.pool_file, encoding="utf-8", errors="replace") as fh:
+            return [l.rstrip("\n") for l in fh if l.strip()]
+    except OSError:
+        return []
+
+
+def lib_chunks(lib):
+    """(path, size, mtime) for every library row, in short reads ordered by rowid."""
+    last = 0
+    while True:
+        con = sqlite3.connect("file:%s?mode=ro" % lib, uri=True)
+        try:
+            rows = con.execute("SELECT rowid, path, size, mtime FROM tracks WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                               (last, CHUNK)).fetchall()
+        finally:
+            con.close()
+        if not rows:
+            return
+        last = rows[-1][0]
+        yield [(p, s, m) for _, p, s, m in rows]
+
+
+def lib_lookup(lib, paths):
+    """size + mtime from library.db for the pool's paths (pool rows not in the index are skipped)."""
+    out = {}
+    con = sqlite3.connect("file:%s?mode=ro" % lib, uri=True)
+    try:
+        for p in paths:
+            r = con.execute("SELECT size, mtime FROM tracks WHERE path=?", (p,)).fetchone()
+            if r:
+                out[p] = r
+    finally:
+        con.close()
+    return out
+
+
+def report(db):
+    if not os.path.exists(db):
+        say("quality.db does not exist yet -- nothing measured.")
+        return
+    con = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+    pool = set(pool_paths())
+    rows = con.execute("SELECT path, rc, lossless, kbps, codec FROM quality").fetchall()
+    con.close()
+    def bucket(rc, ll, k):
+        if rc != 0: return {-4: "missing on disk", -5: "not audio", -6: "unreadable"}.get(rc, "error")
+        if ll: return "lossless"
+        if not k: return "lossy, rate unknown"
+        for lim, name in ((96, "under 96 kbps"), (128, "96-127 kbps"), (160, "128-159 kbps"), (192, "160-191 kbps"),
+                          (256, "192-255 kbps"), (320, "256-319 kbps")):
+            if k < lim: return name
+        return "320 kbps and up"
+    order = ["lossless", "320 kbps and up", "256-319 kbps", "192-255 kbps", "160-191 kbps", "128-159 kbps", "96-127 kbps",
+             "under 96 kbps", "lossy, rate unknown", "missing on disk", "not audio", "unreadable", "error"]
+    for label, sel in (("ROTATION POOL", [r for r in rows if r[0] in pool]), ("WHOLE LIBRARY (measured so far)", rows)):
+        say("%s: %d files measured" % (label, len(sel)))
+        cnt = {}
+        for p, rc, ll, k, c in sel:
+            b = bucket(rc, ll, k); cnt[b] = cnt.get(b, 0) + 1
+        for b in order:
+            if cnt.get(b): say("  %-22s %8d  %5.1f%%" % (b, cnt[b], 100.0 * cnt[b] / max(len(sel), 1)))
+
+
+def main():
+    if A.report:
+        report(A.db); return
+    try:
+        import mutagen
+    except ImportError:
+        say("STOP: mutagen is missing -- run me with the jukebox venv python."); sys.exit(2)
+    pool = pool_paths()
+    exists = os.path.exists(A.db)
+    con = sqlite3.connect(A.db) if (A.go or exists) else None
+    if con is not None and A.go:
+        con.execute(SCHEMA); con.commit()
+    def known(p):
+        if con is None or not exists and not A.go:
+            return None
+        try:
+            return con.execute("SELECT size, mtime, rc FROM quality WHERE path=?", (p,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+    def needs(p, size, mtime):
+        k = known(p)
+        if k is None: return True
+        if k[2] == -4 and A.retry_missing: return True
+        return (k[0], k[1]) != (size, mtime)
+    say("nr-bitrate-measure  %s  (mutagen %s)" % ("LIVE (--go)" if A.go else "DRY RUN", mutagen.version_string))
+    if not A.go:
+        lc = sqlite3.connect("file:%s?mode=ro" % A.library, uri=True)
+        try:
+            lib_n = lc.execute("SELECT count(*) FROM tracks").fetchone()[0]
+        finally:
+            lc.close()
+        try:
+            have = con.execute("SELECT count(*) FROM quality").fetchone()[0] if con is not None else 0
+        except sqlite3.OperationalError:
+            have = 0
+        if con is not None:
+            con.close()
+        say("  library rows : %d   rotation pool: %d   already in quality.db: %d" % (lib_n, len(pool), have))
+        say("  sample, read-only (the first files of the pool):")
+        for p in pool[:12]:
+            m = measure(p)
+            if m["rc"] == 0:
+                say("    %-6s %s %7s kbps %6s Hz %4s bit  %s" % (m["codec"], "LOSSLESS" if m["lossless"] else "lossy   ",
+                    m["kbps"], m["sample_rate"], m["bits"] or "-", os.path.basename(p)[:60]))
+            else:
+                say("    rc %d  %s" % (m["rc"], os.path.basename(p)[:60]))
+        say("\nDRY RUN. Nothing written. Add --go (the service does).")
+        return
+    if os.path.exists(A.stop):
+        say("STOP file present (%s) -- remove it to measure." % A.stop); status("PAUSED (stop file present)"); return
+    done = errs = skipped = 0
+    t0 = time.time()
+    seen = set()
+    def batches():
+        info = lib_lookup(A.library, pool)
+        yield "pool", [(p, info[p][0], info[p][1]) for p in pool if p in info]
+        for chunk in lib_chunks(A.library):
+            yield "library", chunk
+    halted = False
+    for phase, items in batches():
+        for p, size, mtime in items:
+            if p in seen:
+                continue
+            seen.add(p) if phase == "pool" else None
+            if not needs(p, size, mtime):
+                skipped += 1
+                continue
+            if os.path.exists(A.stop):
+                say("stop file seen -- halting cleanly after %d files." % done); halted = True; break
+            if A.limit and done >= A.limit:
+                say("--limit %d reached." % A.limit); halted = True; break
+            m = measure(p)
+            if m["rc"] != 0:
+                errs += 1
+            con.execute("INSERT OR REPLACE INTO quality VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (p, size, mtime, m.get("codec"), m.get("lossless"), m.get("kbps"), m.get("bitrate_mode"),
+                         m.get("sample_rate"), m.get("bits"), m.get("channels"), m.get("length_s"), m["rc"], int(time.time())))
+            done += 1
+            if done % COMMIT_EVERY == 0:
+                con.commit()
+                rate = done / max(time.time() - t0, 1)
+                line = "%s: measured %d this run (%d not measurable), %d already known  ~%.0f files/min" % (
+                    phase, done, errs, skipped, rate * 60)
+                say(line); status(line)
+            if A.sleep > 0:
+                time.sleep(A.sleep)
+        if halted:
+            break
+    con.commit()
+    total = con.execute("SELECT count(*) FROM quality").fetchone()[0]
+    con.close()
+    line = "%s this run: %d measured (%d not measurable), %d already known; quality.db holds %d files." % (
+        "PAUSED" if halted else "DONE", done, errs, skipped, total)
+    say(line); status(line)
+
+
+if __name__ == "__main__":
+    main()

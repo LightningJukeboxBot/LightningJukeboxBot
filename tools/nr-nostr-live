@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-nostr-live (2026-09-13) -- Noderunners Radio on zap.stream and every other Nostr live app, served from our own box.
+
+SF, 2026-09-13: zap.stream "was costing too much, but now that we self host, we might be able to pull it up again?"
+Research (plan/ZAPSTREAM-NOSTR-LIVE-vs-BUMA-20260913.md): zap.stream is a NIP-53 client. A live stream on Nostr is a
+kind:30311 event whose `streaming` tag names an HLS address on ANY host; 9 of the 10 streams live on the public relays
+that day were served from hosts that are not zap.stream. Paying zap.stream is only for people without a server.
+
+So this program does Route A and nothing else: it keeps ONE kind:30311 event alive under the radio's own key, pointing
+at the station's own Owncast HLS. Listeners connect to our licensed endpoint and count in our slots -- the 2026-08-14
+simulcast memo's "link model", the one configuration the verified Sena/Buma texts leave clean. No audio is ever pushed
+to zap.stream or anyone else; nothing is paid to anyone.
+
+HOW IT WORKS
+  1  Every 30 s it reads Owncast's public /api/status. online -> the event's status is "live"; offline -> "ended".
+  2  It publishes on every change of status, and while live re-publishes every 10 minutes (NIP-53: clients may treat a
+     live event as ended after an hour without an update). The event is ADDRESSABLE (a fixed d tag), so each publish
+     replaces the last; the naddr never changes.
+  3  The summary carries what is on air ("Now playing: Artist -- Title"), cleaned by the announcer's text rules when the
+     announcer is installed beside it; otherwise the summary is just the station line.
+     nr_songpub (2026-10-31, Shosho's tip: "update the 30311 event every time the song changes"): while live, a new song
+     on air is published at the next tick too, so Nostr apps always show the song that plays. At most one song publish
+     per SONG_GAP_S, so a run of skips never floods the relays.
+  4  A publish no relay accepts is retried next tick with the SAME event (same id, relays dedupe), at most 3 times, then
+     the operator hears it once and the next refresh tries afresh.
+  5  DRY unless HOME/stream.LIVE exists: it logs "[dry] would publish" and sends nothing. HOME/stream.OFF idles it.
+     Keys: HOME/nostr.env (the same key the announcer and the jukebox speak with).
+  6  Going live and going off air are each reported once to the operator through the station's admin-notes channel,
+     with the naddr, so the listing can be opened with one tap.
+
+nr-nostr-live               run (the service)          nr-nostr-live --check    settings + what Owncast says, no side effects
+nr-nostr-live --once        one tick                   nr-nostr-live --selftest offline tests with fakes; nothing leaves the box
+"""
+import os, sys, re, json, time, signal, struct, secrets, datetime, urllib.request, urllib.error
+import importlib.machinery, importlib.util
+
+HOME = os.environ.get("NR_NOSTR_HOME", os.path.expanduser("~/.config/nr-nostr"))
+NOSTR_PATH = os.environ.get("NR_NOSTR_PATH", "/usr/local/bin/nr-nostr")
+API = os.environ.get("NR_API_BASE", "http://127.0.0.1:7100").rstrip("/")
+OWNCAST = os.environ.get("NR_OWNCAST_URL", "https://video.noderunnersradio.com").rstrip("/")
+HLS = os.environ.get("NR_HLS_URL", OWNCAST + "/hls/stream.m3u8")
+IMAGE = os.environ.get("NR_STREAM_IMAGE", "https://noderunnersradio.com/assets/avatar.webp")
+SITE = "https://noderunnersradio.com"
+D_TAG = "noderunners-radio"
+KIND = 30311
+TITLE = "Noderunners Radio"
+CONTENT = "Noderunners Radio — the listeners pick the music, paid in sats. Listen and request a song: " + SITE
+HASHTAGS = ("noderunnersradio", "music", "radio", "bitcoin")
+POLL_S = int(os.environ.get("NR_NOSTR_LIVE_POLL_S", "30"))
+REFRESH_S = int(os.environ.get("NR_NOSTR_LIVE_REFRESH_S", "600"))
+SONG_GAP_S = int(os.environ.get("NR_NOSTR_LIVE_SONG_GAP_S", "45"))
+MAX_TRIES = 3
+ALERT_GAP_S = 6 * 3600
+STATE = os.path.join(HOME, "stream-state.json")
+LIVE_FLAG = os.path.join(HOME, "stream.LIVE")
+OFF_FLAG = os.path.join(HOME, "stream.OFF")
+
+nn = None          # the nr-nostr module: keys, signing, bech32, publish, relays
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + "live: " + str(msg), flush=True)
+
+
+def load_nostr():
+    """The nr-nostr program as a module. The announcer's text rules ride along when the announcer is installed."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("nr_nostr", NOSTR_PATH)
+    spec = importlib.util.spec_from_loader("nr_nostr", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    for name in ("keys", "pubkey", "schnorr_sign", "publish", "load_relays", "bech32_encode", "schnorr_verify",
+                 "_polymod", "_hrp_expand", "_convertbits", "_B32"):
+        if not hasattr(mod, name):
+            raise RuntimeError("%s lacks %s" % (NOSTR_PATH, name))
+    try:
+        mod.ann = mod.load_announcer()
+    except Exception as e:
+        mod.ann = None
+        log("announcer text rules not available (%s); the summary carries no track names" % str(e)[:80])
+    return mod
+
+
+# ---------------------------------------------------------------- small helpers
+def http_json(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "nr-nostr-live/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def owncast_status():
+    """(online, starts_unix, viewers). Raises on any failure -- the caller decides what a failure means."""
+    d = http_json(OWNCAST + "/api/status")
+    online = bool(d.get("online"))
+    starts = 0
+    t = d.get("lastConnectTime")
+    if isinstance(t, str) and t:
+        try:
+            starts = int(datetime.datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            starts = 0
+    try:
+        viewers = int(d.get("viewerCount") or 0)
+    except (TypeError, ValueError):
+        viewers = 0
+    return online, starts, viewers
+
+
+def now_playing():
+    """(artist, title) of the track on air, or ("", "")."""
+    try:
+        d = http_json(API + "/api/nowplaying")
+        np_ = (d or {}).get("now_playing") or {}
+        return str(np_.get("artist") or ""), str(np_.get("title") or "")
+    except Exception:
+        return "", ""
+
+
+def notify(text):
+    try:
+        data = json.dumps({"src": "nostr-live", "text": text[:600]}).encode()
+        req = urllib.request.Request(API + "/api/admin/note", data=data,
+                                     headers={"Content-Type": "application/json", "User-Agent": "nr-nostr-live/1"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            r.read()
+        return True
+    except Exception as e:
+        log("could not hand the note to the station API: %s" % e)
+        return False
+
+
+def make_event(seckey, kind, content, tags, created_at):
+    """A signed NIP-01 event of ANY kind. nr-nostr's own make_event only makes kind 1 (its selftest caught that here),
+    so the live event is built and signed with the same primitives, one line different."""
+    import hashlib
+    pk = nn.pubkey(seckey).hex()
+    ser = json.dumps([0, pk, int(created_at), int(kind), tags, content], separators=(",", ":"), ensure_ascii=False)
+    eid = hashlib.sha256(ser.encode("utf-8")).digest()
+    sig = nn.schnorr_sign(eid, seckey, secrets.token_bytes(32))
+    return {"id": eid.hex(), "pubkey": pk, "created_at": int(created_at), "kind": int(kind), "tags": tags,
+            "content": content, "sig": sig.hex()}
+
+
+def bech32_decode_long(s):
+    """nr-nostr's decoder refuses anything over 90 characters (the BIP-173 cap); an naddr is longer. Same maths, no cap."""
+    s = s.lower()
+    pos = s.rfind("1")
+    hrp, data = s[:pos], [nn._B32.find(c) for c in s[pos + 1:]]
+    if -1 in data or nn._polymod(nn._hrp_expand(hrp) + data) != 1:
+        raise ValueError("bad checksum")
+    return hrp, bytes(nn._convertbits(data[:-6], 5, 8, False))
+
+
+def naddr(pk_hex, kind=KIND, d=D_TAG):
+    """NIP-19 naddr for the live event: TLV 0 = d, 2 = author, 3 = kind."""
+    dv = d.encode("utf-8")
+    tlv = bytes([0, len(dv)]) + dv + bytes([2, 32]) + bytes.fromhex(pk_hex) + bytes([3, 4]) + struct.pack(">I", kind)
+    return nn.bech32_encode("naddr", tlv)
+
+
+def clean_text(s, limit):
+    if nn is not None and getattr(nn, "ann", None) is not None:
+        try:
+            return nn.ann.clean(s, limit, tracknum=True)
+        except TypeError:
+            return nn.ann.clean(s, limit)
+    s = "".join(c for c in str(s or "") if c >= " ")
+    return " ".join(s.split())[:limit]
+
+
+# ---------------------------------------------------------------- the event
+def compose(pk_hex, status, starts, ends, viewers, artist, title, relays):
+    summary = "The listeners pick the music, paid in sats."
+    a, t = clean_text(artist, 80), clean_text(title, 120)
+    if status == "live" and (a or t):
+        summary = "Now playing: %s" % ("%s — %s" % (a, t) if a and t else (a or t))
+    tags = [["d", D_TAG], ["title", TITLE], ["summary", summary], ["image", IMAGE], ["streaming", HLS],
+            ["status", status], ["p", pk_hex, "", "Host"], ["r", SITE]]
+    if starts:
+        tags.append(["starts", str(int(starts))])
+    if status == "ended" and ends:
+        tags.append(["ends", str(int(ends))])
+    if status == "live":
+        tags.append(["current_participants", str(int(viewers))])
+    for h in HASHTAGS:
+        tags.append(["t", h])
+    if relays:
+        tags.append(["relays"] + list(relays))
+    return CONTENT, tags
+
+
+# ---------------------------------------------------------------- the service
+class Live:
+    def __init__(self, seckey, relays, live_fn, now_fn=time.time, publisher=None, owncast_fn=owncast_status,
+                 np_fn=now_playing, notifier=notify):
+        self.sk = seckey
+        self.pk = nn.pubkey(seckey).hex()
+        self.relays = relays
+        self.live_fn = live_fn
+        self.now = now_fn
+        self.publisher = publisher or nn.publish
+        self.owncast_fn = owncast_fn
+        self.np_fn = np_fn
+        self.notifier = notifier
+        self.st = {"status": "", "starts": 0, "last_pub": 0, "attempt": None, "alerts": {}, "fails": 0, "song": ""}
+        self.load()
+
+    # ---- state on disk: what must survive a restart so nothing is announced twice
+    def load(self):
+        try:
+            with open(STATE, encoding="utf-8") as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                for k in self.st:
+                    if k in d:
+                        self.st[k] = d[k]
+        except Exception:
+            pass
+
+    def save(self):
+        os.makedirs(HOME, mode=0o700, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.st, fh)
+        os.replace(tmp, STATE)
+
+    def alert(self, kind, text):
+        now = self.now()
+        if now - float(self.st["alerts"].get(kind, 0)) < ALERT_GAP_S:
+            return False
+        self.st["alerts"][kind] = now
+        log("ALERT %s: %s" % (kind, text))
+        self.notifier("Nostr live: " + text)
+        return True
+
+    def naddr(self):
+        return naddr(self.pk)
+
+    # ---- one tick
+    def tick(self):
+        if os.path.exists(OFF_FLAG):
+            return "off"
+        now = self.now()
+        try:
+            online, starts, viewers = self.owncast_fn()
+            self.st["fails"] = 0
+        except Exception as e:
+            self.st["fails"] = int(self.st.get("fails") or 0) + 1
+            if self.st["fails"] == 5:
+                self.alert("owncast", "Owncast's status has not answered 5 times in a row (%s). The live event is left as it is." % str(e)[:80])
+            return "owncast-down"          # a status that cannot be read never flips the event
+        want = "live" if online else "ended"
+        attempt = self.st.get("attempt")
+        if attempt and attempt.get("status") == want:
+            return self.resend(attempt)
+        changed = want != self.st.get("status")
+        artist, title = self.np_fn() if want == "live" else ("", "")
+        song = "%s\x00%s" % (artist, title) if (artist or title) else ""
+        since = now - float(self.st.get("last_pub") or 0)
+        # nr_songpub: a new song on air counts as a reason to publish (an empty answer from the API never does)
+        new_song = want == "live" and song and song != (self.st.get("song") or "") and since >= SONG_GAP_S
+        if not changed and not new_song and (want == "ended" or since < REFRESH_S):
+            return "steady"
+        if changed and want == "live":
+            self.st["starts"] = starts or int(now)
+        content, tags = compose(self.pk, want, self.st.get("starts") or 0, int(now) if want == "ended" else 0,
+                                viewers, artist, title, self.relays)
+        ev = make_event(self.sk, KIND, content, tags, int(now))
+        if not self.live_fn():
+            log("[dry] would publish %s (%s): %s" % (want, self.naddr(), tags[2][1]))
+            self.st.update({"status": want, "last_pub": now, "attempt": None, "song": song})
+            self.save()
+            return "dry-" + want
+        self.st["attempt"] = {"event": ev, "status": want, "tries": 0, "changed": changed, "song": song}
+        return self.resend(self.st["attempt"])
+
+    def resend(self, attempt):
+        """Publish the attempt's event; on refusal keep the SAME event for the next tick, up to MAX_TRIES."""
+        ev, want = attempt["event"], attempt["status"]
+        res = self.publisher(ev, self.relays)
+        ok = [u for u, good, _m in res if good]
+        now = self.now()
+        if ok:
+            was = self.st.get("status")
+            self.st.update({"status": want, "last_pub": now, "attempt": None, "song": attempt.get("song") or ""})
+            self.save()
+            log("published %s %s to %d/%d relays: %s" % (want, ev["id"][:12], len(ok), len(res), self.naddr()))
+            if attempt.get("changed") or was != want:
+                if want == "live":
+                    self.notifier("Nostr live: the station is listed as LIVE on zap.stream and every Nostr live app, from our own stream. nostr:%s" % self.naddr())
+                else:
+                    self.notifier("Nostr live: the station is listed as ended (Owncast went offline). nostr:%s" % self.naddr())
+            return "published-" + want
+        attempt["tries"] = int(attempt.get("tries") or 0) + 1
+        detail = "; ".join("%s: %s" % (u.replace("wss://", ""), m) for u, _g, m in res)[:200]
+        if attempt["tries"] >= MAX_TRIES:
+            self.st["attempt"] = None
+            self.st["last_pub"] = now            # so the next try is a fresh event at the next refresh, not a hot loop
+            self.save()
+            self.alert("relays", "no relay accepted the live event after %d tries (%s). Trying again at the next refresh." % (MAX_TRIES, detail))
+            return "gave-up"
+        self.save()
+        log("no relay accepted (try %d of %d): %s" % (attempt["tries"], MAX_TRIES, detail))
+        return "retry"
+
+
+def live_mode():
+    return os.path.exists(LIVE_FLAG) and not os.path.exists(OFF_FLAG)
+
+
+_stop = False
+
+
+def _on_term(signum, frame):
+    global _stop
+    _stop = True
+
+
+def main():
+    global nn
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    try:
+        nn = load_nostr()
+    except Exception as e:
+        log("STOP: cannot load %s: %s" % (NOSTR_PATH, e))
+        return 3
+    sk = nn.keys()
+    if args == ["--check"]:
+        relays = nn.load_relays()
+        print("home: %s\nkey: %s\nLIVE: %s  OFF: %s\nrelays: %s\nowncast: %s\nhls: %s\nimage: %s\nrefresh: every %d s while live, poll %d s" % (
+            HOME, ("present -> " + nn.bech32_encode("npub", nn.pubkey(sk))) if sk else "MISSING", os.path.exists(LIVE_FLAG), os.path.exists(OFF_FLAG),
+            ", ".join(relays), OWNCAST, HLS, IMAGE, REFRESH_S, POLL_S))
+        if sk:
+            print("naddr: %s" % naddr(nn.pubkey(sk).hex()))
+        try:
+            online, starts, viewers = owncast_status()
+            print("owncast says: %s, %d viewer(s), connected since %s" % ("ONLINE" if online else "offline", viewers,
+                  time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(starts)) if starts else "?"))
+        except Exception as e:
+            print("owncast did not answer: %s" % e)
+        try:
+            with open(STATE, encoding="utf-8") as fh:
+                st = json.load(fh)
+            print("state: status=%s last publish=%s" % (st.get("status") or "(never)", time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(float(st.get("last_pub") or 0))) if st.get("last_pub") else "never"))
+        except Exception:
+            print("state: (none yet)")
+        return 0
+    if args not in ([], ["--once"]):
+        print(__doc__)
+        return 64
+    if not sk:
+        log("STOP: no key (HOME/nostr.env); run nr-nostr-keys.py first")
+        return 2
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    try:
+        import fcntl
+        lk = open(os.path.join(HOME, ".live.lock"), "w")
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        globals()["_LOCK"] = lk
+    except ImportError:
+        pass
+    except OSError:
+        log("STOP: another nr-nostr-live is running (the service?).")
+        return 65
+    svc = Live(sk, nn.load_relays(), live_mode)
+    log("keeping the live event %s -- %s; owncast %s; hls %s" % (
+        svc.naddr(), "LIVE (publishing)" if live_mode() else "DRY (logging only; touch %s to publish)" % LIVE_FLAG, OWNCAST, HLS))
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    if args == ["--once"]:
+        print(svc.tick())
+        return 0
+    while not _stop:
+        try:
+            r = svc.tick()
+            if r not in ("steady", "off"):
+                log(r)
+        except Exception as e:
+            log("tick error: %s" % e)
+        for _ in range(POLL_S):
+            if _stop:
+                break
+            time.sleep(1)
+    try:
+        svc.save()
+    except Exception:
+        pass
+    log("stopping (signal); state saved")
+    return 0
+
+
+# ---------------------------------------------------------------- self-test: fakes only, nothing leaves the box
+def selftest():
+    global nn, HOME, STATE, LIVE_FLAG, OFF_FLAG
+    import tempfile, shutil, atexit
+    d = tempfile.mkdtemp(prefix="nr-nostr-live-test-")
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    HOME = d
+    STATE = os.path.join(d, "stream-state.json")
+    LIVE_FLAG = os.path.join(d, "stream.LIVE")
+    OFF_FLAG = os.path.join(d, "stream.OFF")
+    nn = load_nostr()
+    fails = []
+
+    def check(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    sk = secrets.token_bytes(32)
+    pk = nn.pubkey(sk).hex()
+    posted, notes = [], []
+    box = {"online": True, "starts": 1_800_000_000, "viewers": 3, "fail": False}
+    np_ = {"artist": "Dire Straits", "title": "01. Sultans Of Swing"}
+    clock = {"t": 1_800_000_100.0}
+    refuse = {"on": False}
+
+    def fake_publish(ev, relays):
+        if refuse["on"]:
+            return [(u, False, "nope") for u in relays]
+        posted.append(ev)
+        return [(u, True, "") for u in relays]
+
+    def fake_owncast():
+        if box["fail"]:
+            raise OSError("owncast down")
+        return box["online"], box["starts"], box["viewers"]
+
+    live = {"on": False}
+    svc = Live(sk, ["wss://one.example", "wss://two.example"], lambda: live["on"], now_fn=lambda: clock["t"],
+               publisher=fake_publish, owncast_fn=fake_owncast, np_fn=lambda: (np_["artist"], np_["title"]),
+               notifier=lambda t: notes.append(t))
+    # 1 dry
+    r = svc.tick()
+    check("dry: composed and logged, nothing published, state remembers", r == "dry-live" and not posted and svc.st["status"] == "live")
+    # 2 live: one publish with the right shape
+    live["on"] = True
+    svc.st["status"] = ""          # as if it had never been published
+    r = svc.tick()
+    ev = posted[-1] if posted else {}
+    tags = {t[0]: t for t in ev.get("tags", [])}
+    check("live: one kind-30311 event", r == "published-live" and len(posted) == 1 and ev.get("kind") == KIND)
+    check("live: addressable d tag, our HLS, status live, host = our key",
+          tags.get("d", [None, ""])[1] == D_TAG and tags.get("streaming", [None, ""])[1] == HLS and tags.get("status", [None, ""])[1] == "live"
+          and tags.get("p", [None, ""])[1] == pk and tags["p"][3] == "Host")
+    check("live: starts = Owncast's connect time, viewers carried", tags.get("starts", [None, ""])[1] == str(box["starts"]) and tags.get("current_participants", [None, ""])[1] == "3")
+    check("live: the summary names what is on air, track number stripped", tags.get("summary", [None, ""])[1] == "Now playing: Dire Straits — Sultans Of Swing")
+    check("live: relays tag lists both relays", tags.get("relays", [])[1:] == ["wss://one.example", "wss://two.example"])
+    check("live: signed by our key", nn.schnorr_verify(bytes.fromhex(ev["id"]), bytes.fromhex(ev["pubkey"]), bytes.fromhex(ev["sig"])) and ev["pubkey"] == pk)
+    check("live: the operator hears it once, with the naddr", len(notes) == 1 and "LIVE" in notes[0] and "naddr1" in notes[0])
+    # 3 steady, then refresh
+    clock["t"] += 60
+    check("steady: no republish within the refresh window", svc.tick() == "steady" and len(posted) == 1)
+    clock["t"] += REFRESH_S
+    np_["title"] = "Telegraph Road"
+    r = svc.tick()
+    t2 = {t[0]: t for t in posted[-1]["tags"]}
+    check("refresh: republished after the window, same d, newer created_at, new track", r == "published-live" and len(posted) == 2
+          and t2["d"][1] == D_TAG and posted[-1]["created_at"] > posted[-2]["created_at"] and "Telegraph Road" in t2["summary"][1])
+    check("refresh: no second 'went live' note", len(notes) == 1)
+    # 3b nr_songpub: a new song inside the refresh window is published at once; a burst of skips is held back
+    clock["t"] += SONG_GAP_S
+    np_["title"] = "Brothers In Arms"
+    n0 = len(posted)
+    r = svc.tick()
+    t2b = {t[0]: t for t in posted[-1]["tags"]}
+    check("song change: published inside the refresh window, new song in the summary",
+          r == "published-live" and len(posted) == n0 + 1 and "Brothers In Arms" in t2b["summary"][1])
+    clock["t"] += 10
+    np_["title"] = "Walk Of Life"
+    check("song change: a skip within SONG_GAP_S waits", svc.tick() == "steady" and len(posted) == n0 + 1)
+    clock["t"] += SONG_GAP_S
+    r = svc.tick()
+    check("song change: after the gap the newest song goes out", r == "published-live" and "Walk Of Life" in posted[-1]["tags"][2][1])
+    clock["t"] += SONG_GAP_S
+    check("song change: the same song is not published twice", svc.tick() == "steady")
+    saved_np = dict(np_)
+    np_["artist"], np_["title"] = "", ""
+    clock["t"] += SONG_GAP_S
+    check("song change: an empty now-playing answer publishes nothing", svc.tick() == "steady")
+    np_.update(saved_np)
+    check("song change: no extra 'went live' note", len(notes) == 1)
+    # 4 offline -> one ended event, then silence
+    box["online"] = False
+    clock["t"] += 30
+    r = svc.tick()
+    t3 = {t[0]: t for t in posted[-1]["tags"]}
+    check("offline: one ended event with an end time", r == "published-ended" and t3["status"][1] == "ended" and t3["ends"][1] == str(int(clock["t"])))
+    check("offline: the operator hears it", len(notes) == 2 and "ended" in notes[1])
+    clock["t"] += REFRESH_S + 60
+    n_off = len(posted)
+    check("offline: nothing more while it stays off", svc.tick() == "steady" and len(posted) == n_off)
+    # 5 back online -> live again with a new start
+    box["online"], box["starts"] = True, 1_800_009_000
+    clock["t"] += 30
+    r = svc.tick()
+    t4 = {t[0]: t for t in posted[-1]["tags"]}
+    check("back online: live again with the new start time", r == "published-live" and t4["status"][1] == "live" and t4["starts"][1] == "1800009000" and len(notes) == 3)
+    # 6 refusals: same event id retried, then give up once
+    refuse["on"] = True
+    clock["t"] += REFRESH_S
+    ids = []
+    rs = []
+    for _ in range(3):
+        rs.append(svc.tick())
+        ids.append(svc.st["attempt"]["event"]["id"] if svc.st.get("attempt") else None)
+        clock["t"] += 30
+    check("refused: retried with the SAME event id, then given up", rs == ["retry", "retry", "gave-up"] and ids[0] == ids[1] and ids[2] is None)
+    check("refused: the operator hears it once", sum(1 for n in notes if "no relay" in n) == 1)
+    clock["t"] += 30
+    check("refused: and not again within 6 h", svc.tick() == "steady" and sum(1 for n in notes if "no relay" in n) == 1)
+    refuse["on"] = False
+    # 7 owncast unreachable while live: nothing flips
+    n_posted = len(posted)
+    box["fail"] = True
+    clock["t"] += REFRESH_S
+    check("owncast down: no flip, no publish", svc.tick() == "owncast-down" and len(posted) == n_posted and svc.st["status"] == "live")
+    box["fail"] = False
+    # 8 OFF idles
+    open(OFF_FLAG, "w").close()
+    check("OFF file idles", svc.tick() == "off")
+    os.remove(OFF_FLAG)
+    # 9 state round trip: a restart does not announce again
+    svc.save()
+    svc2 = Live(sk, ["wss://one.example"], lambda: True, now_fn=lambda: clock["t"], publisher=fake_publish,
+                owncast_fn=fake_owncast, np_fn=lambda: ("", ""), notifier=lambda t: notes.append(t))
+    n_notes = len(notes)
+    clock["t"] += 30
+    r = svc2.tick()
+    check("restart: state survives, a steady stream is not announced again", svc2.st["status"] == "live" and r in ("steady", "published-live") and len(notes) == n_notes)
+    # 10 naddr round trip
+    na = svc.naddr()
+    hrp, raw = bech32_decode_long(na)
+    kind_ok = raw[-4:] == struct.pack(">I", KIND) and raw[-6:-4] == bytes([3, 4])
+    check("naddr: encodes our key, the d tag and kind 30311 (and is longer than nr-nostr's 90-char decoder allows)",
+          hrp == "naddr" and bytes.fromhex(pk) in raw and D_TAG.encode() in raw and kind_ok and len(na) > 90)
+    # 11 no announcer rules: a plain summary, no crash
+    saved = nn.ann
+    nn.ann = None
+    c, t = compose(pk, "live", 1, 0, 0, "A\x00B", "T", [])
+    nn.ann = saved
+    check("without the announcer's rules the summary is still clean", {x[0]: x for x in t}["summary"][1] == "Now playing: AB — T")
+    print("\nSELFTEST %s (%d failed)" % ("PASSED" if not fails else "FAILED", len(fails)))
+    return 0 if not fails else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

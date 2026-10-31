@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+nr-radio (2026-09-09) -- the station's own voice on Nostr, speaking as Noderunners Radio (NR-FM).
+
+SF, 2026-09-09: news plus a daily digest. This account is NOT the jukebox bot. The bot already posts every
+paid request as it goes on air, so this one never repeats that. It says two kinds of thing and nothing else:
+
+  1  ONE DIGEST A DAY. At NR_RADIO_DIGEST_HOUR (UTC, default 17) it reads the play log for the last 24 hours
+     and posts a short round-up: how many songs aired, how many were PAID REQUESTS, and a handful of names.
+     Jingles are never counted or named. Gifts are counted but never named and never called paid. Every
+     artist and title goes through the announcer's own cleaner and blocklist, like the X and Nostr announcers.
+  2  NEWS, WHEN THERE IS NEWS. SF writes a line into HOME/news.txt and it goes out once, in order, at most
+     NR_RADIO_NEWS_PER_RUN attempts a run. The file is never edited by this program: it only remembers what
+     it has sent.
+
+        echo "The jingles are on the air, one an hour. Thanks Truuus." >> ~/.config/nr-radio/news.txt
+
+     A line is remembered by the sha of its own text, so EDITING a line that already went out makes it a new
+     line and it goes out again. To correct something, write a new line saying so; the old note is already on
+     other people's relays and deleting the text here cannot reach it.
+
+Anything else -- what is on air right now, who requested what -- belongs to the jukebox bot or to nobody.
+
+WHAT COUNTS AS PAID is an allow-list on purpose (review finding, 2026-09-09): only the two lanes that really
+take sats, "local" and "wavlake". The captain's mood queue, gifts, the rotation and any lane invented later
+are NOT paid, and a wrong number here would be a false public claim about listeners' money.
+
+DRY unless HOME/LIVE exists: it decides, logs "[dry] would post: ...", and nothing leaves the box. HOME/OFF
+idles it completely. The key is the RADIO's own nsec in HOME/nostr.env, written by nr-radio-keys.py with a
+masked prompt; it is never printed, never logged and never leaves the ship. The program refuses to post with
+any key that is not the radio's, so a mixed-up env file makes it silent instead of making it lie.
+
+  nr-radio            one tick (what the timer runs)
+  nr-radio --check    what it would do right now; changes nothing
+  nr-radio --digest   compose today's digest and print it; posts nothing, changes nothing
+  nr-radio --selftest offline tests; no network, no key, nothing outside a temp folder
+"""
+import os, sys, json, time, hashlib, tempfile, calendar, importlib.machinery, importlib.util
+
+HOME = os.environ.get("NR_RADIO_HOME", os.path.expanduser("~/.config/nr-radio"))
+NOSTR_PATH = os.environ.get("NR_NOSTR_PATH", "/usr/local/bin/nr-nostr")
+PLAYLOG = os.environ.get("NR_PLAYLOG", "/var/log/liquidsoap/playlog.tsv")
+NEWS = os.path.join(HOME, "news.txt")
+STATE = os.path.join(HOME, "state.json")
+LIVE = os.path.join(HOME, "LIVE")
+OFF = os.path.join(HOME, "OFF")
+SITE = "https://noderunnersradio.com"
+EXPECT_NPUB = "npub1ua6fxn9ktc4jncanf79jzvklgjftcdrt5etverwzzg0lgpmg3hsq2gh6v6"   # Noderunners Radio (NR-FM)
+DIGEST_HOUR = int(os.environ.get("NR_RADIO_DIGEST_HOUR", "17"))
+NEWS_PER_RUN = int(os.environ.get("NR_RADIO_NEWS_PER_RUN", "2"))
+HIGHLIGHTS = int(os.environ.get("NR_RADIO_HIGHLIGHTS", "5"))
+MAX_PER_HOUR = int(os.environ.get("NR_RADIO_MAX_PER_HOUR", "10"))
+NEWS_TRIES = 3                          # a relay outage must not eat a line; the same event id is re-sent
+NEWS_MAX = 800
+PAID_SOURCES = ("local", "wavlake")     # the ONLY two lanes that take sats. An allow-list, never a deny-list.
+GIFT_SOURCES = ("gift",)                # aired, counted, never called paid and never named (as the announcers do)
+EXCLUDED_RIGHTS = ("station",)          # our own jingles: never counted, never named
+
+nn = None
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + "nr-radio: " + str(msg), flush=True)
+
+
+def load_nostr():
+    """nr-nostr, pointed at THIS program's home so it finds the radio's key and relay list, not the bot's."""
+    os.environ["NR_NOSTR_HOME"] = HOME
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("nr_nostr", NOSTR_PATH)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("nr_nostr", loader))
+    loader.exec_module(mod)
+    for name in ("keys", "pubkey", "make_event", "publish", "load_relays", "load_announcer", "bech32_encode"):
+        if not hasattr(mod, name):
+            raise RuntimeError("%s lacks %s" % (NOSTR_PATH, name))
+    mod.ann = mod.load_announcer()
+    return mod
+
+
+def our_npub(sk):
+    return nn.bech32_encode("npub", nn.pubkey(sk))
+
+
+# ---------------------------------------------------------------- state
+def load_state():
+    """{"last_digest": day, "news": {id: {"tries": n, "at": created_at, "done": bool}}, "stamps": [...]}.
+    A state file written by the first version kept "news" as a plain list of ids; those are read as done."""
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        st = {}
+    news = st.get("news") or {}
+    if isinstance(news, list):
+        news = {str(i): {"tries": NEWS_TRIES, "at": 0, "done": True} for i in news}
+    clean = {}
+    for k, v in news.items():
+        if isinstance(v, dict):
+            clean[str(k)] = {"tries": int(v.get("tries") or 0), "at": int(v.get("at") or 0),
+                             "done": bool(v.get("done"))}
+    return {"last_digest": str(st.get("last_digest") or ""), "news": clean,
+            "stamps": [float(t) for t in (st.get("stamps") or [])], "posts": int(st.get("posts") or 0)}
+
+
+def save_state(st):
+    fd, tmp = tempfile.mkstemp(prefix="state.json.", suffix=".new", dir=os.path.dirname(STATE) or ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, STATE)
+
+
+def remember(st):
+    try:
+        save_state(st)
+        return True
+    except Exception as e:
+        log("could not write %s (%s); posting nothing, because a post nobody remembers is a post that repeats"
+            % (STATE, str(e)[:80]))
+        return False
+
+
+# ---------------------------------------------------------------- the play log
+def read_plays(since, until, path=None):
+    """Every real music play in the window, as (ts, source, rights, artist, title), or None when the log
+    could not be read at all. None is NOT an empty day: the caller must not mistake one for the other."""
+    out = []
+    try:
+        fh = open(path or PLAYLOG, "rb")
+    except OSError as e:
+        log("cannot read the play log: %s" % e)
+        return None
+    try:
+        with fh:
+            for bline in fh:
+                p = bline.replace(b"\x00", b"").decode("utf-8", "replace").rstrip("\n").split("\t")
+                if len(p) < 6 or p[1] != "play":
+                    continue
+                if not (since <= p[0] < until):
+                    continue
+                if p[3] in EXCLUDED_RIGHTS:
+                    continue
+                artist, title = p[4].strip(), p[5].strip()
+                if not artist and not title:
+                    continue
+                out.append((p[0], p[2], p[3], artist, title))
+    except OSError as e:
+        log("the play log went away while reading it: %s" % e)
+        return None
+    return out
+
+
+def digest_text(rows, blocklist):
+    """The day's round-up, or None when there is nothing worth saying."""
+    if len(rows) < 5:
+        return None
+    # PAID is an allow-list: only the two lanes that take sats. Mood picks, gifts, the rotation and anything
+    # added later are not paid, because a wrong number here is a false public claim about listeners' money.
+    paid = [r for r in rows if r[1] in PAID_SOURCES]
+    v4v = [r for r in paid if r[2] == "v4v" and r[1] == "wavlake"]
+    gifts = {id(r) for r in rows if r[1] in GIFT_SOURCES}
+    named, seen = [], set()
+    # the songs listeners actually paid for come first, newest first, then the rest of the day.
+    # A gift is never named: the announcers refuse them on purpose and so does this.
+    for r in list(reversed(paid)) + list(reversed(rows)):
+        if id(r) in gifts:
+            continue
+        a = nn.ann.clean(r[3], 60, tracknum=True)
+        t = nn.ann.clean(r[4], 80, tracknum=True)
+        if t.casefold() == "unknown track":
+            t = ""
+        if not a and not t:
+            continue
+        line = "%s - %s" % (a, t) if a and t else (a or t)
+        key = line.casefold()
+        if key in seen or nn.ann.blocked(line, blocklist):
+            continue
+        seen.add(key)
+        named.append(line)
+        if len(named) >= HIGHLIGHTS:
+            break
+    if not named:
+        return None
+    head = "Today on Noderunners Radio: %d songs" % len(rows)
+    if paid:
+        head += ", %d of them asked for and paid for by listeners" % len(paid)
+    if v4v:
+        head += " (%d straight to the artist)" % len(v4v)
+    body = "\n".join("- " + n for n in named)
+    return "%s.\n\n%s\n\nThe crowd is the DJ. Listen and pick a song: %s" % (head, body, SITE)
+
+
+# ---------------------------------------------------------------- news
+def news_lines():
+    """Every line SF has written, in order, with the id used to remember it. The file is never edited here."""
+    out = []
+    try:
+        with open(NEWS, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                out.append((hashlib.sha256(line.encode("utf-8")).hexdigest()[:16], line[:NEWS_MAX]))
+    except OSError:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------- posting
+def post(text, kind, dry, relays, sk, created_at=None):
+    """Sign and send one note. Returns True when it really went out (or would have, in DRY). created_at is
+    pinned on a retry so the event id is identical and the relays dedupe it instead of showing it twice."""
+    if dry:
+        log("[dry] would post (%s): %s" % (kind, text.replace("\n", " / ")[:200]))
+        return True
+    ev = nn.make_event(sk, text, [["t", "noderunnersradio"], ["r", SITE]], created_at=created_at)
+    res = nn.publish(ev, relays)
+    ok = [u for u, good, _m in res if good]
+    if not ok:
+        log("%s NOT posted: %s" % (kind, "; ".join("%s: %s" % (u, m) for u, _g, m in res)[:300]))
+        return False
+    if len(ok) < len(res):
+        log("%s posted to %d/%d relays; refused by: %s"
+            % (kind, len(ok), len(res), ", ".join("%s (%s)" % (u, m[:40]) for u, g, m in res if not g)))
+    else:
+        log("%s posted to all %d relays" % (kind, len(res)))
+    return True
+
+
+def tick(now=None, dry=None, relays=None, sk=None, poster=post):
+    now = time.time() if now is None else now
+    dry = (not os.path.exists(LIVE)) if dry is None else dry
+    if os.path.exists(OFF):
+        return "off"
+    st = load_state()
+    st["stamps"] = [t for t in st["stamps"] if now - t < 3600]
+    blocklist = nn.ann.load_blocklist()
+    did = []
+
+    def budget_left():
+        return MAX_PER_HOUR - len(st["stamps"])
+
+    def sent_one():
+        st["stamps"].append(now)
+        st["posts"] += 1
+
+    # --- news first: it is the thing SF actually typed, so it must not wait behind a digest
+    lines = news_lines()
+    ids = {i for i, _l in lines}
+    for gone in [k for k in st["news"] if k not in ids]:
+        st["news"].pop(gone)            # bounded by the file, so an old id can never fall out and come back
+    attempts = 0
+    for nid, line in lines:
+        rec = st["news"].get(nid) or {"tries": 0, "at": 0, "done": False}
+        if rec["done"] or rec["tries"] >= NEWS_TRIES:
+            continue
+        if attempts >= NEWS_PER_RUN:
+            did.append("news-waiting")
+            break
+        if budget_left() <= 0:
+            did.append("hour-full")
+            break
+        if nn.ann.blocked(line, blocklist):
+            log("a news line was withheld by the blocklist and will never be retried: %s" % line[:80])
+            st["news"][nid] = {"tries": NEWS_TRIES, "at": 0, "done": True}
+            if not remember(st):
+                return "state-failed"
+            continue
+        # counted as an ATTEMPT, not as a success: a relay outage must not walk the whole backlog in one run
+        attempts += 1
+        rec["tries"] += 1
+        rec["at"] = rec["at"] or int(now)     # pinned, so a retry is the same event id and relays dedupe it
+        st["news"][nid] = rec
+        if not remember(st):
+            return "state-failed"
+        if poster(line, "news", dry, relays, sk, rec["at"]):
+            rec["done"] = True
+            sent_one()
+            remember(st)
+            did.append("news")
+        else:
+            left = NEWS_TRIES - rec["tries"]
+            log("news line not posted; %s" % ("%d more try(s) on later ticks" % left if left > 0 else "giving up on it"))
+            did.append("news-failed")
+
+    # --- then the digest, once a day, at its hour
+    tm = time.gmtime(now)
+    day = time.strftime("%Y-%m-%d", tm)
+    if st["last_digest"] != day and tm.tm_hour >= DIGEST_HOUR:
+        if budget_left() <= 0:
+            did.append("hour-full")
+        else:
+            rows = read_plays(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 86400)),
+                              time.strftime("%Y-%m-%dT%H:%M:%S", tm))
+            if rows is None:
+                # the log could not be read. That is NOT a quiet day, so the day is not marked done and the
+                # next tick tries again -- twenty minutes later, at the cost of one wasted read.
+                did.append("log-unreadable")
+            else:
+                text = digest_text(rows, blocklist)
+                st["last_digest"] = day     # remembered first: a repeat is worse than a miss
+                if not remember(st):
+                    return "state-failed"
+                if text is None:
+                    log("no digest today: only %d songs in the window" % len(rows))
+                    did.append("digest-skipped")
+                elif poster(text, "digest", dry, relays, sk, None):
+                    sent_one()
+                    remember(st)
+                    did.append("digest")
+                else:
+                    did.append("digest-failed")
+    return "+".join(did) if did else "nothing-to-say"
+
+
+def check():
+    st = load_state()
+    sk = nn.keys()
+    lines = news_lines()
+    waiting = [l for i, l in lines if not (st["news"].get(i) or {}).get("done")]
+    print("home: %s" % HOME)
+    if sk:
+        n = our_npub(sk)
+        print("key: present -> %s" % n)
+        print("     %s" % ("this IS the radio account" if n == EXPECT_NPUB else "WRONG ACCOUNT -- it will refuse to post"))
+    else:
+        print("key: MISSING (run nr-radio-keys.py)")
+    print("mode: %s" % ("LIVE (posts for real)" if os.path.exists(LIVE) else "DRY (nothing leaves the box; touch %s to go live)" % LIVE))
+    print("paused: %s" % ("yes -- %s exists" % OFF if os.path.exists(OFF) else "no"))
+    print("relays: %s" % ", ".join(nn.load_relays()))
+    print("digest: hour %02d:00 UTC; last one %s; posts made in all: %d"
+          % (DIGEST_HOUR, st["last_digest"] or "never", st["posts"]))
+    print("news file: %s (%d line(s), %d still to go out)" % (NEWS, len(lines), len(waiting)))
+    print("  note: a line is remembered by its exact text, so editing one that already went out sends it again")
+    for l in waiting[:3]:
+        print("    waiting: %s" % l[:100])
+    now = time.time()
+    rows = read_plays(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 86400)),
+                      time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)))
+    if rows is None:
+        print("play log: COULD NOT BE READ (%s)" % PLAYLOG)
+    else:
+        print("play log: %d songs in the last 24 h (%d paid, station IDs excluded)"
+              % (len(rows), len([r for r in rows if r[1] in PAID_SOURCES])))
+    return 0
+
+
+def show_digest():
+    now = time.time()
+    rows = read_plays(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 86400)),
+                      time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)))
+    if rows is None:
+        print("(the play log could not be read)")
+        return 1
+    text = digest_text(rows, nn.ann.load_blocklist())
+    print(text if text else "(nothing worth saying: only %d songs in the window)" % len(rows))
+    return 0
+
+
+# ---------------------------------------------------------------- offline tests
+def selftest():
+    global HOME, NEWS, STATE, LIVE, OFF, nn, DIGEST_HOUR, PLAYLOG, MAX_PER_HOUR
+    d = tempfile.mkdtemp(prefix="nr-radio-test-")
+    HOME, NEWS, STATE = d, os.path.join(d, "news.txt"), os.path.join(d, "state.json")
+    LIVE, OFF = os.path.join(d, "LIVE"), os.path.join(d, "OFF")
+    DIGEST_HOUR, MAX_PER_HOUR = 17, 10
+    nn = load_nostr()
+    fails = []
+
+    def check_(name, cond):
+        print(("ok   " if cond else "FAIL ") + name)
+        if not cond:
+            fails.append(name)
+
+    posted = []
+
+    def poster(text, kind, dry, relays, sk, created_at=None):
+        posted.append((kind, text, created_at))
+        return True
+
+    def failing(text, kind, dry, relays, sk, created_at=None):
+        posted.append((kind, text, created_at))
+        return False
+
+    plog = os.path.join(d, "playlog.tsv")
+    base = "2026-09-09T"
+
+    def row(h, m, src, rights, a, t):
+        return "%s%02d:%02d:00+00:00\tplay\t%s\t%s\t%s\t%s\n" % (base, h, m, src, rights, a, t)
+    with open(plog, "w", encoding="utf-8") as fh:
+        for i in range(14):
+            fh.write(row(10, i, "rotation", "collecting_society", "Rot Artist %d" % i, "Rot Song %d" % i))
+        for i in range(8):
+            fh.write(row(11, i, "mood", "collecting_society", "Mood Artist %d" % i, "Mood Song %d" % i))
+        fh.write(row(12, 0, "local", "collecting_society", "Paid Artist", "Paid Song"))
+        fh.write(row(12, 1, "wavlake", "v4v", "V4V Artist", "V4V Song"))
+        fh.write(row(12, 2, "gift", "collecting_society", "Gift Artist", "Gift Song"))
+        fh.write(row(12, 3, "playlist", "unknown", "Untagged Artist", "Untagged Song"))
+        fh.write(row(12, 4, "jingle", "station", "Truuus's", "NRFM Jingle 4"))
+        fh.write(row(12, 5, "rotation", "collecting_society", "kanker", "badword"))
+        fh.write(row(12, 6, "rotation", "collecting_society", "", ""))
+    PLAYLOG = plog
+    rows = read_plays(base + "00:00:00", base + "23:59:59")
+    check_("station IDs and nameless rows are left out of the day", len(rows) == 27
+           and not any(r[2] == "station" for r in rows))
+    bl = nn.ann.load_blocklist()
+    text = digest_text(rows, bl)
+    check_("ONLY the two paid lanes count as paid (mood, gift and untagged do not)",
+           "27 songs, 2 of them asked for and paid for by listeners" in text)
+    check_("only a wavlake v4v row counts as going to the artist", "(1 straight to the artist)" in text)
+    first_two = text.split("\n\n")[1].split("\n")[:2]
+    check_("the paid songs are named first",
+           sorted(first_two) == ["- Paid Artist - Paid Song", "- V4V Artist - V4V Song"])
+    check_("a gift is never named", "Gift Artist" not in text)
+    check_("a blocklisted name never reaches the digest", "kanker" not in text)
+    check_("the digest carries the site link", SITE in text)
+    check_("a quiet day says nothing at all", digest_text(rows[:3], bl) is None)
+    check_("an unreadable play log is not an empty day", read_plays("a", "b", path=os.path.join(d, "nope")) is None)
+
+    open(NEWS, "w", encoding="utf-8").write("# a comment, never posted\n\nFirst item.\nSecond item.\nThird item.\n")
+    at17 = calendar.timegm((2026, 9, 9, 17, 5, 0, 0, 0, 0))
+    r = tick(at17, dry=True, relays=[], sk=None, poster=poster)
+    kinds = [k for k, _t, _a in posted]
+    check_("one tick posts the news first, at most two, then the digest",
+           kinds[:2] == ["news", "news"] and "digest" in kinds and "news-waiting" in r)
+    check_("comments and blank lines are never posted", not any("a comment" in t for _k, t, _a in posted))
+    n0 = len(posted)
+    tick(at17 + 60, dry=True, relays=[], sk=None, poster=poster)
+    check_("the same news is never posted twice, and the digest is once a day",
+           [k for k, _t, _a in posted[n0:]] == ["news"] and len(posted) == n0 + 1)
+
+    # a relay outage must not burn the whole backlog in one tick, and must be retried
+    open(NEWS, "a", encoding="utf-8").write("Fourth.\nFifth.\nSixth.\nSeventh.\n")
+    n1 = len(posted)
+    tick(at17 + 120, dry=True, relays=[], sk=None, poster=failing)
+    check_("a total outage attempts at most NEWS_PER_RUN lines, not the whole backlog", len(posted) == n1 + NEWS_PER_RUN)
+    st = load_state()
+    check_("each attempt is counted, and none is marked done",
+           all(st["news"][i]["tries"] == 1 and not st["news"][i]["done"] for i, _l in news_lines()[3:5]))
+    n2 = len(posted)
+    tick(at17 + 180, dry=True, relays=[], sk=None, poster=poster)
+    check_("the next tick retries the SAME lines and they go out",
+           [t for _k, t, _a in posted[n2:]] == ["Fourth.", "Fifth."])
+    check_("a retry keeps the original created_at, so relays dedupe it",
+           posted[n2][2] == load_state()["news"][news_lines()[3][0]]["at"])
+    n3 = len(posted)
+    for i in range(6):
+        tick(at17 + 240 + i * 60, dry=True, relays=[], sk=None, poster=failing)
+    st = load_state()
+    ids = [i for i, _l in news_lines()]
+    check_("a line that fails three times is given up on, not retried for ever",
+           st["news"][ids[5]]["tries"] == NEWS_TRIES and not st["news"][ids[5]]["done"])
+    n4 = len(posted)
+    tick(at17 + 900, dry=True, relays=[], sk=None, poster=poster)
+    check_("and it is never attempted again", not any(t == "Sixth." for _k, t, _a in posted[n4:]))
+
+    # the old 500-id trim could let an old line come back to life; ids now follow the file
+    st = load_state()
+    check_("state holds one id per line in the file, no more", set(st["news"]) == set(ids))
+    open(NEWS, "w", encoding="utf-8").write("Only this one now.\n")
+    tick(at17 + 960, dry=True, relays=[], sk=None, poster=poster)
+    st = load_state()
+    check_("ids for lines removed from the file are dropped with them", set(st["news"]) == {news_lines()[0][0]})
+
+    open(OFF, "w").close()
+    check_("the OFF flag stops everything", tick(at17 + 1020, dry=True, relays=[], sk=None, poster=poster) == "off")
+    os.unlink(OFF)
+
+    open(NEWS, "a", encoding="utf-8").write("you kanker thing\n")
+    n5 = len(posted)
+    tick(at17 + 1080, dry=True, relays=[], sk=None, poster=poster)
+    check_("a news line the blocklist refuses is dropped, not posted and not retried",
+           not any("kanker" in t for _k, t, _a in posted[n5:]))
+
+    st = load_state(); st["stamps"] = [at17 + 1140] * MAX_PER_HOUR; save_state(st)
+    open(NEWS, "a", encoding="utf-8").write("One more.\n")
+    n6 = len(posted)
+    r = tick(at17 + 1140, dry=True, relays=[], sk=None, poster=poster)
+    check_("an hour's cap stops it saying more", "hour-full" in r and len(posted) == n6)
+    st = load_state(); st["stamps"] = []; save_state(st)
+
+    real_save = save_state
+
+    def boom(_st):
+        raise OSError("disk full")
+    globals()["save_state"] = boom
+    n7 = len(posted)
+    check_("a state file that will not write stops everything",
+           tick(at17 + 1200, dry=True, relays=[], sk=None, poster=poster) == "state-failed" and len(posted) == n7)
+    globals()["save_state"] = real_save
+
+    # an unreadable log at the digest hour must NOT burn the day
+    st = load_state(); st["last_digest"] = ""; save_state(st)
+    PLAYLOG = os.path.join(d, "gone.tsv")
+    r = tick(at17 + 1260, dry=True, relays=[], sk=None, poster=poster)
+    check_("an unreadable log does not burn the day's digest",
+           "log-unreadable" in r and load_state()["last_digest"] == "")
+    PLAYLOG = plog
+    n8 = len(posted)
+    tick(at17 + 1320, dry=True, relays=[], sk=None, poster=poster)
+    check_("and the next tick posts it", "digest" in [k for k, _t, _a in posted[n8:]])
+
+    st = load_state(); st["last_digest"] = ""; save_state(st)
+    n9 = len(posted)
+    tick(calendar.timegm((2026, 9, 11, 9, 0, 0, 0, 0, 0)), dry=True, relays=[], sk=None, poster=poster)
+    check_("before the digest hour it stays quiet", "digest" not in [k for k, _t, _a in posted[n9:]])
+
+    old = {"last_digest": "2026-09-01", "news": ["aa", "bb"], "posts": 4}
+    with open(STATE, "w", encoding="utf-8") as fh:
+        json.dump(old, fh)
+    st = load_state()
+    check_("a state file from the first version is read, and its news counts as sent",
+           st["news"]["aa"]["done"] and st["last_digest"] == "2026-09-01")
+
+    print("\nSELFTEST %s (%d failed)" % ("PASSED" if not fails else "FAILED", len(fails)))
+    return 0 if not fails else 1
+
+
+def main():
+    global nn
+    args = sys.argv[1:]
+    if args == ["--selftest"]:
+        return selftest()
+    try:
+        nn = load_nostr()
+    except Exception as e:
+        log("STOP: cannot load %s: %s" % (NOSTR_PATH, e))
+        return 3
+    if args == ["--check"]:
+        return check()
+    if args == ["--digest"]:
+        return show_digest()
+    if args not in ([], ["--once"]):
+        print(__doc__)
+        return 64
+    sk = nn.keys()
+    if not sk:
+        log("STOP: no key in %s/nostr.env -- run nr-radio-keys.py first" % HOME)
+        return 2
+    npub = our_npub(sk)
+    if npub != EXPECT_NPUB:
+        # Better silent than speaking in the wrong voice: an env file from another account would otherwise
+        # post the station's words under someone else's name (review finding).
+        log("STOP: the key in the environment belongs to %s, not to the radio (%s). Nothing posted." % (npub, EXPECT_NPUB))
+        return 2
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    try:
+        r = tick(relays=nn.load_relays(), sk=sk)
+    except Exception as e:
+        log("tick error: %s" % e)
+        return 1
+    if r not in ("nothing-to-say", "off"):
+        log("result: %s" % r)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
